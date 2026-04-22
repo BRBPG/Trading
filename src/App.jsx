@@ -142,51 +142,59 @@ CRITICAL RULES — NON-NEGOTIABLE:
 - When asked "best opportunity" across multiple stocks: rank them, pick ONE, commit to the trade.`;
 
 
-function calcEMA(prices, period) {
-  if (prices.length < period) return null;
-  const k = 2 / (period + 1);
-  let ema = prices.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  for (let i = period; i < prices.length; i++) ema = prices[i] * k + ema * (1 - k);
-  return ema;
-}
+// ─── Yahoo Finance fallback ─────────────────────────────────────────────────
+// Finnhub's free tier only covers US stocks. For UK / non-US tickers we hit
+// Yahoo's public chart endpoint via a CORS proxy (same pattern we use for the
+// RSS news feed). Returns the same shape fetchQuote needs: price, prevClose,
+// optionally a bar series and day high/low. Works for any Yahoo-supported
+// symbol — .L (LSE), .DE (Xetra), .PA (Paris), .HK (HKEX), etc.
+const YAHOO_PROXIES = [
+  u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+  u => `https://corsproxy.io/?${encodeURIComponent(u)}`,
+];
 
-function calcRSI(closes, period = 14) {
-  if (closes.length < period + 1) return null;
-  let gains = 0, losses = 0;
-  for (let i = closes.length - period; i < closes.length; i++) {
-    const diff = closes[i] - closes[i - 1];
-    if (diff > 0) gains += diff; else losses -= diff;
+async function fetchYahoo(symbol) {
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1m&range=1d`;
+  for (const proxy of YAHOO_PROXIES) {
+    try {
+      const res = await fetch(proxy(url), { signal: AbortSignal.timeout(10000) });
+      if (!res.ok) continue;
+      const data = await res.json();
+      const r = data?.chart?.result?.[0];
+      if (!r) continue;
+      const m = r.meta || {};
+      const q = r.indicators?.quote?.[0] || {};
+      const price = m.regularMarketPrice;
+      const prevClose = m.chartPreviousClose ?? m.previousClose;
+      if (!price || !prevClose) continue;
+
+      // Filter out nulls that Yahoo leaves for halted/pre-open minutes.
+      const rawCloses  = (q.close  || []).filter(v => v != null);
+      const rawHighs   = (q.high   || []).filter(v => v != null);
+      const rawLows    = (q.low    || []).filter(v => v != null);
+      const rawVolumes = (q.volume || []).map(v => v == null ? 0 : v);
+
+      return {
+        price, prevClose,
+        dayHigh: m.regularMarketDayHigh,
+        dayLow:  m.regularMarketDayLow,
+        high52:  m.fiftyTwoWeekHigh,
+        low52:   m.fiftyTwoWeekLow,
+        volume:  m.regularMarketVolume,
+        currency: m.currency,
+        bars: rawCloses.length >= 30
+          ? { closes: rawCloses, highs: rawHighs, lows: rawLows, volumes: rawVolumes }
+          : null,
+      };
+    } catch { /* try next proxy */ }
   }
-  return 100 - 100 / (1 + gains / (losses || 0.001));
+  return null;
 }
 
-function calcMACD(closes) {
-  const e12 = calcEMA(closes, 12), e26 = calcEMA(closes, 26);
-  return e12 != null && e26 != null ? e12 - e26 : null;
-}
-
-function calcATR(highs, lows, closes, period = 14) {
-  if (highs.length < period + 1) return null;
-  const trs = [];
-  for (let i = 1; i < highs.length; i++)
-    trs.push(Math.max(highs[i]-lows[i], Math.abs(highs[i]-closes[i-1]), Math.abs(lows[i]-closes[i-1])));
-  return trs.slice(-period).reduce((a, b) => a + b, 0) / period;
-}
-
-function calcVWAP(prices, volumes) {
-  let pv = 0, v = 0;
-  for (let i = 0; i < prices.length; i++) { pv += prices[i]*(volumes[i]||0); v += volumes[i]||0; }
-  return v > 0 ? pv / v : null;
-}
-
-function calcBB(closes, period = 20, mult = 2) {
-  if (closes.length < period) return null;
-  const sl = closes.slice(-period);
-  const mean = sl.reduce((a,b)=>a+b,0)/period;
-  const sd = Math.sqrt(sl.reduce((a,b)=>a+(b-mean)**2,0)/period);
-  const upper = mean+mult*sd, lower = mean-mult*sd;
-  const price = closes[closes.length-1];
-  return { pos:(price-lower)/(upper-lower), upper, lower, mean };
+function shouldUseYahoo(symbol) {
+  // Route by symbol suffix. Anything with a dot-suffix that isn't a US index
+  // is a non-US exchange that Finnhub free won't cover.
+  return /\.[A-Z]{1,3}$/.test(symbol.toUpperCase());
 }
 
 // Run the raw candle series through the cleaning pipeline, then recompute
@@ -210,6 +218,61 @@ function cleanAndRecompute(live, session, anchors) {
 
 async function fetchQuote(symbol, finnhubKey) {
   const session = getMarketSession(symbol);
+
+  // Non-US tickers (e.g. TW.L) go to Yahoo regardless of Finnhub key — free
+  // Finnhub doesn't cover those exchanges.
+  if (shouldUseYahoo(symbol)) {
+    const y = await fetchYahoo(symbol);
+    if (!y) {
+      const mk = generateMockQuote(symbol);
+      return { ...mk, session, quality: "suspect" };
+    }
+    const change = y.price - y.prevClose;
+    const changePct = (change / y.prevClose) * 100;
+
+    // Build a candle series: prefer Yahoo's real bars if we got enough,
+    // otherwise fall back to the synthetic candle generator anchored to the
+    // real Yahoo price/prevClose so indicators still compute.
+    const rawLive = y.bars
+      ? { closes: y.bars.closes, highs: y.bars.highs, lows: y.bars.lows, volumes: y.bars.volumes }
+      : generateLiveIndicators(symbol, y.price, y.prevClose);
+    const live = cleanAndRecompute(rawLive, session, { first: y.prevClose, last: y.price });
+    const { closes, highs, lows, volumes, cleaning } = live;
+
+    const quant = {
+      adx:        calcADX(highs, lows, closes),
+      williamsR:  calcWilliamsR(highs, lows, closes),
+      stochastic: calcStochastic(highs, lows, closes),
+      roc:        calcROC(closes),
+      zScore:     calcZScore(closes),
+      cmf:        calcCMF(highs, lows, closes, volumes),
+      maxDrawdown:calcMaxDrawdown(closes),
+      sharpe:     calcSharpe(closes),
+    };
+    const extendedMove = session !== "OPEN" ? { price: y.price, changePct, change } : null;
+    const quality = assessQuality({
+      flagged: cleaning.hampelFlagged,
+      capped: cleaning.winsorised,
+      zeroVolFilled: cleaning.zeroVolFilled,
+      lastFetched: Date.now(),
+      session,
+    });
+
+    return {
+      symbol,
+      price: y.price, change, changePct, prevClose: y.prevClose,
+      high52: y.high52, low52: y.low52,
+      dayHigh: y.dayHigh, dayLow: y.dayLow,
+      volume: y.volume ?? volumes[volumes.length-1],
+      currency: y.currency,
+      ...live, quant,
+      session, extendedMove,
+      quality, cleaning,
+      marketState: "LIVE", lastFetched: Date.now(), isMock: false,
+      source: "YAHOO",
+    };
+  }
+
   if (!finnhubKey) {
     const m = generateMockQuote(symbol);
     const cleaned = cleanAndRecompute(m, session, { first: m.prevClose, last: m.price });
@@ -284,6 +347,7 @@ async function fetchQuote(symbol, finnhubKey) {
       session, extendedMove,
       quality, cleaning,
       marketState: "LIVE", lastFetched: Date.now(), isMock: false,
+      source: "FINNHUB",
     };
   } catch {
     const m = generateMockQuote(symbol);
@@ -365,7 +429,6 @@ function rankOpportunities(quotes, topN = 3) {
       const m = scoreSetup(q);
       const edge = Math.abs(parseFloat(m.lrProb) - 50); // 0–50, higher = more conviction
       const treeBoost = m.treeSignal === "STRONG_BUY" || m.treeSignal === "STRONG_SELL" ? 8 : 0;
-      const atrPct = q.atr && q.price ? (q.atr / q.price) * 100 : 0;
       const volBoost = (q.volRatio ?? 1) > 1.3 ? 4 : 0;
       const score = edge + treeBoost + volBoost;
       return { q, m, score };
@@ -494,12 +557,29 @@ export default function App() {
   // refreshAll MUST depend on finnhubKey — otherwise the closure captures the
   // initial (possibly empty) key and quotes stay SIMULATED forever even after
   // the user saves a real key.
+  //
+  // Resilience rule: if a fresh fetch returned mock data (rate-limited, network
+  // blip, Finnhub free tier doesn't support this symbol, etc.) but we already
+  // had LIVE data for that symbol, keep the live data and flag it stale rather
+  // than flipping the whole dashboard back to SIMULATED.
   const refreshAll = useCallback(async (silent=false) => {
     if (!silent) setRefreshing(true);
     const results = await Promise.all(WATCHLIST.map(s=>fetchQuote(s, finnhubKey)));
-    const map = {};
-    results.forEach((r,i)=>{ if(r) map[WATCHLIST[i]]=r; });
-    setQuotes(prev=>({...prev,...map}));
+    setQuotes(prev => {
+      const map = { ...prev };
+      results.forEach((r, i) => {
+        if (!r) return;
+        const sym = WATCHLIST[i];
+        const existing = map[sym];
+        if (r.isMock && existing && !existing.isMock) {
+          // Preserve prior live quote, downgrade quality tag
+          map[sym] = { ...existing, quality: "stale" };
+        } else {
+          map[sym] = r;
+        }
+      });
+      return map;
+    });
     setLastRefresh(Date.now());
     if (!silent) setRefreshing(false);
   }, [finnhubKey]);

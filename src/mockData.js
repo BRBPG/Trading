@@ -42,11 +42,11 @@ function generateCandles(symbol, anchorPrice) {
     closes[i] = Math.max(next * 0.85, next - change);
   }
 
-  const highs = closes.map((c, i) => {
+  const highs = closes.map(c => {
     const range = c * vol * (0.3 + rand() * 0.7);
     return c + range * rand();
   });
-  const lows = closes.map((c, i) => {
+  const lows = closes.map(c => {
     const range = c * vol * (0.3 + rand() * 0.7);
     return c - range * rand();
   });

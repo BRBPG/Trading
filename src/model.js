@@ -9,7 +9,7 @@ function loadWeights() {
   try {
     const saved = JSON.parse(localStorage.getItem(WEIGHTS_KEY) || "null");
     if (saved?.weights?.length === 7) return { weights: saved.weights, bias: saved.bias };
-  } catch {}
+  } catch { /* corrupt localStorage — fall through to defaults */ }
   return { weights: [...DEFAULT_WEIGHTS], bias: DEFAULT_BIAS };
 }
 
