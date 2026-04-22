@@ -4,12 +4,14 @@ const VOL_PROFILES = {
   MSFT: { vol: 0.012 }, META: { vol: 0.018 }, UAL:  { vol: 0.022 },
   CCL:  { vol: 0.025 }, XOM:  { vol: 0.014 }, GLD:  { vol: 0.009 },
   AMZN: { vol: 0.016 }, BNO:  { vol: 0.022 }, XAUUSD: { vol: 0.009 },
+  "TW.L": { vol: 0.018 },
 };
 
 const FALLBACK_PRICES = {
   SPY: 530, QQQ: 455, AAPL: 213, NVDA: 875, TSLA: 248,
   AMD: 158, MSFT: 415, META: 512, UAL: 68, CCL: 19.5,
   XOM: 112, GLD: 224, AMZN: 195, BNO: 20, XAUUSD: 3300,
+  "TW.L": 112,
 };
 
 function mulberry32(seed) {

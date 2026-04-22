@@ -4,11 +4,53 @@ import { scoreSetup, logDecision, reviewDecision, getPerformanceStats, getLog, a
 import { calcADX, calcWilliamsR, calcStochastic, calcROC, calcZScore,
          calcCMF, calcMaxDrawdown, calcSharpe, calcBeta, engineerFeatures,
          fetchAllNews } from "./quant";
+import { BUFFETT_SYSTEM_PROMPT, buildBuffettContext } from "./buffett";
 
 const FH_QUOTE  = (sym, key) => `https://finnhub.io/api/v1/quote?symbol=${sym}&token=${key}`;
 const FH_METRIC = (sym, key) => `https://finnhub.io/api/v1/stock/metric?symbol=${sym}&metric=all&token=${key}`;
 
-const WATCHLIST = ["SPY","QQQ","AAPL","NVDA","TSLA","AMD","MSFT","META","UAL","CCL","XOM","GLD","AMZN","BNO"];
+const WATCHLIST = ["SPY","QQQ","AAPL","NVDA","TSLA","AMD","MSFT","META","UAL","CCL","XOM","GLD","AMZN","BNO","TW.L"];
+
+// ─── Market-session detection (pure, client-side) ───────────────────────────
+// US stocks:   premarket 04:00-09:30 ET, open 09:30-16:00 ET, after 16:00-20:00 ET
+// LSE (.L):    premarket 07:00-08:00 UK, open 08:00-16:30 UK, after 16:30-17:15 UK
+function getMarketSession(symbol = "") {
+  const isUK = symbol.toUpperCase().endsWith(".L");
+  const tz = isUK ? "Europe/London" : "America/New_York";
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat("en-US", {
+      timeZone: tz, weekday: "short", hour: "numeric", minute: "numeric", hour12: false,
+    }).formatToParts(new Date()).map(p => [p.type, p.value])
+  );
+  const h = parseInt(parts.hour, 10) % 24;
+  const m = parseInt(parts.minute, 10);
+  const mins = h * 60 + m;
+  if (parts.weekday === "Sat" || parts.weekday === "Sun") return "CLOSED";
+  if (isUK) {
+    if (mins >= 7*60   && mins < 8*60)     return "PREMARKET";
+    if (mins >= 8*60   && mins < 16*60+30) return "OPEN";
+    if (mins >= 16*60+30 && mins < 17*60+15) return "AFTERHOURS";
+    return "CLOSED";
+  }
+  if (mins >= 4*60   && mins < 9*60+30) return "PREMARKET";
+  if (mins >= 9*60+30 && mins < 16*60)  return "OPEN";
+  if (mins >= 16*60  && mins < 20*60)   return "AFTERHOURS";
+  return "CLOSED";
+}
+
+function sessionLabel(s) {
+  return s === "PREMARKET" ? "PRE-MARKET"
+       : s === "AFTERHOURS" ? "AFTER-HOURS"
+       : s === "CLOSED" ? "CLOSED"
+       : "OPEN";
+}
+
+function sessionColor(s) {
+  return s === "OPEN" ? "#2ECC71"
+       : s === "PREMARKET" ? "#5AACDF"
+       : s === "AFTERHOURS" ? "#C9A84C"
+       : "#888";
+}
 
 const SYSTEM_PROMPT = `You are THE TRADER — the composite mind of five legendary traders. You have been given a pre-trained quantitative model score alongside live market data. Your job is to give ONE clear, decisive verdict. Not "it could go either way." A real verdict.
 
@@ -147,18 +189,19 @@ function calcBB(closes, period = 20, mult = 2) {
 }
 
 async function fetchQuote(symbol, finnhubKey) {
-  if (!finnhubKey) return generateMockQuote(symbol);
+  const session = getMarketSession(symbol);
+  if (!finnhubKey) return { ...generateMockQuote(symbol), session };
   try {
     const [quoteRes, metricRes] = await Promise.all([
       fetch(FH_QUOTE(symbol, finnhubKey), { signal: AbortSignal.timeout(8000) }),
       fetch(FH_METRIC(symbol, finnhubKey), { signal: AbortSignal.timeout(8000) }),
     ]);
-    if (!quoteRes.ok) return generateMockQuote(symbol);
+    if (!quoteRes.ok) return { ...generateMockQuote(symbol), session };
     const quote = await quoteRes.json();
     const metric = metricRes.ok ? await metricRes.json() : null;
     const price = quote.c;
     const prevClose = quote.pc;
-    if (!price || !prevClose) return generateMockQuote(symbol);
+    if (!price || !prevClose) return { ...generateMockQuote(symbol), session };
 
     const change = price - prevClose;
     const changePct = (change / prevClose) * 100;
@@ -177,16 +220,24 @@ async function fetchQuote(symbol, finnhubKey) {
       sharpe:     calcSharpe(closes),
     };
 
+    // When the market is NOT open, the Finnhub quote.c reflects extended-hours
+    // price on supported symbols (or the last regular close if extended-hours
+    // data isn't available). Compute the extended-hours move against prevClose
+    // so we still have something meaningful when the bell isn't ringing.
+    const extendedMove = session !== "OPEN" ? { price, changePct, change } : null;
+
     return {
       symbol, price, change, changePct, prevClose,
       high52, low52,
       dayHigh: quote.h, dayLow: quote.l,
+      open: quote.o,
       volume: quote.v ?? volumes[volumes.length-1],
       ...live, quant,
+      session, extendedMove,
       marketState: "LIVE", lastFetched: Date.now(), isMock: false,
     };
   } catch {
-    return generateMockQuote(symbol);
+    return { ...generateMockQuote(symbol), session };
   }
 }
 
@@ -307,10 +358,15 @@ function buildContext(quotes, selected, news = []) {
   if (!q) return `[No data for ${selected}]`;
   const pct52 = q.high52&&q.low52 ? ((q.price-q.low52)/(q.high52-q.low52)*100).toFixed(0) : "?";
   const model = scoreSetup(q);
+  const session = q.session || getMarketSession(selected);
+  const sessLine = session === "OPEN"
+    ? `Market session: OPEN`
+    : `Market session: ${sessionLabel(session)} — extended-hours price $${q.price?.toFixed(2)} vs prev close $${q.prevClose?.toFixed(2)} (${q.changePct>=0?"+":""}${q.changePct?.toFixed(2)}%). Regular bell has NOT rung; treat intraday indicators (VWAP, volume ratio, 5-bar momentum) as stale from the prior session.`;
   const snapshot = Object.values(quotes).map(d=>
-    `${d.symbol.padEnd(5)} $${d.price?.toFixed(2).padStart(8)} ${(d.changePct>=0?"+":"")+d.changePct?.toFixed(2)}%  RSI:${d.rsi?.toFixed(0)||"?"}  Vol:${d.volRatio?.toFixed(1)||"?"}x`
+    `${d.symbol.padEnd(5)} $${d.price?.toFixed(2).padStart(8)} ${(d.changePct>=0?"+":"")+d.changePct?.toFixed(2)}%  RSI:${d.rsi?.toFixed(0)||"?"}  Vol:${d.volRatio?.toFixed(1)||"?"}x  [${sessionLabel(d.session||getMarketSession(d.symbol))}]`
   ).join("\n");
   return `=== LIVE DATA ${q.isMock?"(SIMULATED)":""} — ${new Date().toLocaleTimeString()} ===
+${sessLine}
 SYMBOL: ${selected}  Price: $${q.price?.toFixed(2)}  Change: ${q.changePct>=0?"+":""}${q.changePct?.toFixed(2)}%
 Day Range: $${q.dayLow?.toFixed(2)||"?"}–$${q.dayHigh?.toFixed(2)||"?"}
 52W Range: $${q.low52?.toFixed(2)||"?"}–$${q.high52?.toFixed(2)||"?"} (${pct52}th pct)
@@ -383,6 +439,9 @@ export default function App() {
   const [newsLoading, setNewsLoading] = useState(false);
   const chatRef = useRef(null);
 
+  // refreshAll MUST depend on finnhubKey — otherwise the closure captures the
+  // initial (possibly empty) key and quotes stay SIMULATED forever even after
+  // the user saves a real key.
   const refreshAll = useCallback(async (silent=false) => {
     if (!silent) setRefreshing(true);
     const results = await Promise.all(WATCHLIST.map(s=>fetchQuote(s, finnhubKey)));
@@ -391,20 +450,36 @@ export default function App() {
     setQuotes(prev=>({...prev,...map}));
     setLastRefresh(Date.now());
     if (!silent) setRefreshing(false);
-  }, []);
+  }, [finnhubKey]);
 
+  // Re-run (and reset the interval) whenever refreshAll changes, i.e. when the
+  // finnhub key changes. Also re-fetch when the tab becomes visible again after
+  // being hidden, so you don't come back to stale prices.
   useEffect(() => {
+    if (!finnhubKey) return;
     refreshAll();
     const id = setInterval(()=>refreshAll(true), 30000);
-    return ()=>clearInterval(id);
-  }, [refreshAll]);
+    const onVis = () => { if (document.visibilityState === "visible") refreshAll(true); };
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      clearInterval(id);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  }, [refreshAll, finnhubKey]);
 
+  // News: refresh every 5 minutes so the feed stays current without the user
+  // having to click REFRESH.
   useEffect(() => {
-    setNewsLoading(true);
-    fetchAllNews()
-      .then(articles => setNews(articles))
-      .catch(()=>{})
-      .finally(()=>setNewsLoading(false));
+    const loadNews = () => {
+      setNewsLoading(true);
+      fetchAllNews()
+        .then(articles => setNews(articles))
+        .catch(()=>{})
+        .finally(()=>setNewsLoading(false));
+    };
+    loadNews();
+    const id = setInterval(loadNews, 5 * 60 * 1000);
+    return () => clearInterval(id);
   }, []);
 
   useEffect(() => {
@@ -532,6 +607,50 @@ export default function App() {
     setThinking(false);
   }
 
+  // Buffett's verdict is SEPARATE from the trader system. His horizon (decades)
+  // and framework (value, moats, intrinsic value) would contaminate a short-term
+  // BUY/SELL signal, so we fire a second, independent Claude call with his own
+  // system prompt and render it as a distinct message.
+  async function sendToBuffett(userText) {
+    if (thinking) return;
+    setThinking(true);
+    setTab("chat");
+    const q = quotes[selected];
+    const session = q?.session || getMarketSession(selected);
+    const buffettCtx = buildBuffettContext(q, selected, session);
+    const prompt = `${buffettCtx}\n\nUSER ASKS: ${userText || `Warren, what's your honest take on ${selected} right now?`}`;
+    setMessages(prev=>[...prev,{type:"user",text:`🏛 BUFFETT: ${userText || `Your take on ${selected}?`}`}]);
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+        },
+        body: JSON.stringify({
+          model: "claude-opus-4-5",
+          max_tokens: 3000,
+          system: BUFFETT_SYSTEM_PROMPT,
+          // Intentionally NOT using chatHistory — Buffett runs in his own
+          // conversation so his framework doesn't bleed into the trader chat.
+          messages: [{ role: "user", content: prompt }],
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        setMessages(prev=>[...prev,{type:"bot",persona:"buffett",text:`⚠️ API error: ${data.error?.message||`HTTP ${res.status}`}`}]);
+        setThinking(false); return;
+      }
+      const reply = data.content?.filter(b=>b.type==="text").map(b=>b.text).join("\n") || "No response.";
+      setMessages(prev=>[...prev,{type:"bot",persona:"buffett",text:reply}]);
+    } catch(err) {
+      setMessages(prev=>[...prev,{type:"bot",persona:"buffett",text:`⚠️ Connection failed: ${err.message}`}]);
+    }
+    setThinking(false);
+  }
+
   const selQ = quotes[selected];
   const marketUp = selQ ? selQ.changePct>=0 : true;
   const loadedCount = Object.keys(quotes).length;
@@ -627,6 +746,15 @@ export default function App() {
                 <span style={{fontSize:14,marginLeft:8,color:marketUp?"#2ECC71":"#E74C3C",fontWeight:700}}>
                   {marketUp?"▲":"▼"} {selQ.changePct>=0?"+":""}{selQ.changePct?.toFixed(2)}%
                 </span>
+                {(()=>{ const s = selQ.session || getMarketSession(selected);
+                  return <span style={{fontSize:9,color:sessionColor(s),marginLeft:8,letterSpacing:1,
+                    padding:"2px 6px",border:`1px solid ${sessionColor(s)}44`}}>● {sessionLabel(s)}</span>;
+                })()}
+                {selQ.extendedMove && (selQ.session==="PREMARKET"||selQ.session==="AFTERHOURS") && (
+                  <span style={{fontSize:10,color:"#888",marginLeft:8,letterSpacing:1}}>
+                    {selQ.session==="PREMARKET"?"PRE":"POST"} {selQ.changePct>=0?"+":""}{selQ.changePct?.toFixed(2)}% vs prev close
+                  </span>
+                )}
                 {selQ.isMock&&<span style={{fontSize:9,color:"#C9A84C",marginLeft:8,letterSpacing:1}}>SIMULATED</span>}
               </div>
               <div style={{display:"flex",gap:14,marginLeft:10,flexWrap:"wrap"}}>
@@ -644,13 +772,20 @@ export default function App() {
                   </div>
                 ))}
               </div>
-              <div style={{marginLeft:"auto"}}>
+              <div style={{marginLeft:"auto",display:"flex",gap:8}}>
                 <button onClick={()=>{setTab("chat");sendToAI(`Give me your full trading assessment on ${selected} right now.`);}}
                   disabled={thinking} style={{
                     background:thinking?"#1A1A1A":"#C9A84C",color:thinking?"#444":"#000",
                     border:"none",fontFamily:"'Courier New',monospace",fontWeight:900,
                     fontSize:11,letterSpacing:2,padding:"7px 14px",cursor:thinking?"not-allowed":"pointer"}}>
                   ⚡ ANALYZE NOW
+                </button>
+                <button onClick={()=>sendToBuffett("")} disabled={thinking} title="Warren Buffett's separate, long-horizon take — NOT part of the BUY/SELL verdict"
+                  style={{
+                    background:thinking?"#1A1A1A":"#0D2A1F",color:thinking?"#444":"#7FD8A6",
+                    border:"1px solid #2A7A4F",fontFamily:"'Courier New',monospace",fontWeight:900,
+                    fontSize:11,letterSpacing:2,padding:"7px 14px",cursor:thinking?"not-allowed":"pointer"}}>
+                  🏛 BUFFETT TAKE
                 </button>
               </div>
             </div>
@@ -952,18 +1087,27 @@ export default function App() {
                   const td = m.tradeData;
                   const isLogged = m.id && loggedMsgIds.has(m.id);
                   const vColor = td?.verdict==="BUY"?"#2ECC71":td?.verdict==="SELL"?"#E74C3C":"#888";
+                  const isBuffett = m.persona === "buffett";
+                  const botAvatar = isBuffett ? "🏛" : "📈";
+                  const botBorderColor = isBuffett ? "#2A7A4F" : "#C9A84C";
+                  const botBgColor = isBuffett ? "#0D1A14" : "#1A1500";
                   return (
                     <div key={i} style={{display:"flex",gap:10,alignSelf:m.type==="user"?"flex-end":"flex-start",
                       maxWidth:"95%",flexDirection:m.type==="user"?"row-reverse":"row"}}>
                       <div style={{width:28,height:28,flexShrink:0,alignSelf:"flex-start",
-                        background:m.type==="user"?"#0d1117":"#1A1500",
-                        border:`1px solid ${m.type==="user"?"#222":"#C9A84C"}`,
+                        background:m.type==="user"?"#0d1117":botBgColor,
+                        border:`1px solid ${m.type==="user"?"#222":botBorderColor}`,
                         display:"flex",alignItems:"center",justifyContent:"center",fontSize:13}}>
-                        {m.type==="user"?"👤":"📈"}
+                        {m.type==="user"?"👤":botAvatar}
                       </div>
                       <div style={{display:"flex",flexDirection:"column",gap:6,flex:1,minWidth:0}}>
-                        <div style={{background:m.type==="user"?"#0d1117":"#111",border:"1px solid #1E1E1E",
-                          borderLeft:m.type==="bot"?"3px solid #C9A84C":"1px solid #1E1E1E",
+                        {isBuffett && (
+                          <div style={{fontSize:9,color:"#7FD8A6",letterSpacing:2,fontWeight:700}}>
+                            🏛 BUFFETT — SEPARATE LONG-HORIZON VIEW (not part of the trader verdict)
+                          </div>
+                        )}
+                        <div style={{background:m.type==="user"?"#0d1117":isBuffett?"#0A140E":"#111",border:"1px solid #1E1E1E",
+                          borderLeft:m.type==="bot"?`3px solid ${botBorderColor}`:"1px solid #1E1E1E",
                           borderRight:m.type==="user"?"3px solid #333":"1px solid #1E1E1E",
                           padding:"10px 14px",fontSize:12,lineHeight:1.8,
                           color:m.type==="user"?"#888":"#D8D0C0",whiteSpace:"pre-wrap"}}>
