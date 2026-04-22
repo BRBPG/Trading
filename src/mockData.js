@@ -55,7 +55,7 @@ function generateCandles(symbol, anchorPrice) {
   return { closes, highs, lows, volumes };
 }
 
-function computeIndicators(closes, highs, lows, volumes) {
+export function computeIndicators(closes, highs, lows, volumes) {
   const k = (period) => {
     if (closes.length < period) return null;
     const kf = 2 / (period + 1);

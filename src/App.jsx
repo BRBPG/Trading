@@ -1,10 +1,11 @@
 import { useState, useRef, useEffect, useCallback } from "react";
-import { generateMockQuote, generateLiveIndicators } from "./mockData";
+import { generateMockQuote, generateLiveIndicators, computeIndicators } from "./mockData";
 import { scoreSetup, logDecision, reviewDecision, getPerformanceStats, getLog, adaptWeights, resetWeights, getCurrentWeights } from "./model";
 import { calcADX, calcWilliamsR, calcStochastic, calcROC, calcZScore,
          calcCMF, calcMaxDrawdown, calcSharpe, calcBeta, engineerFeatures,
          fetchAllNews } from "./quant";
 import { BUFFETT_SYSTEM_PROMPT, buildBuffettContext } from "./buffett";
+import { cleanBars, assessQuality, cleaningSummary } from "./cleaning";
 
 const FH_QUOTE  = (sym, key) => `https://finnhub.io/api/v1/quote?symbol=${sym}&token=${key}`;
 const FH_METRIC = (sym, key) => `https://finnhub.io/api/v1/stock/metric?symbol=${sym}&metric=all&token=${key}`;
@@ -188,27 +189,66 @@ function calcBB(closes, period = 20, mult = 2) {
   return { pos:(price-lower)/(upper-lower), upper, lower, mean };
 }
 
+// Run the raw candle series through the cleaning pipeline, then recompute
+// indicators on the CLEANED bars so RSI/MACD/ATR/EMA reflect validated data.
+function cleanAndRecompute(live, session, anchors) {
+  const cleanedBars = cleanBars(
+    { closes: live.closes, highs: live.highs, lows: live.lows, volumes: live.volumes },
+    session,
+    anchors,
+  );
+  const { closes, highs, lows, volumes, cleaning } = cleanedBars;
+  const indicators = computeIndicators(closes, highs, lows, volumes);
+  return {
+    closes, highs, lows, volumes, ...indicators,
+    sparkline: closes.slice(-30),
+    dayHigh: Math.max(...highs.slice(-78)),
+    dayLow:  Math.min(...lows.slice(-78)),
+    cleaning,
+  };
+}
+
 async function fetchQuote(symbol, finnhubKey) {
   const session = getMarketSession(symbol);
-  if (!finnhubKey) return { ...generateMockQuote(symbol), session };
+  if (!finnhubKey) {
+    const m = generateMockQuote(symbol);
+    const cleaned = cleanAndRecompute(m, session, { first: m.prevClose, last: m.price });
+    const quality = assessQuality({
+      flagged: cleaned.cleaning.hampelFlagged,
+      capped: cleaned.cleaning.winsorised,
+      zeroVolFilled: cleaned.cleaning.zeroVolFilled,
+      lastFetched: Date.now(),
+      session,
+    });
+    return { ...m, ...cleaned, session, quality };
+  }
   try {
     const [quoteRes, metricRes] = await Promise.all([
       fetch(FH_QUOTE(symbol, finnhubKey), { signal: AbortSignal.timeout(8000) }),
       fetch(FH_METRIC(symbol, finnhubKey), { signal: AbortSignal.timeout(8000) }),
     ]);
-    if (!quoteRes.ok) return { ...generateMockQuote(symbol), session };
+    if (!quoteRes.ok) {
+      const m = generateMockQuote(symbol);
+      return { ...m, session, quality: "suspect" };
+    }
     const quote = await quoteRes.json();
     const metric = metricRes.ok ? await metricRes.json() : null;
     const price = quote.c;
     const prevClose = quote.pc;
-    if (!price || !prevClose) return { ...generateMockQuote(symbol), session };
+    if (!price || !prevClose) {
+      const m = generateMockQuote(symbol);
+      return { ...m, session, quality: "suspect" };
+    }
 
     const change = price - prevClose;
     const changePct = (change / prevClose) * 100;
     const high52 = metric?.metric?.["52WeekHigh"] ?? quote.h;
     const low52  = metric?.metric?.["52WeekLow"]  ?? quote.l;
-    const live = generateLiveIndicators(symbol, price, prevClose);
-    const { closes, highs, lows, volumes } = live;
+
+    const rawLive = generateLiveIndicators(symbol, price, prevClose);
+    const live = cleanAndRecompute(rawLive, session, { first: prevClose, last: price });
+    const { closes, highs, lows, volumes, cleaning } = live;
+
     const quant = {
       adx:        calcADX(highs, lows, closes),
       williamsR:  calcWilliamsR(highs, lows, closes),
@@ -226,6 +266,14 @@ async function fetchQuote(symbol, finnhubKey) {
     // so we still have something meaningful when the bell isn't ringing.
     const extendedMove = session !== "OPEN" ? { price, changePct, change } : null;
 
+    const quality = assessQuality({
+      flagged: cleaning.hampelFlagged,
+      capped: cleaning.winsorised,
+      zeroVolFilled: cleaning.zeroVolFilled,
+      lastFetched: Date.now(),
+      session,
+    });
+
     return {
       symbol, price, change, changePct, prevClose,
       high52, low52,
@@ -234,10 +282,12 @@ async function fetchQuote(symbol, finnhubKey) {
       volume: quote.v ?? volumes[volumes.length-1],
       ...live, quant,
       session, extendedMove,
+      quality, cleaning,
       marketState: "LIVE", lastFetched: Date.now(), isMock: false,
     };
   } catch {
-    return { ...generateMockQuote(symbol), session };
+    const m = generateMockQuote(symbol);
+    return { ...m, session, quality: "suspect" };
   }
 }
 
@@ -362,11 +412,13 @@ function buildContext(quotes, selected, news = []) {
   const sessLine = session === "OPEN"
     ? `Market session: OPEN`
     : `Market session: ${sessionLabel(session)} — extended-hours price $${q.price?.toFixed(2)} vs prev close $${q.prevClose?.toFixed(2)} (${q.changePct>=0?"+":""}${q.changePct?.toFixed(2)}%). Regular bell has NOT rung; treat intraday indicators (VWAP, volume ratio, 5-bar momentum) as stale from the prior session.`;
+  const qualityLine = `Data quality: ${cleaningSummary(q.cleaning, q.quality || "unknown")}${q.quality === "suspect" ? " — treat technicals with reduced confidence." : q.quality === "stale" ? " — quote hasn't updated recently; act only if independently confirmed." : ""}`;
   const snapshot = Object.values(quotes).map(d=>
-    `${d.symbol.padEnd(5)} $${d.price?.toFixed(2).padStart(8)} ${(d.changePct>=0?"+":"")+d.changePct?.toFixed(2)}%  RSI:${d.rsi?.toFixed(0)||"?"}  Vol:${d.volRatio?.toFixed(1)||"?"}x  [${sessionLabel(d.session||getMarketSession(d.symbol))}]`
+    `${d.symbol.padEnd(5)} $${d.price?.toFixed(2).padStart(8)} ${(d.changePct>=0?"+":"")+d.changePct?.toFixed(2)}%  RSI:${d.rsi?.toFixed(0)||"?"}  Vol:${d.volRatio?.toFixed(1)||"?"}x  [${sessionLabel(d.session||getMarketSession(d.symbol))}${d.quality && d.quality !== "clean" ? " " + d.quality.toUpperCase() : ""}]`
   ).join("\n");
   return `=== LIVE DATA ${q.isMock?"(SIMULATED)":""} — ${new Date().toLocaleTimeString()} ===
 ${sessLine}
+${qualityLine}
 SYMBOL: ${selected}  Price: $${q.price?.toFixed(2)}  Change: ${q.changePct>=0?"+":""}${q.changePct?.toFixed(2)}%
 Day Range: $${q.dayLow?.toFixed(2)||"?"}–$${q.dayHigh?.toFixed(2)||"?"}
 52W Range: $${q.low52?.toFixed(2)||"?"}–$${q.high52?.toFixed(2)||"?"} (${pct52}th pct)
@@ -749,6 +801,12 @@ export default function App() {
                 {(()=>{ const s = selQ.session || getMarketSession(selected);
                   return <span style={{fontSize:9,color:sessionColor(s),marginLeft:8,letterSpacing:1,
                     padding:"2px 6px",border:`1px solid ${sessionColor(s)}44`}}>● {sessionLabel(s)}</span>;
+                })()}
+                {(()=>{ const qc = selQ.quality || "clean";
+                  const qColor = qc === "clean" ? "#2ECC71" : qc === "suspect" ? "#C9A84C" : qc === "stale" ? "#888" : "#555";
+                  const title = cleaningSummary(selQ.cleaning, qc);
+                  return <span title={title} style={{fontSize:9,color:qColor,marginLeft:6,letterSpacing:1,
+                    padding:"2px 6px",border:`1px solid ${qColor}44`,cursor:"help"}}>◆ {qc.toUpperCase()}</span>;
                 })()}
                 {selQ.extendedMove && (selQ.session==="PREMARKET"||selQ.session==="AFTERHOURS") && (
                   <span style={{fontSize:10,color:"#888",marginLeft:8,letterSpacing:1}}>
