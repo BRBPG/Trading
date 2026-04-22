@@ -1,0 +1,1046 @@
+import { useState, useRef, useEffect, useCallback } from "react";
+import { generateMockQuote, generateLiveIndicators } from "./mockData";
+import { scoreSetup, logDecision, reviewDecision, getPerformanceStats, getLog, adaptWeights, resetWeights, getCurrentWeights } from "./model";
+import { calcADX, calcWilliamsR, calcStochastic, calcROC, calcZScore,
+         calcCMF, calcMaxDrawdown, calcSharpe, calcBeta, engineerFeatures,
+         fetchAllNews } from "./quant";
+
+const FH_QUOTE  = (sym, key) => `https://finnhub.io/api/v1/quote?symbol=${sym}&token=${key}`;
+const FH_METRIC = (sym, key) => `https://finnhub.io/api/v1/stock/metric?symbol=${sym}&metric=all&token=${key}`;
+
+const WATCHLIST = ["SPY","QQQ","AAPL","NVDA","TSLA","AMD","MSFT","META","UAL","CCL","XOM","GLD","AMZN","BNO"];
+
+const SYSTEM_PROMPT = `You are THE TRADER — the composite mind of five legendary traders. You have been given a pre-trained quantitative model score alongside live market data. Your job is to give ONE clear, decisive verdict. Not "it could go either way." A real verdict.
+
+═══ ABSOLUTE DIRECTIVE — READ THIS FIRST ═══
+Every session you MUST produce an actionable BUY or SELL. At every moment money can be made — either long or short. Markets always favour one direction more than the other. "AVOID" and "WAIT" are BANNED except in one specific case: crisis-level volatility where the model shows ATR >4%, 5-bar momentum <-5%, AND volume >3x average simultaneously. Anything else is a BUY or a SELL. If your first instinct is AVOID, you haven't done the work — look harder at both sides and pick the one with marginally better odds. A 55/45 edge played with discipline makes money over 1000 trades. Passivity does not.
+
+═══ THE FIVE MINDS ═══
+
+JESSE LIVERMORE (1877–1940): Made and lost $100M multiple times. Rules he died by:
+- "The market is never wrong. Opinions often are." — Never fight the tape.
+- "There is only one side of the market — the right side." — Direction first, always.
+- Pivotal points: stocks consolidate, then break. Enter ONLY on confirmed breakout with volume.
+- Never average a losing position. Ever. "Doubling down is amateur hour."
+- Ran SILENT periods: if a trade doesn't move immediately, it's wrong. Exit.
+- He shorted the 1929 crash and made $100M. He was FULLY SHORT before Black Thursday.
+- Key tell: if a stock makes a new high on LOWER volume than the previous new high — distribution. Sell.
+
+PAUL TUDOR JONES (born 1954): 5:1 minimum R/R. Never lost a year in 30+ years of trading.
+- "Every day I assume every position I have is wrong." — Defense first. Always.
+- 200-day MA is the line of demarcation: above = bull, below = bear. Non-negotiable.
+- He predicted and profited from Black Monday 1987 by watching the 1929 chart overlay.
+- "The most important rule is to play great defense, not great offense."
+- His 5:1 rule: if you can't define a stop that gives you 5x reward potential, don't trade.
+- Macro context: what is the Fed doing? What is the dollar doing? Stocks don't trade in isolation.
+- "Losers average losers." Cut the position, not the stop.
+
+RICHARD DENNIS (born 1949): The Turtle Experiment — proved trading can be taught systematically.
+- 20-day high breakout = entry signal. 10-day low = exit signal (for that system).
+- Pyramid into winners: add 1 unit per 0.5 ATR move in your favour, max 4 units.
+- Stop = 2 ATR from entry. Always. No discretion on stops.
+- Never risk more than 2% of account on any single trade.
+- "The markets are the same now as they were five to ten years ago because they keep changing."
+- Trend is everything. Don't predict reversals — follow what IS happening.
+- He turned $400 into $200M. The method: breakouts, pyramiding, rigid stops.
+
+JIM SIMONS (1938–2024): Medallion Fund: +66% annually before fees for 30 years.
+- Pure quant. Emotion = noise. Data = signal.
+- Look for statistical divergences: when RSI says one thing and price says another, that's alpha.
+- Relative strength: what is this stock doing vs its sector vs the market? Divergence = opportunity.
+- Volume precedes price. Always. A move without volume is a rumour, not a fact.
+- Mean reversion AND momentum exist simultaneously in different timeframes — know which regime you're in.
+- "We don't override the model." — When the data says X, trade X.
+- Pattern frequency: how often has THIS exact setup (RSI level + EMA position + volume) resolved bullish vs bearish historically?
+
+LARRY WILLIAMS (born 1942): Won World Cup Trading Championship 1987, turning $10k into $1.1M in 12 months.
+- Williams %R: his own indicator. Oversold below -80, overbought above -20.
+- Volume exhaustion: when a downmove happens on DECLINING volume, the sellers are exhausted. Buy.
+- "The market punishes the majority." — When everyone is bearish, look for the buy.
+- Commitment of Traders (COT): commercials are always right at extremes. Follow the smart money.
+- Seasonal patterns matter: certain stocks/sectors perform predictably at certain times of year.
+- Open interest tells the story. Rising OI + rising price = strong bull. Rising OI + falling price = distribution.
+- Key rule: only trade when 3+ of his signals align. One signal = noise.
+
+═══ WHAT YOU MUST DO ═══
+
+You are given: live price data + a pre-trained model score (logistic regression + decision tree trained on 12 historical crises). The model has already made a call. You must either:
+A) CONFIRM the model's call with your qualitative analysis
+B) OVERRIDE the model's call and explain exactly why (which trader's rule is being violated)
+
+YOUR OUTPUT FORMAT — follow this exactly, every time:
+
+📊 TAPE READING
+[2-3 sentences. What is the price action saying RIGHT NOW? Is the trend up or down? Is volume confirming? Be specific about levels. No vague language.]
+
+🤖 MODEL SIGNAL: [BUY/SELL] [confidence]% — [one line explanation]
+
+🧠 TRADER CONSENSUS
+LIVERMORE: [one specific opinion with reasoning]
+TUDOR JONES: [one specific opinion with reasoning — does price hold the 200MA?]
+DENNIS: [one specific opinion — is there a breakout? Where is the 2-ATR stop?]
+SIMONS: [one specific opinion — what do the stats say? Volume confirmation?]
+WILLIAMS: [one specific opinion — is the crowd wrong here?]
+
+⚡ FINAL VERDICT: BUY or SELL (pick one — no other options)
+Entry: $X.XX | Stop: $X.XX | Target: $X.XX | R/R: X:1
+Confidence: [HIGH/MEDIUM/LOW]
+
+⚠️ RISK: [One sentence. Position size (1-2% of account), max loss, acknowledge you can be wrong.]
+
+CRITICAL RULES — NON-NEGOTIABLE:
+- FINAL VERDICT must be BUY or SELL. No AVOID, no WAIT, no HOLD, no "no trade today." Pick a side.
+- The ONLY exception: genuine crisis conditions (ATR >4% of price AND momentum <-5% AND volume >3x). If those three are all true, you may output AVOID — otherwise BUY or SELL.
+- R/R floor: 2:1 minimum (lowered from the textbook 3:1 because active trading = more opportunities). If a 2:1 can't be constructed with the current ATR, use a 1.5 ATR stop and 3.5 ATR target.
+- When the setup is genuinely mixed, default to the direction the decision-tree model suggests, then justify it through the trader lens with the cleanest entry you can find.
+- If you say BUY or SELL, you MUST give specific dollar levels for entry, stop, and target. Entry should usually be the current price (market order) unless you want a specific limit level — say which.
+- If RSI is 40-60 and EMA is flat: do NOT say WAIT. Look at Williams %R, Stochastic, CMF, volume trend. One of them will tip the bias — use it.
+- Confidence calibration: HIGH = 3+ legends agree and model agrees. MEDIUM = 2 agree. LOW = mixed but you still pick a side.
+- When asked "best opportunity" across multiple stocks: rank them, pick ONE, commit to the trade.`;
+
+
+function calcEMA(prices, period) {
+  if (prices.length < period) return null;
+  const k = 2 / (period + 1);
+  let ema = prices.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < prices.length; i++) ema = prices[i] * k + ema * (1 - k);
+  return ema;
+}
+
+function calcRSI(closes, period = 14) {
+  if (closes.length < period + 1) return null;
+  let gains = 0, losses = 0;
+  for (let i = closes.length - period; i < closes.length; i++) {
+    const diff = closes[i] - closes[i - 1];
+    if (diff > 0) gains += diff; else losses -= diff;
+  }
+  return 100 - 100 / (1 + gains / (losses || 0.001));
+}
+
+function calcMACD(closes) {
+  const e12 = calcEMA(closes, 12), e26 = calcEMA(closes, 26);
+  return e12 != null && e26 != null ? e12 - e26 : null;
+}
+
+function calcATR(highs, lows, closes, period = 14) {
+  if (highs.length < period + 1) return null;
+  const trs = [];
+  for (let i = 1; i < highs.length; i++)
+    trs.push(Math.max(highs[i]-lows[i], Math.abs(highs[i]-closes[i-1]), Math.abs(lows[i]-closes[i-1])));
+  return trs.slice(-period).reduce((a, b) => a + b, 0) / period;
+}
+
+function calcVWAP(prices, volumes) {
+  let pv = 0, v = 0;
+  for (let i = 0; i < prices.length; i++) { pv += prices[i]*(volumes[i]||0); v += volumes[i]||0; }
+  return v > 0 ? pv / v : null;
+}
+
+function calcBB(closes, period = 20, mult = 2) {
+  if (closes.length < period) return null;
+  const sl = closes.slice(-period);
+  const mean = sl.reduce((a,b)=>a+b,0)/period;
+  const sd = Math.sqrt(sl.reduce((a,b)=>a+(b-mean)**2,0)/period);
+  const upper = mean+mult*sd, lower = mean-mult*sd;
+  const price = closes[closes.length-1];
+  return { pos:(price-lower)/(upper-lower), upper, lower, mean };
+}
+
+async function fetchQuote(symbol, finnhubKey) {
+  if (!finnhubKey) return generateMockQuote(symbol);
+  try {
+    const [quoteRes, metricRes] = await Promise.all([
+      fetch(FH_QUOTE(symbol, finnhubKey), { signal: AbortSignal.timeout(8000) }),
+      fetch(FH_METRIC(symbol, finnhubKey), { signal: AbortSignal.timeout(8000) }),
+    ]);
+    if (!quoteRes.ok) return generateMockQuote(symbol);
+    const quote = await quoteRes.json();
+    const metric = metricRes.ok ? await metricRes.json() : null;
+    const price = quote.c;
+    const prevClose = quote.pc;
+    if (!price || !prevClose) return generateMockQuote(symbol);
+
+    const change = price - prevClose;
+    const changePct = (change / prevClose) * 100;
+    const high52 = metric?.metric?.["52WeekHigh"] ?? quote.h;
+    const low52  = metric?.metric?.["52WeekLow"]  ?? quote.l;
+    const live = generateLiveIndicators(symbol, price, prevClose);
+    const { closes, highs, lows, volumes } = live;
+    const quant = {
+      adx:        calcADX(highs, lows, closes),
+      williamsR:  calcWilliamsR(highs, lows, closes),
+      stochastic: calcStochastic(highs, lows, closes),
+      roc:        calcROC(closes),
+      zScore:     calcZScore(closes),
+      cmf:        calcCMF(highs, lows, closes, volumes),
+      maxDrawdown:calcMaxDrawdown(closes),
+      sharpe:     calcSharpe(closes),
+    };
+
+    return {
+      symbol, price, change, changePct, prevClose,
+      high52, low52,
+      dayHigh: quote.h, dayLow: quote.l,
+      volume: quote.v ?? volumes[volumes.length-1],
+      ...live, quant,
+      marketState: "LIVE", lastFetched: Date.now(), isMock: false,
+    };
+  } catch {
+    return generateMockQuote(symbol);
+  }
+}
+
+function Sparkline({ data, up, width=80, height=28 }) {
+  if (!data||data.length<2) return null;
+  const min=Math.min(...data), max=Math.max(...data), range=max-min||1;
+  const pts = data.map((v,i)=>`${(i/(data.length-1))*width},${height-((v-min)/range)*height}`).join(" ");
+  return (
+    <svg width={width} height={height} style={{display:"block"}}>
+      <polyline points={pts} fill="none" stroke={up?"#2ECC71":"#E74C3C"} strokeWidth="1.5" opacity="0.85"/>
+    </svg>
+  );
+}
+
+function RSIBar({ rsi }) {
+  if (rsi==null) return <span style={{color:"#555",fontSize:10}}>—</span>;
+  const color = rsi>70?"#E74C3C":rsi<30?"#2ECC71":"#C9A84C";
+  return (
+    <div style={{display:"flex",alignItems:"center",gap:4}}>
+      <div style={{width:44,height:5,background:"#222",borderRadius:2,overflow:"hidden"}}>
+        <div style={{width:`${rsi}%`,height:"100%",background:color}}/>
+      </div>
+      <span style={{fontSize:9,color,letterSpacing:1}}>{rsi.toFixed(0)} {rsi>70?"OB":rsi<30?"OS":"NEU"}</span>
+    </div>
+  );
+}
+
+function ApiKeyModal({ onSave }) {
+  const [ak, setAk] = useState(()=>localStorage.getItem("anthropic_key")||"");
+  const [fk, setFk] = useState(()=>localStorage.getItem("finnhub_key")||"");
+  const valid = ak.startsWith("sk-") && fk.length > 5;
+  function save() {
+    if (!valid) return;
+    localStorage.setItem("anthropic_key", ak);
+    localStorage.setItem("finnhub_key", fk);
+    onSave(ak, fk);
+  }
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.88)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:999}}>
+      <div style={{background:"#0F0F0F",border:"1px solid #C9A84C",padding:28,width:400}}>
+        <div style={{fontSize:14,fontWeight:900,color:"#C9A84C",letterSpacing:3,marginBottom:8}}>◈ API KEYS REQUIRED</div>
+        <div style={{fontSize:10,color:"#666",marginBottom:16,lineHeight:1.7}}>
+          Both keys are stored locally in your browser only.
+        </div>
+        <div style={{fontSize:9,color:"#C9A84C",letterSpacing:2,marginBottom:4}}>ANTHROPIC KEY (AI analysis)</div>
+        <input value={ak} onChange={e=>setAk(e.target.value)} placeholder="sk-ant-..."
+          style={{width:"100%",boxSizing:"border-box",background:"#080808",border:"1px solid #2A2A2A",
+            color:"#D8D0C0",fontFamily:"'Courier New',monospace",fontSize:12,padding:"9px 12px",
+            outline:"none",marginBottom:14}}/>
+        <div style={{fontSize:9,color:"#C9A84C",letterSpacing:2,marginBottom:4}}>FINNHUB KEY (live prices)</div>
+        <input value={fk} onChange={e=>setFk(e.target.value)} placeholder="your finnhub key..."
+          onKeyDown={e=>e.key==="Enter"&&save()}
+          style={{width:"100%",boxSizing:"border-box",background:"#080808",border:"1px solid #2A2A2A",
+            color:"#D8D0C0",fontFamily:"'Courier New',monospace",fontSize:12,padding:"9px 12px",
+            outline:"none",marginBottom:14}}/>
+        <button onClick={save} disabled={!valid}
+          style={{width:"100%",background:valid?"#C9A84C":"#1A1A1A",color:valid?"#000":"#444",
+            border:"none",fontFamily:"'Courier New',monospace",fontWeight:900,fontSize:11,
+            letterSpacing:2,padding:10,cursor:valid?"pointer":"not-allowed"}}>
+          SAVE &amp; CONNECT
+        </button>
+        <div style={{fontSize:9,color:"#444",marginTop:10,lineHeight:1.6}}>
+          Anthropic: console.anthropic.com · Finnhub: finnhub.io · Not financial advice.
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Rank all loaded quotes by model edge and return the top N
+function rankOpportunities(quotes, topN = 3) {
+  return Object.values(quotes)
+    .filter(q => q && q.price)
+    .map(q => {
+      const m = scoreSetup(q);
+      const edge = Math.abs(parseFloat(m.lrProb) - 50); // 0–50, higher = more conviction
+      const treeBoost = m.treeSignal === "STRONG_BUY" || m.treeSignal === "STRONG_SELL" ? 8 : 0;
+      const atrPct = q.atr && q.price ? (q.atr / q.price) * 100 : 0;
+      const volBoost = (q.volRatio ?? 1) > 1.3 ? 4 : 0;
+      const score = edge + treeBoost + volBoost;
+      return { q, m, score };
+    })
+    .sort((a, b) => b.score - a.score)
+    .slice(0, topN);
+}
+
+function buildBestOpportunityContext(quotes, news = []) {
+  const top = rankOpportunities(quotes, 3);
+  const blocks = top.map(({ q, m }, i) => {
+    const pct52 = q.high52 && q.low52 ? ((q.price - q.low52) / (q.high52 - q.low52) * 100).toFixed(0) : "?";
+    return `
+--- CANDIDATE ${i + 1}: ${q.symbol} ---
+Price: $${q.price?.toFixed(2)}  Change: ${q.changePct >= 0 ? "+" : ""}${q.changePct?.toFixed(2)}%  52W pct: ${pct52}th
+RSI: ${q.rsi?.toFixed(1) || "N/A"}  MACD: ${q.macd != null ? (q.macd > 0 ? "BULL" : "BEAR") : "N/A"}  ATR: $${q.atr?.toFixed(2) || "N/A"}
+EMA9/20/50: $${q.ema9?.toFixed(2) || "?"} / $${q.ema20?.toFixed(2) || "?"} / $${q.ema50?.toFixed(2) || "?"}
+BB: ${q.bb ? (q.bb.pos * 100).toFixed(0) + "% of range" : "N/A"}  VWAP: $${q.vwap?.toFixed(2) || "N/A"}  Vol: ${q.volRatio?.toFixed(1) || "N/A"}x
+ADX: ${q.quant?.adx?.adx?.toFixed(1) || "N/A"}  Williams%R: ${q.quant?.williamsR?.toFixed(1) || "N/A"}  CMF: ${q.quant?.cmf?.toFixed(3) || "N/A"}
+LR Score: ${m.lrProb}% (${m.direction})  Tree: ${m.treeSignal} — ${m.treeReason}
+Crisis Match: ${m.crisis?.name || "N/A"} (${m.crisis ? (m.crisis.similarity * 100).toFixed(0) : 0}%)
+Suggested LONG: entry $${q.price?.toFixed(2)}, stop $${m.stopLong || "?"}, target $${m.tgt3Long || "?"}
+Suggested SHORT: entry $${q.price?.toFixed(2)}, stop $${m.stopShort || "?"}, target $${m.tgt3Short || "?"}`;
+  }).join("\n");
+
+  const headlineBlurb = news.length > 0
+    ? `\n=== TOP HEADLINES (last 100 days) ===\n${news.slice(0, 10).map(n => `[${n.source || ""}] ${n.title}`).join("\n")}`
+    : "";
+
+  return `=== BEST OPPORTUNITY SCAN — ${new Date().toLocaleTimeString()} ===
+The system has ranked ALL ${Object.keys(quotes).length} watchlist symbols by model conviction. The top 3 candidates are presented below. You MUST choose exactly ONE and provide a full actionable trade.
+${blocks}
+${headlineBlurb}
+
+INSTRUCTION: Review all three candidates. Choose the ONE with the cleanest, highest-conviction setup right now. Use the full output format. FINAL VERDICT must be BUY or SELL with specific levels.`;
+}
+
+function buildContext(quotes, selected, news = []) {
+  const q = quotes[selected];
+  if (!q) return `[No data for ${selected}]`;
+  const pct52 = q.high52&&q.low52 ? ((q.price-q.low52)/(q.high52-q.low52)*100).toFixed(0) : "?";
+  const model = scoreSetup(q);
+  const snapshot = Object.values(quotes).map(d=>
+    `${d.symbol.padEnd(5)} $${d.price?.toFixed(2).padStart(8)} ${(d.changePct>=0?"+":"")+d.changePct?.toFixed(2)}%  RSI:${d.rsi?.toFixed(0)||"?"}  Vol:${d.volRatio?.toFixed(1)||"?"}x`
+  ).join("\n");
+  return `=== LIVE DATA ${q.isMock?"(SIMULATED)":""} — ${new Date().toLocaleTimeString()} ===
+SYMBOL: ${selected}  Price: $${q.price?.toFixed(2)}  Change: ${q.changePct>=0?"+":""}${q.changePct?.toFixed(2)}%
+Day Range: $${q.dayLow?.toFixed(2)||"?"}–$${q.dayHigh?.toFixed(2)||"?"}
+52W Range: $${q.low52?.toFixed(2)||"?"}–$${q.high52?.toFixed(2)||"?"} (${pct52}th pct)
+5-bar momentum: ${q.momentum5!=null?(q.momentum5>=0?"+":"")+q.momentum5.toFixed(2)+"%":"N/A"}
+Volume: ${q.volRatio?.toFixed(1)||"N/A"}x avg
+
+TECHNICALS:
+RSI(14): ${q.rsi?.toFixed(1)||"N/A"} ${q.rsi>70?"⚠ OVERBOUGHT":q.rsi<30?"✓ OVERSOLD":""}
+MACD: ${q.macd?.toFixed(3)||"N/A"} (${q.macd!=null?(q.macd>0?"BULLISH":"BEARISH"):"N/A"})
+EMA9/20/50: $${q.ema9?.toFixed(2)||"?"} / $${q.ema20?.toFixed(2)||"?"} / $${q.ema50?.toFixed(2)||"?"}
+EMA Trend: ${q.ema9&&q.ema20?(q.ema9>q.ema20?"SHORT-TERM BULL":"SHORT-TERM BEAR"):"N/A"} | ${q.ema20&&q.ema50?(q.ema20>q.ema50?"MED-TERM BULL":"MED-TERM BEAR"):"N/A"}
+VWAP: $${q.vwap?.toFixed(2)||"N/A"} → ${q.vwap?(q.price>q.vwap?"ABOVE (intraday strength)":"BELOW (intraday weakness)"):"N/A"}
+ATR(14): $${q.atr?.toFixed(2)||"N/A"}
+Bollinger: ${q.bb?(q.bb.pos*100).toFixed(0)+"% of range (upper=$"+q.bb.upper.toFixed(2)+", lower=$"+q.bb.lower.toFixed(2)+")":"N/A"}
+
+=== QUANT ANALYSIS (Institutional Grade) ===
+ADX(14): ${q.quant?.adx?.adx?.toFixed(1)||"N/A"} ${q.quant?.adx?.adx>25?"(TRENDING)":"(WEAK TREND)"}  DI+: ${q.quant?.adx?.diPlus?.toFixed(1)||"?"}  DI-: ${q.quant?.adx?.diMinus?.toFixed(1)||"?"}
+Williams %R: ${q.quant?.williamsR?.toFixed(1)||"N/A"} ${q.quant?.williamsR<-80?"OVERSOLD":q.quant?.williamsR>-20?"OVERBOUGHT":"NEUTRAL"}
+Stochastic: K=${q.quant?.stochastic?.k?.toFixed(1)||"?"}  D=${q.quant?.stochastic?.d?.toFixed(1)||"?"}
+ROC(10): ${q.quant?.roc!=null?(q.quant.roc>=0?"+":"")+q.quant.roc.toFixed(2)+"%":"N/A"}
+Z-Score(20): ${q.quant?.zScore?.toFixed(2)||"N/A"} ${Math.abs(q.quant?.zScore||0)>2?"⚠ EXTENDED":"within normal range"}
+Chaikin Money Flow: ${q.quant?.cmf?.toFixed(3)||"N/A"} ${q.quant?.cmf>0.1?"BUYING PRESSURE":q.quant?.cmf<-0.1?"SELLING PRESSURE":"NEUTRAL"}
+Max Drawdown: ${q.quant?.maxDrawdown?.toFixed(2)||"N/A"}%
+Sharpe (ann.): ${q.quant?.sharpe?.toFixed(2)||"N/A"}
+
+=== FEATURE ENGINEERING ===
+${(()=>{ const f=engineerFeatures(q, quotes); return [
+  `EMA Alignment: ${f.emaScore}/3 — ${f.emaLabel}`,
+  `Momentum Composite: ${f.momentumComposite}% — ${f.momentumLabel}`,
+  `Volatility Regime: ${f.volRegime}  ATR%: ${f.atrPct}%`,
+  `BB State: ${f.bbState||"N/A"}  Bandwidth: ${f.bbBandwidth||"?"}%`,
+  `Relative Strength vs SPY: ${f.relStrVsSpy!=null?(f.relStrVsSpy>=0?"+":"")+f.relStrVsSpy+"%":"N/A"}`,
+  `VWAP Deviation: ${f.vwapDev!=null?(f.vwapDev>=0?"+":"")+f.vwapDev+"%":"N/A"}`,
+  `Volume Trend: ${f.volTrendLabel||"N/A"} (${f.volTrend||"?"}x recent vs prior)`,
+].join("\n"); })()}
+
+=== PRE-TRAINED MODEL OUTPUT ===
+LR Probability (bullish): ${model.lrProb}%
+Direction: ${model.direction} | Confidence: ${model.confidence}%
+Decision Tree: ${model.treeSignal} — ${model.treeReason}
+Nearest Crisis Analogue: ${model.crisis?.name||"N/A"} (${model.crisis?(model.crisis.similarity*100).toFixed(0)+"% similarity":"N/A"})
+Crisis Note: ${model.crisis?.note||"N/A"}
+Suggested LONG: entry $${q.price?.toFixed(2)}, stop $${model.stopLong||"?"}, target $${model.tgt3Long||"?"}
+Suggested SHORT: entry $${q.price?.toFixed(2)}, stop $${model.stopShort||"?"}, target $${model.tgt3Short||"?"}
+
+Last 10 closes: ${q.closes?.slice(-10).map(c=>"$"+c?.toFixed(2)).join(", ")||"N/A"}
+
+=== LIVE NEWS — GEOPOLITICAL & MARKET CONTEXT (last 100 days) ===
+${news.length>0 ? news.slice(0,20).map(n=>`[${n.date.toLocaleDateString()}][${n.source||"News"}] ${n.title}`).join("\n") : "[No news loaded — fetch from NEWS tab]"}
+
+=== WATCHLIST SNAPSHOT ===
+${snapshot}`;
+}
+
+export default function App() {
+  const [quotes, setQuotes] = useState({});
+  const [selected, setSelected] = useState("SPY");
+  const [messages, setMessages] = useState([]);
+  const [chatHistory, setChatHistory] = useState([]);
+  const [input, setInput] = useState("");
+  const [thinking, setThinking] = useState(false);
+  const [lastRefresh, setLastRefresh] = useState(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [tab, setTab] = useState("chat");
+  const [apiKey, setApiKey] = useState(()=>localStorage.getItem("anthropic_key")||"");
+  const [finnhubKey, setFinnhubKey] = useState(()=>localStorage.getItem("finnhub_key")||"");
+  const [decisionLog, setDecisionLog] = useState(()=>getLog());
+  const [loggedMsgIds, setLoggedMsgIds] = useState(new Set());
+  const [news, setNews] = useState([]);
+  const [newsLoading, setNewsLoading] = useState(false);
+  const chatRef = useRef(null);
+
+  const refreshAll = useCallback(async (silent=false) => {
+    if (!silent) setRefreshing(true);
+    const results = await Promise.all(WATCHLIST.map(s=>fetchQuote(s, finnhubKey)));
+    const map = {};
+    results.forEach((r,i)=>{ if(r) map[WATCHLIST[i]]=r; });
+    setQuotes(prev=>({...prev,...map}));
+    setLastRefresh(Date.now());
+    if (!silent) setRefreshing(false);
+  }, []);
+
+  useEffect(() => {
+    refreshAll();
+    const id = setInterval(()=>refreshAll(true), 30000);
+    return ()=>clearInterval(id);
+  }, [refreshAll]);
+
+  useEffect(() => {
+    setNewsLoading(true);
+    fetchAllNews()
+      .then(articles => setNews(articles))
+      .catch(()=>{})
+      .finally(()=>setNewsLoading(false));
+  }, []);
+
+  useEffect(() => {
+    if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight;
+  }, [messages, thinking]);
+
+  async function sendToAI(userText) {
+    setThinking(true);
+    const context = buildContext(quotes, selected, news);
+    const fullContent = `${context}\n\nUSER: ${userText}`;
+    const newHistory = [...chatHistory, { role:"user", content:fullContent }];
+    setChatHistory(newHistory);
+    setMessages(prev=>[...prev, { type:"user", text:userText }]);
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+        },
+        body: JSON.stringify({
+          model: "claude-opus-4-5",
+          max_tokens: 4096,
+          system: SYSTEM_PROMPT,
+          messages: newHistory,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok||data.error) {
+        setMessages(prev=>[...prev,{type:"bot",text:`⚠️ API error: ${data.error?.message||`HTTP ${res.status}`}`}]);
+        setThinking(false); return;
+      }
+      const reply = data.content?.filter(b=>b.type==="text").map(b=>b.text).join("\n")||"No response.";
+      setChatHistory(prev=>[...prev,{role:"assistant",content:reply}]);
+      // Parse any trade verdict from the reply and attach to message so user can manually log
+      const q = quotes[selected];
+      const verdictMatch = reply.match(/FINAL VERDICT:\s*(BUY|SELL|AVOID)/i);
+      let tradeData = null;
+      if (q && verdictMatch) {
+        const model = scoreSetup(q);
+        tradeData = {
+          symbol: selected, entryPrice: q.price,
+          verdict:    verdictMatch[1].toUpperCase(),
+          stop:       parseFloat(reply.match(/Stop:\s*\$?([\d.]+)/i)?.[1]) || null,
+          target:     parseFloat(reply.match(/Target:\s*\$?([\d.]+)/i)?.[1]) || null,
+          rr:         parseFloat(reply.match(/R\/R:\s*([\d.]+)/i)?.[1]) || null,
+          confidence: reply.match(/Confidence:\s*(HIGH|MEDIUM|LOW)/i)?.[1] || null,
+          modelScore: { direction: model.direction, confidence: model.confidence, treeSignal: model.treeSignal },
+          features: model.features,
+        };
+      }
+      const msgId = Date.now();
+      setMessages(prev=>[...prev,{id: msgId, type:"bot", text:reply, tradeData}]);
+    } catch(err) {
+      setMessages(prev=>[...prev,{type:"bot",text:`⚠️ Connection failed: ${err.message}`}]);
+    }
+    setThinking(false);
+  }
+
+  function handleSend() {
+    if (!input.trim()||thinking) return;
+    const txt = input.trim(); setInput(""); sendToAI(txt);
+  }
+
+  async function sendBestOpportunity() {
+    if (thinking || Object.keys(quotes).length < 3) return;
+    setThinking(true);
+    setTab("chat");
+    const context = buildBestOpportunityContext(quotes, news);
+    setMessages(prev=>[...prev,{type:"user",text:"⚡ BEST OPPORTUNITY SCAN — rank all stocks and pick ONE trade now."}]);
+    const newHistory = [...chatHistory, { role:"user", content:context }];
+    setChatHistory(newHistory);
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method:"POST",
+        headers:{
+          "Content-Type":"application/json",
+          "x-api-key":apiKey,
+          "anthropic-version":"2023-06-01",
+          "anthropic-dangerous-direct-browser-access":"true",
+        },
+        body: JSON.stringify({
+          model:"claude-opus-4-5",
+          max_tokens:4096,
+          system:SYSTEM_PROMPT,
+          messages:newHistory,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok||data.error) {
+        setMessages(prev=>[...prev,{type:"bot",text:`⚠️ API error: ${data.error?.message||`HTTP ${res.status}`}`}]);
+        setThinking(false); return;
+      }
+      const reply = data.content?.filter(b=>b.type==="text").map(b=>b.text).join("\n")||"No response.";
+      setChatHistory(prev=>[...prev,{role:"assistant",content:reply}]);
+      setMessages(prev=>[...prev,{type:"bot",text:reply}]);
+      // Detect which symbol was picked and log it
+      const symMatch = reply.match(/(?:FINAL VERDICT.*?|picking|chosen?|trade on|go with)\s+([A-Z]{2,6})/i);
+      const pickedSym = symMatch ? WATCHLIST.find(s => s === symMatch[1].toUpperCase()) : null;
+      const logSym = pickedSym || selected;
+      const q = quotes[logSym];
+      const verdictMatch = reply.match(/FINAL VERDICT:\s*(BUY|SELL|AVOID)/i);
+      let tradeData = null;
+      if (q && verdictMatch) {
+        const model = scoreSetup(q);
+        tradeData = {
+          symbol: logSym, entryPrice: q.price,
+          verdict:    verdictMatch[1].toUpperCase(),
+          stop:       parseFloat(reply.match(/Stop:\s*\$?([\d.]+)/i)?.[1]) || null,
+          target:     parseFloat(reply.match(/Target:\s*\$?([\d.]+)/i)?.[1]) || null,
+          rr:         parseFloat(reply.match(/R\/R:\s*([\d.]+)/i)?.[1]) || null,
+          confidence: reply.match(/Confidence:\s*(HIGH|MEDIUM|LOW)/i)?.[1] || null,
+          modelScore: { direction:model.direction, confidence:model.confidence, treeSignal:model.treeSignal },
+          features: model.features,
+        };
+        if (pickedSym) setSelected(pickedSym);
+      }
+      const msgId = Date.now();
+      setMessages(prev=>[...prev,{id: msgId, type:"bot", text:reply, tradeData}]);
+    } catch(err) {
+      setMessages(prev=>[...prev,{type:"bot",text:`⚠️ Connection failed: ${err.message}`}]);
+    }
+    setThinking(false);
+  }
+
+  const selQ = quotes[selected];
+  const marketUp = selQ ? selQ.changePct>=0 : true;
+  const loadedCount = Object.keys(quotes).length;
+  const mockCount = Object.values(quotes).filter(q=>q.isMock).length;
+
+  if (!apiKey||!finnhubKey) return <ApiKeyModal onSave={(ak,fk)=>{setApiKey(ak);setFinnhubKey(fk);}}/>;
+
+  return (
+    <div style={{display:"flex",flexDirection:"column",height:"100vh",background:"#080808",
+      color:"#D8D0C0",fontFamily:"'Courier New',monospace",overflow:"hidden"}}>
+
+      {/* Header */}
+      <div style={{background:"#0F0F0F",borderBottom:"1px solid #1E1E1E",padding:"8px 14px",
+        display:"flex",alignItems:"center",gap:12,flexShrink:0}}>
+        <div style={{fontSize:18,fontWeight:900,color:"#C9A84C",letterSpacing:4}}>◈ THE TRADER</div>
+        <div style={{flex:1,fontSize:9,color:"#555",letterSpacing:2}}>Livermore · Tudor Jones · Dennis · Simons · Williams</div>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          {mockCount>0&&<span style={{fontSize:9,color:"#C9A84C",letterSpacing:1}}>SIM {mockCount}/{loadedCount}</span>}
+          <div style={{width:6,height:6,borderRadius:"50%",
+            background:refreshing?"#C9A84C":loadedCount>0?"#2ECC71":"#555",animation:"pulse 2s infinite"}}/>
+          <span style={{fontSize:9,color:"#555",letterSpacing:1}}>
+            {lastRefresh?`${loadedCount}/${WATCHLIST.length} · ${new Date(lastRefresh).toLocaleTimeString()}`:"CONNECTING..."}
+          </span>
+          <button onClick={sendBestOpportunity} disabled={thinking||loadedCount<3}
+            style={{background:thinking||loadedCount<3?"#1A1500":"#C9A84C",
+              color:thinking||loadedCount<3?"#555":"#000",border:"none",fontFamily:"'Courier New',monospace",
+              fontWeight:900,fontSize:9,letterSpacing:1,padding:"4px 10px",
+              cursor:thinking||loadedCount<3?"not-allowed":"pointer"}}>
+            ★ BEST TRADE
+          </button>
+          <button onClick={()=>refreshAll()} style={{background:"#1A1A1A",border:"1px solid #2A2A2A",
+            color:"#888",fontSize:9,padding:"3px 8px",cursor:"pointer",letterSpacing:1,fontFamily:"inherit"}}>
+            ↻ REFRESH
+          </button>
+          <button onClick={()=>setApiKey("")} style={{background:"#1A1A1A",border:"1px solid #2A2A2A",
+            color:"#555",fontSize:9,padding:"3px 8px",cursor:"pointer",letterSpacing:1,fontFamily:"inherit"}}>
+            KEY
+          </button>
+        </div>
+      </div>
+
+      {/* Ticker */}
+      <div style={{background:"#0C0C0C",borderBottom:"1px solid #1E1E1E",overflow:"hidden",height:24,flexShrink:0}}>
+        <div style={{display:"flex",whiteSpace:"nowrap",height:"100%",alignItems:"center",
+          animation:"ticker 35s linear infinite",fontSize:10,letterSpacing:"0.05em"}}>
+          {[...WATCHLIST,...WATCHLIST].map((sym,i)=>{
+            const q=quotes[sym]; const up=q?q.changePct>=0:true;
+            return <span key={i} style={{marginRight:32,color:up?"#2ECC71":"#E74C3C",fontWeight:600}}>
+              {up?"▲":"▼"} {sym} {q?`$${q.price?.toFixed(2)} (${q.changePct>=0?"+":""}${q.changePct?.toFixed(2)}%)`:"..."}
+            </span>;
+          })}
+        </div>
+      </div>
+
+      <div style={{flex:1,display:"flex",overflow:"hidden"}}>
+        {/* Watchlist */}
+        <div style={{width:200,background:"#0C0C0C",borderRight:"1px solid #1A1A1A",overflowY:"auto",flexShrink:0}}>
+          <div style={{padding:"8px 10px",fontSize:8,color:"#444",letterSpacing:2,borderBottom:"1px solid #1A1A1A"}}>
+            WATCHLIST · {loadedCount}/{WATCHLIST.length}
+          </div>
+          {WATCHLIST.map(sym=>{
+            const q=quotes[sym]; const up=q?q.changePct>=0:null; const isSel=sym===selected;
+            return (
+              <div key={sym} onClick={()=>setSelected(sym)} style={{padding:"8px 10px",cursor:"pointer",
+                background:isSel?"#1A1500":"transparent",
+                borderLeft:isSel?"2px solid #C9A84C":"2px solid transparent",borderBottom:"1px solid #111"}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                  <span style={{fontSize:12,fontWeight:700,color:isSel?"#C9A84C":"#CCC",letterSpacing:1}}>{sym}</span>
+                  {q&&<span style={{fontSize:10,color:up?"#2ECC71":"#E74C3C",fontWeight:600}}>
+                    {up?"+":""}{q.changePct?.toFixed(2)}%
+                  </span>}
+                </div>
+                {q&&<div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:2}}>
+                  <span style={{fontSize:11,color:"#888"}}>${q.price?.toFixed(2)}</span>
+                  <RSIBar rsi={q.rsi}/>
+                </div>}
+                {q&&<Sparkline data={q.sparkline} up={up} width={180} height={18}/>}
+                {!q&&<div style={{fontSize:9,color:"#333",marginTop:4}}>loading...</div>}
+                {q?.isMock&&<div style={{fontSize:8,color:"#555",letterSpacing:1}}>SIMULATED</div>}
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Main panel */}
+        <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
+          {selQ&&(
+            <div style={{background:"#0F0F0F",borderBottom:"1px solid #1A1A1A",padding:"10px 14px",
+              display:"flex",alignItems:"center",gap:16,flexShrink:0,flexWrap:"wrap"}}>
+              <div>
+                <span style={{fontSize:20,fontWeight:900,color:"#FFF",letterSpacing:2}}>{selected}</span>
+                <span style={{fontSize:22,marginLeft:10,color:"#FFF"}}>${selQ.price?.toFixed(2)}</span>
+                <span style={{fontSize:14,marginLeft:8,color:marketUp?"#2ECC71":"#E74C3C",fontWeight:700}}>
+                  {marketUp?"▲":"▼"} {selQ.changePct>=0?"+":""}{selQ.changePct?.toFixed(2)}%
+                </span>
+                {selQ.isMock&&<span style={{fontSize:9,color:"#C9A84C",marginLeft:8,letterSpacing:1}}>SIMULATED</span>}
+              </div>
+              <div style={{display:"flex",gap:14,marginLeft:10,flexWrap:"wrap"}}>
+                {[
+                  ["RSI",selQ.rsi!=null?`${selQ.rsi.toFixed(0)}${selQ.rsi>70?" ⚠":selQ.rsi<30?" ✓":""}`:"-"],
+                  ["MACD",selQ.macd!=null?(selQ.macd>0?"▲ BULL":"▼ BEAR"):"-"],
+                  ["VWAP",selQ.vwap?`$${selQ.vwap.toFixed(2)}`:"-"],
+                  ["ATR",selQ.atr?`$${selQ.atr.toFixed(2)}`:"-"],
+                  ["VOL",selQ.volRatio?`${selQ.volRatio.toFixed(1)}x`:"-"],
+                  ["BB",selQ.bb?`${(selQ.bb.pos*100).toFixed(0)}%`:"-"],
+                ].map(([label,val])=>(
+                  <div key={label} style={{textAlign:"center"}}>
+                    <div style={{fontSize:8,color:"#555",letterSpacing:1}}>{label}</div>
+                    <div style={{fontSize:11,color:"#C9A84C",fontWeight:700}}>{val}</div>
+                  </div>
+                ))}
+              </div>
+              <div style={{marginLeft:"auto"}}>
+                <button onClick={()=>{setTab("chat");sendToAI(`Give me your full trading assessment on ${selected} right now.`);}}
+                  disabled={thinking} style={{
+                    background:thinking?"#1A1A1A":"#C9A84C",color:thinking?"#444":"#000",
+                    border:"none",fontFamily:"'Courier New',monospace",fontWeight:900,
+                    fontSize:11,letterSpacing:2,padding:"7px 14px",cursor:thinking?"not-allowed":"pointer"}}>
+                  ⚡ ANALYZE NOW
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Tabs */}
+          <div style={{display:"flex",borderBottom:"1px solid #1A1A1A",background:"#0C0C0C",flexShrink:0}}>
+            {[["chat","💬 ANALYSIS"],["data","📊 RAW DATA"],["log","📋 LOG"],["model","🤖 MODEL"],["quant","📐 QUANT"],["news","📰 NEWS"]].map(([t,label])=>(
+              <button key={t} onClick={()=>setTab(t)} style={{
+                padding:"8px 14px",fontSize:9,letterSpacing:2,textTransform:"uppercase",
+                background:tab===t?"#1A1A1A":"transparent",border:"none",
+                borderBottom:tab===t?"2px solid #C9A84C":"2px solid transparent",
+                color:tab===t?"#C9A84C":"#555",cursor:"pointer",fontFamily:"inherit"}}>
+                {label}
+              </button>
+            ))}
+          </div>
+
+          {tab==="data"&&(
+            <div style={{flex:1,overflowY:"auto",padding:14,fontSize:11,color:"#888"}}>
+              <pre style={{whiteSpace:"pre-wrap",fontFamily:"'Courier New',monospace",fontSize:11,margin:0}}>
+                {buildContext(quotes,selected,news)}
+              </pre>
+            </div>
+          )}
+
+          {tab==="model"&&(()=>{
+            const q = quotes[selected];
+            const m = q ? scoreSetup(q) : null;
+            return (
+              <div style={{flex:1,overflowY:"auto",padding:14,fontSize:11,color:"#888"}}>
+                {!m ? <div>No data</div> : (
+                  <div style={{display:"flex",flexDirection:"column",gap:12}}>
+                    <div style={{color:"#C9A84C",fontSize:13,fontWeight:900,letterSpacing:2}}>{selected} — MODEL READOUT</div>
+                    <div style={{background:"#111",border:"1px solid #1E1E1E",padding:12}}>
+                      <div style={{fontSize:9,color:"#555",letterSpacing:2,marginBottom:8}}>LOGISTIC REGRESSION</div>
+                      <div style={{fontSize:18,fontWeight:900,color:m.lrProb>58?"#2ECC71":m.lrProb<42?"#E74C3C":"#C9A84C"}}>
+                        {m.direction} — {m.lrProb}% bullish probability
+                      </div>
+                      <div style={{marginTop:8,fontSize:10,color:"#666"}}>Confidence: {m.confidence}%</div>
+                      <div style={{marginTop:4,width:"100%",height:6,background:"#222",borderRadius:3}}>
+                        <div style={{width:`${m.lrProb}%`,height:"100%",background:m.lrProb>58?"#2ECC71":m.lrProb<42?"#E74C3C":"#C9A84C",borderRadius:3}}/>
+                      </div>
+                    </div>
+                    <div style={{background:"#111",border:"1px solid #1E1E1E",padding:12}}>
+                      <div style={{fontSize:9,color:"#555",letterSpacing:2,marginBottom:8}}>DECISION TREE</div>
+                      <div style={{fontSize:14,fontWeight:700,color:
+                        m.treeSignal==="STRONG_BUY"?"#2ECC71":
+                        m.treeSignal==="BUY"?"#2ECC71":
+                        m.treeSignal==="STRONG_SELL"?"#E74C3C":
+                        m.treeSignal==="SELL"?"#E74C3C":"#C9A84C"
+                      }}>{m.treeSignal}</div>
+                      <div style={{fontSize:10,color:"#666",marginTop:4}}>{m.treeReason}</div>
+                    </div>
+                    <div style={{background:"#111",border:"1px solid #1E1E1E",padding:12}}>
+                      <div style={{fontSize:9,color:"#555",letterSpacing:2,marginBottom:8}}>NEAREST HISTORICAL CRISIS ANALOGUE</div>
+                      <div style={{fontSize:13,fontWeight:700,color:"#C9A84C"}}>{m.crisis?.name}</div>
+                      <div style={{fontSize:10,color:"#888",marginTop:4}}>{m.crisis?.note}</div>
+                      <div style={{marginTop:8,fontSize:10,color:"#555"}}>Similarity: {m.crisis?(m.crisis.similarity*100).toFixed(0):0}%</div>
+                      <div style={{marginTop:4,width:"100%",height:4,background:"#222",borderRadius:2}}>
+                        <div style={{width:`${m.crisis?(m.crisis.similarity*100):0}%`,height:"100%",background:"#C9A84C",borderRadius:2}}/>
+                      </div>
+                    </div>
+                    <div style={{background:"#111",border:"1px solid #1E1E1E",padding:12}}>
+                      <div style={{fontSize:9,color:"#555",letterSpacing:2,marginBottom:8}}>SUGGESTED LEVELS (1.5 ATR stop, 3:1 R/R)</div>
+                      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+                        {[["LONG entry",`$${q.price?.toFixed(2)}`],["LONG stop",`$${m.stopLong||"?"}`],
+                          ["LONG target",`$${m.tgt3Long||"?"}`],["SHORT entry",`$${q.price?.toFixed(2)}`],
+                          ["SHORT stop",`$${m.stopShort||"?"}`],["SHORT target",`$${m.tgt3Short||"?"}`]
+                        ].map(([l,v])=>(
+                          <div key={l}>
+                            <div style={{fontSize:8,color:"#444",letterSpacing:1}}>{l}</div>
+                            <div style={{fontSize:12,color:"#C9A84C",fontWeight:700}}>{v}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })()}
+
+          {tab==="log"&&(()=>{
+            const stats = getPerformanceStats();
+            const reviewed = decisionLog.filter(d=>d.reviewed && d.features);
+            const wts = getCurrentWeights();
+            const FEATURE_NAMES = ["RSI","MACD","Mom","BB","EMA9/20","EMA20/50","Vol"];
+            return (
+              <div style={{flex:1,overflowY:"auto",padding:14}}>
+                {/* Header row */}
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}}>
+                  <div style={{color:"#C9A84C",fontSize:11,letterSpacing:2}}>DECISION LOG — {decisionLog.length} entries</div>
+                  <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+                    {stats&&<div style={{fontSize:10,color:"#888"}}>
+                      Win: <span style={{color:stats.winRate>50?"#2ECC71":"#E74C3C",fontWeight:700}}>{stats.winRate}%</span>
+                      &nbsp;·&nbsp;<span style={{color:stats.avgPnl>0?"#2ECC71":"#E74C3C",fontWeight:700}}>{stats.avgPnl>0?"+":""}{stats.avgPnl}%</span>
+                      &nbsp;·&nbsp;{stats.wins}W/{stats.losses}L
+                    </div>}
+                    <button
+                      disabled={reviewed.length < 2}
+                      onClick={()=>{
+                        const res = adaptWeights(decisionLog.filter(d=>d.reviewed));
+                        alert(`Model updated from ${res.trained} reviewed trades.\nWeights adapted via gradient descent (${40} epochs).`);
+                      }}
+                      style={{background:reviewed.length>=2?"#0A1A2A":"#111",
+                        border:`1px solid ${reviewed.length>=2?"#2A6A9A":"#2A2A2A"}`,
+                        color:reviewed.length>=2?"#5AACDF":"#444",
+                        fontSize:9,padding:"4px 10px",cursor:reviewed.length>=2?"pointer":"not-allowed",
+                        fontFamily:"inherit",letterSpacing:1}}>
+                      🧠 LEARN ({reviewed.length} trades)
+                    </button>
+                    <button
+                      onClick={()=>{resetWeights();alert("Model weights reset to defaults.");}}
+                      style={{background:"#111",border:"1px solid #2A2A2A",color:"#444",
+                        fontSize:9,padding:"4px 8px",cursor:"pointer",fontFamily:"inherit",letterSpacing:1}}>
+                      RESET MODEL
+                    </button>
+                  </div>
+                </div>
+
+                {/* Current weights display */}
+                <div style={{background:"#0A0A0A",border:"1px solid #1A1A1A",padding:"8px 10px",marginBottom:12,fontSize:9,color:"#444"}}>
+                  <span style={{color:"#555",letterSpacing:1}}>LR WEIGHTS: </span>
+                  {FEATURE_NAMES.map((n,i)=>(
+                    <span key={n} style={{marginRight:10,color:wts.weights[i]>0?"#2ECC71":"#E74C3C"}}>
+                      {n}:{wts.weights[i]?.toFixed(2)}
+                    </span>
+                  ))}
+                </div>
+
+                {decisionLog.length===0&&<div style={{color:"#333",fontSize:11,lineHeight:1.7}}>
+                  No decisions logged yet. Every AI verdict (BUY, SELL, or AVOID) is now logged automatically.
+                </div>}
+
+                {decisionLog.map(d=>{
+                  const q = quotes[d.symbol];
+                  const currentPrice = q?.price;
+                  const isAvoid = d.verdict === "AVOID";
+                  const livePnl = currentPrice && !d.reviewed && !isAvoid ? (d.verdict==="BUY"
+                    ? ((currentPrice-d.entryPrice)/d.entryPrice*100)
+                    : ((d.entryPrice-currentPrice)/d.entryPrice*100)
+                  ).toFixed(2) : null;
+                  const pnl = d.reviewed ? d.pnlPct : livePnl;
+                  const verdictColor = d.verdict==="BUY"?"#2ECC71":d.verdict==="SELL"?"#E74C3C":"#666";
+                  const outcomeColor = d.outcome==="WIN"?"#2ECC71":d.outcome==="LOSS"?"#E74C3C":"#C9A84C";
+                  return (
+                    <div key={d.id} style={{background:"#0C0C0C",border:"1px solid #1A1A1A",
+                      borderLeft:`3px solid ${verdictColor}`,padding:10,marginBottom:6,
+                      opacity:isAvoid?0.6:1}}>
+                      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+                        <div>
+                          <span style={{fontWeight:900,color:"#FFF",fontSize:13,letterSpacing:1}}>{d.symbol}</span>
+                          <span style={{marginLeft:8,fontWeight:900,color:verdictColor,fontSize:12}}>{d.verdict}</span>
+                          {d.confidence&&<span style={{marginLeft:6,fontSize:9,color:"#555",letterSpacing:1}}>{d.confidence}</span>}
+                        </div>
+                        <span style={{fontSize:9,color:"#333"}}>{new Date(d.timestamp).toLocaleString()}</span>
+                      </div>
+                      <div style={{display:"flex",gap:12,marginTop:6,fontSize:10,color:"#888",flexWrap:"wrap"}}>
+                        <span>@ <b style={{color:"#FFF"}}>${d.entryPrice?.toFixed(2)}</b></span>
+                        {d.stop&&<span>SL:<b style={{color:"#E74C3C"}}>${d.stop}</b></span>}
+                        {d.target&&<span>TP:<b style={{color:"#2ECC71"}}>${d.target}</b></span>}
+                        {d.rr&&<span>R/R:<b style={{color:"#C9A84C"}}>{d.rr}:1</b></span>}
+                        {currentPrice&&!d.reviewed&&!isAvoid&&<span>Now:<b style={{color:"#FFF"}}>${currentPrice?.toFixed(2)}</b></span>}
+                        {pnl!=null&&<span>P&L:<b style={{color:pnl>0?"#2ECC71":"#E74C3C"}}>{pnl>0?"+":""}{pnl}%</b></span>}
+                        {d.reviewed&&<span style={{color:outcomeColor,fontWeight:900}}>{d.outcome}</span>}
+                      </div>
+                      <div style={{fontSize:8,color:"#2A2A2A",marginTop:4}}>
+                        {d.modelScore?.direction} · {d.modelScore?.treeSignal} · {d.modelScore?.confidence}%
+                      </div>
+                      {!d.reviewed&&!isAvoid&&currentPrice&&(
+                        <button onClick={()=>setDecisionLog(reviewDecision(d.id, currentPrice))}
+                          style={{marginTop:6,background:"#1A1500",border:"1px solid #C9A84C",color:"#C9A84C",
+                            fontSize:9,padding:"3px 8px",cursor:"pointer",fontFamily:"inherit",letterSpacing:1}}>
+                          ✓ REVIEW (${currentPrice?.toFixed(2)})
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+                {decisionLog.length>0&&(
+                  <button onClick={()=>{localStorage.removeItem("trader_decision_log");setDecisionLog([]);}}
+                    style={{marginTop:8,background:"#1A0808",border:"1px solid #4A1A1A",color:"#E74C3C",
+                      fontSize:9,padding:"4px 10px",cursor:"pointer",fontFamily:"inherit",letterSpacing:1}}>
+                    CLEAR LOG
+                  </button>
+                )}
+              </div>
+            );
+          })()}
+
+          {tab==="quant"&&(()=>{
+            const q = quotes[selected];
+            if (!q) return <div style={{padding:14,color:"#333"}}>No data</div>;
+            const qt = q.quant||{};
+            const f = engineerFeatures(q, quotes);
+            const beta = calcBeta(q.closes||[], quotes.SPY?.closes||[]);
+            const rows = [
+              ["ADX(14)", qt.adx?.adx?.toFixed(1)||"—", qt.adx?.adx>25?"TRENDING":"WEAK", qt.adx?.adx>50?"#E74C3C":qt.adx?.adx>25?"#C9A84C":"#555"],
+              ["DI+ / DI−", `${qt.adx?.diPlus?.toFixed(1)||"?"}  /  ${qt.adx?.diMinus?.toFixed(1)||"?"}`, qt.adx?.diPlus>qt.adx?.diMinus?"BULL DI":"BEAR DI", qt.adx?.diPlus>qt.adx?.diMinus?"#2ECC71":"#E74C3C"],
+              ["Williams %R", qt.williamsR?.toFixed(1)||"—", qt.williamsR<-80?"OVERSOLD":qt.williamsR>-20?"OVERBOUGHT":"NEUTRAL", qt.williamsR<-80?"#2ECC71":qt.williamsR>-20?"#E74C3C":"#888"],
+              ["Stoch K/D", `${qt.stochastic?.k?.toFixed(1)||"?"}  /  ${qt.stochastic?.d?.toFixed(1)||"?"}`, qt.stochastic?.k>80?"OVERBOUGHT":qt.stochastic?.k<20?"OVERSOLD":"NEUTRAL", qt.stochastic?.k>80?"#E74C3C":qt.stochastic?.k<20?"#2ECC71":"#888"],
+              ["ROC(10)", qt.roc!=null?(qt.roc>=0?"+":"")+qt.roc.toFixed(2)+"%":"—", qt.roc>0?"POSITIVE":"NEGATIVE", qt.roc>0?"#2ECC71":"#E74C3C"],
+              ["Z-Score(20)", qt.zScore?.toFixed(2)||"—", Math.abs(qt.zScore||0)>2?"EXTENDED":Math.abs(qt.zScore||0)>1?"ELEVATED":"NORMAL", Math.abs(qt.zScore||0)>2?"#E74C3C":Math.abs(qt.zScore||0)>1?"#C9A84C":"#888"],
+              ["CMF(20)", qt.cmf?.toFixed(3)||"—", qt.cmf>0.1?"BUYING":qt.cmf<-0.1?"SELLING":"NEUTRAL", qt.cmf>0.1?"#2ECC71":qt.cmf<-0.1?"#E74C3C":"#888"],
+              ["Max Drawdown", qt.maxDrawdown?.toFixed(2)+"%"||"—", "from peak", qt.maxDrawdown>20?"#E74C3C":"#888"],
+              ["Sharpe (ann.)", qt.sharpe?.toFixed(2)||"—", qt.sharpe>1?"GOOD":qt.sharpe>0?"POSITIVE":qt.sharpe!=null?"NEGATIVE":"—", qt.sharpe>1?"#2ECC71":qt.sharpe>0?"#C9A84C":"#E74C3C"],
+              ["Beta vs SPY", beta?.toFixed(2)||"—", beta>1.5?"HIGH BETA":beta<0.5?"LOW BETA":"MODERATE", beta>1.5?"#E74C3C":"#888"],
+            ];
+            return (
+              <div style={{flex:1,overflowY:"auto",padding:14}}>
+                <div style={{color:"#C9A84C",fontSize:11,letterSpacing:2,marginBottom:12}}>INSTITUTIONAL QUANT — {selected}</div>
+                <div style={{marginBottom:16}}>
+                  {rows.map(([label,val,note,color])=>(
+                    <div key={label} style={{display:"flex",justifyContent:"space-between",alignItems:"center",
+                      padding:"7px 10px",borderBottom:"1px solid #111",background:"#0C0C0C"}}>
+                      <span style={{fontSize:10,color:"#555",letterSpacing:1,width:120}}>{label}</span>
+                      <span style={{fontSize:12,color:"#FFF",fontWeight:700,width:100,textAlign:"center"}}>{val}</span>
+                      <span style={{fontSize:9,color,letterSpacing:1,width:120,textAlign:"right"}}>{note}</span>
+                    </div>
+                  ))}
+                </div>
+                <div style={{color:"#C9A84C",fontSize:11,letterSpacing:2,marginBottom:8}}>FEATURE ENGINEERING</div>
+                {[
+                  ["EMA Alignment",`${f.emaScore}/3 — ${f.emaLabel}`],
+                  ["Momentum Composite",`${f.momentumComposite}% — ${f.momentumLabel}`],
+                  ["Volatility Regime",f.volRegime],
+                  ["BB State",`${f.bbState||"N/A"}  bw=${f.bbBandwidth||"?"}%`],
+                  ["Rel. Strength vs SPY",`${f.relStrVsSpy!=null?(f.relStrVsSpy>=0?"+":"")+f.relStrVsSpy+"%":"N/A"}`],
+                  ["VWAP Deviation",`${f.vwapDev!=null?(f.vwapDev>=0?"+":"")+f.vwapDev+"%":"N/A"}`],
+                  ["Volume Trend",`${f.volTrendLabel||"N/A"} (${f.volTrend||"?"}x)`],
+                ].map(([l,v])=>(
+                  <div key={l} style={{display:"flex",justifyContent:"space-between",padding:"6px 10px",borderBottom:"1px solid #0F0F0F"}}>
+                    <span style={{fontSize:10,color:"#555"}}>{l}</span>
+                    <span style={{fontSize:10,color:"#C9A84C",fontWeight:600}}>{v}</span>
+                  </div>
+                ))}
+              </div>
+            );
+          })()}
+
+          {tab==="news"&&(
+            <div style={{flex:1,overflowY:"auto",padding:14}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                <div>
+                  <div style={{color:"#C9A84C",fontSize:11,letterSpacing:2}}>LIVE NEWS FEED</div>
+                  <div style={{fontSize:9,color:"#444",marginTop:2}}>Al Jazeera · Reuters · MarketWatch · CNBC · BBC · Yahoo Finance — {news.length} articles</div>
+                </div>
+                <button onClick={()=>{setNewsLoading(true);fetchAllNews().then(a=>setNews(a)).finally(()=>setNewsLoading(false));}}
+                  style={{background:"#1A1A1A",border:"1px solid #2A2A2A",color:"#888",fontSize:9,
+                    padding:"3px 8px",cursor:"pointer",letterSpacing:1,fontFamily:"inherit"}}>
+                  ↻ REFRESH
+                </button>
+              </div>
+              {newsLoading&&<div style={{color:"#555",fontSize:10,letterSpacing:1,padding:"20px 0"}}>FETCHING FROM 9 SOURCES...</div>}
+              {!newsLoading&&news.length===0&&(
+                <div style={{color:"#333",fontSize:11,lineHeight:1.7}}>
+                  No articles loaded. RSS proxies may be blocked.<br/>Click REFRESH to retry.
+                </div>
+              )}
+              {news.map((n,i)=>(
+                <div key={i} style={{padding:"8px 0",borderBottom:"1px solid #0F0F0F",display:"flex",gap:10}}>
+                  <div style={{flexShrink:0,width:72,paddingTop:2}}>
+                    <div style={{fontSize:8,color:"#C9A84C",letterSpacing:1,fontWeight:700,textTransform:"uppercase",
+                      overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{n.source||"News"}</div>
+                    <div style={{fontSize:8,color:"#333",marginTop:2}}>{n.date.toLocaleDateString()}</div>
+                  </div>
+                  <div style={{flex:1}}>
+                    <div style={{fontSize:11,color:"#D8D0C0",lineHeight:1.5,marginBottom:2}}>{n.title}</div>
+                    {n.desc&&<div style={{fontSize:9,color:"#444",lineHeight:1.4}}>{n.desc}</div>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {tab==="chat"&&(
+            <>
+              <div ref={chatRef} style={{flex:1,overflowY:"auto",padding:14,display:"flex",flexDirection:"column",gap:12}}>
+                {messages.length===0&&(
+                  <div style={{textAlign:"center",padding:"40px 20px",color:"#333"}}>
+                    <div style={{fontSize:28,marginBottom:10}}>📈</div>
+                    <div style={{fontSize:12,color:"#555",letterSpacing:2,textTransform:"uppercase"}}>
+                      Pick a symbol → ⚡ ANALYZE NOW<br/>or ask a question
+                    </div>
+                    <div style={{marginTop:20,display:"flex",gap:8,flexWrap:"wrap",justifyContent:"center"}}>
+                      {["What's the strongest setup right now?",`Is ${selected} worth trading today?`,
+                        "Which symbol has the best R/R?","Any short setups?","Where would Livermore enter SPY?"]
+                        .map((c,i)=>(
+                          <button key={i} onClick={()=>setInput(c)} style={{fontSize:10,padding:"5px 10px",
+                            background:"#111",border:"1px solid #222",color:"#555",cursor:"pointer",fontFamily:"inherit"}}>
+                            {c}
+                          </button>
+                        ))}
+                    </div>
+                  </div>
+                )}
+                {messages.map((m,i)=>{
+                  const td = m.tradeData;
+                  const isLogged = m.id && loggedMsgIds.has(m.id);
+                  const vColor = td?.verdict==="BUY"?"#2ECC71":td?.verdict==="SELL"?"#E74C3C":"#888";
+                  return (
+                    <div key={i} style={{display:"flex",gap:10,alignSelf:m.type==="user"?"flex-end":"flex-start",
+                      maxWidth:"95%",flexDirection:m.type==="user"?"row-reverse":"row"}}>
+                      <div style={{width:28,height:28,flexShrink:0,alignSelf:"flex-start",
+                        background:m.type==="user"?"#0d1117":"#1A1500",
+                        border:`1px solid ${m.type==="user"?"#222":"#C9A84C"}`,
+                        display:"flex",alignItems:"center",justifyContent:"center",fontSize:13}}>
+                        {m.type==="user"?"👤":"📈"}
+                      </div>
+                      <div style={{display:"flex",flexDirection:"column",gap:6,flex:1,minWidth:0}}>
+                        <div style={{background:m.type==="user"?"#0d1117":"#111",border:"1px solid #1E1E1E",
+                          borderLeft:m.type==="bot"?"3px solid #C9A84C":"1px solid #1E1E1E",
+                          borderRight:m.type==="user"?"3px solid #333":"1px solid #1E1E1E",
+                          padding:"10px 14px",fontSize:12,lineHeight:1.8,
+                          color:m.type==="user"?"#888":"#D8D0C0",whiteSpace:"pre-wrap"}}>
+                          {m.text}
+                        </div>
+                        {td && !isLogged && (
+                          <div style={{display:"flex",alignItems:"center",gap:10,padding:"6px 10px",
+                            background:"#0A0A0A",border:`1px solid ${vColor}33`,borderLeft:`3px solid ${vColor}`}}>
+                            <span style={{fontSize:10,color:vColor,fontWeight:900,letterSpacing:1}}>{td.symbol} {td.verdict}</span>
+                            <span style={{fontSize:9,color:"#555"}}>@ ${td.entryPrice?.toFixed(2)}</span>
+                            {td.stop&&<span style={{fontSize:9,color:"#666"}}>SL ${td.stop}</span>}
+                            {td.target&&<span style={{fontSize:9,color:"#666"}}>TP ${td.target}</span>}
+                            {td.rr&&<span style={{fontSize:9,color:"#C9A84C"}}>{td.rr}:1</span>}
+                            <button onClick={()=>{
+                              logDecision(td);
+                              setDecisionLog(getLog());
+                              setLoggedMsgIds(prev=>new Set([...prev, m.id]));
+                              setTab("log");
+                            }} style={{marginLeft:"auto",background:"#0A1A0A",border:`1px solid ${vColor}`,
+                              color:vColor,fontSize:9,padding:"3px 10px",cursor:"pointer",
+                              fontFamily:"inherit",letterSpacing:1,fontWeight:700}}>
+                              📋 LOG THIS TRADE
+                            </button>
+                          </div>
+                        )}
+                        {td && isLogged && (
+                          <div style={{fontSize:9,color:"#2ECC71",padding:"3px 10px",letterSpacing:1}}>
+                            ✓ Logged to decision log
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+                {thinking&&(
+                  <div style={{display:"flex",gap:10}}>
+                    <div style={{width:28,height:28,background:"#1A1500",border:"1px solid #C9A84C",
+                      display:"flex",alignItems:"center",justifyContent:"center",fontSize:13}}>📈</div>
+                    <div style={{background:"#111",border:"1px solid #1E1E1E",borderLeft:"3px solid #C9A84C",
+                      padding:"12px 14px",display:"flex",gap:6,alignItems:"center"}}>
+                      {[0,1,2].map(d=>(
+                        <div key={d} style={{width:7,height:7,borderRadius:"50%",background:"#C9A84C",
+                          animation:`dots 1.2s ease-in-out ${d*0.2}s infinite`}}/>
+                      ))}
+                      <span style={{fontSize:10,color:"#555",marginLeft:6,letterSpacing:1}}>READING THE TAPE...</span>
+                    </div>
+                  </div>
+                )}
+              </div>
+              <div style={{background:"#0C0C0C",borderTop:"1px solid #1A1A1A",
+                padding:"10px 14px",display:"flex",gap:8,flexShrink:0}}>
+                <input value={input} onChange={e=>setInput(e.target.value)}
+                  onKeyDown={e=>e.key==="Enter"&&handleSend()}
+                  placeholder={`Ask about ${selected}...`} disabled={thinking}
+                  style={{flex:1,background:"#080808",border:"1px solid #1E1E1E",color:"#D8D0C0",
+                    fontFamily:"'Courier New',monospace",fontSize:12,padding:"9px 12px",outline:"none"}}/>
+                <button onClick={handleSend} disabled={thinking||!input.trim()} style={{
+                  background:thinking||!input.trim()?"#1A1A1A":"#C9A84C",
+                  color:thinking||!input.trim()?"#444":"#000",border:"none",
+                  fontFamily:"'Courier New',monospace",fontWeight:900,fontSize:11,letterSpacing:2,
+                  padding:"0 16px",cursor:thinking||!input.trim()?"not-allowed":"pointer",textTransform:"uppercase"}}>
+                  SEND
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+
+      <style>{`
+        @keyframes ticker{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+        @keyframes pulse{0%,100%{opacity:.4}50%{opacity:1}}
+        @keyframes dots{0%,100%{opacity:.2;transform:scale(.8)}50%{opacity:1;transform:scale(1.2)}}
+        ::-webkit-scrollbar{width:3px;height:3px}
+        ::-webkit-scrollbar-track{background:#080808}
+        ::-webkit-scrollbar-thumb{background:#2A2A2A}
+      `}</style>
+    </div>
+  );
+}
