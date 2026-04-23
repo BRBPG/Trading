@@ -1975,9 +1975,26 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                       )}
                       {multiSimResult && !multiSimResult.error && (() => {
                         const r = multiSimResult;
-                        const verdict = r.trimmedMeanAUC >= 0.55 ? { label: "Genuine signal — train it", color: "#2ECC71" }
-                                      : r.trimmedMeanAUC >= 0.52 ? { label: "Marginal — borderline", color: "#C9A84C" }
-                                      : { label: "Coin flip — don't train", color: "#E74C3C" };
+                        // Verdict logic: trimmed mean alone is misleading when
+                        // per-run variance is high. A 0.56 trimmed mean made up
+                        // of 0.32 + 0.69 + middle is NOT a stable edge — it's
+                        // a coin flip with wide swings. Real edge has tight
+                        // per-run agreement (std < 0.06). Penalise high
+                        // variance even when trimmed mean looks decent.
+                        const HIGH_VARIANCE = r.stdAUC > 0.10;
+                        const MED_VARIANCE  = r.stdAUC > 0.06;
+                        let verdict;
+                        if (HIGH_VARIANCE) {
+                          verdict = { label: "Unstable — fragile / regime-dependent, don't train", color: "#E74C3C" };
+                        } else if (r.trimmedMeanAUC >= 0.55 && !MED_VARIANCE) {
+                          verdict = { label: "Genuine signal — train it", color: "#2ECC71" };
+                        } else if (r.trimmedMeanAUC >= 0.55 && MED_VARIANCE) {
+                          verdict = { label: "Edge present but inconsistent — investigate variance first", color: "#C9A84C" };
+                        } else if (r.trimmedMeanAUC >= 0.52) {
+                          verdict = { label: "Marginal — borderline", color: "#C9A84C" };
+                        } else {
+                          verdict = { label: "Coin flip — don't train", color: "#E74C3C" };
+                        }
                         return (
                           <div style={{marginTop:12}}>
                             <div style={{padding:"8px 10px",background:"#080808",border:`1px solid ${verdict.color}55`,borderLeft:`3px solid ${verdict.color}`,marginBottom:10}}>
