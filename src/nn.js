@@ -21,7 +21,14 @@
 //   • Dropout — sample counts too small for it to add signal.
 //   • Batch norm — overkill at this scale.
 
-const NN_KEY = "trader_nn_weights_v1";
+// v2 architecture: 14 → 16 → 8 → 1 (393 params). Dimensions bumped from v1
+// (7→8→4→1, 105 params) to accommodate the new macro + calendar features.
+// Storage key changes so any v1 weights are discarded cleanly rather than
+// feeding the wrong shape into inference.
+const NN_KEY = "trader_nn_weights_v2";
+const NN_INPUT_DIM = 14;
+const NN_HIDDEN1 = 16;
+const NN_HIDDEN2 = 8;
 
 // ─── Linear algebra helpers (tiny, no dep on libraries) ───────────────────
 function randn() {
@@ -46,9 +53,9 @@ function sigmoid(x) { return 1 / (1 + Math.exp(-x)); }
 // ─── Weight init / persistence ─────────────────────────────────────────────
 function initWeights() {
   return {
-    W1: xavierMatrix(8, 7), b1: zeros(8),
-    W2: xavierMatrix(4, 8), b2: zeros(4),
-    W3: xavierMatrix(1, 4), b3: zeros(1),
+    W1: xavierMatrix(NN_HIDDEN1, NN_INPUT_DIM), b1: zeros(NN_HIDDEN1),
+    W2: xavierMatrix(NN_HIDDEN2, NN_HIDDEN1),   b2: zeros(NN_HIDDEN2),
+    W3: xavierMatrix(1, NN_HIDDEN2),            b3: zeros(1),
     means: null,  // set after first training
     stds: null,
     trainedOn: 0,
@@ -61,7 +68,7 @@ function initWeights() {
 export function loadNN() {
   try {
     const saved = JSON.parse(localStorage.getItem(NN_KEY) || "null");
-    if (saved?.W1 && saved.W1.length === 8 && saved.W1[0].length === 7) return saved;
+    if (saved?.W1 && saved.W1.length === NN_HIDDEN1 && saved.W1[0].length === NN_INPUT_DIM) return saved;
   } catch { /* fall through */ }
   return initWeights();
 }

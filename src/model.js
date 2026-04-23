@@ -1,16 +1,25 @@
 import { predictNN, trainNN as trainNNRaw, getNNInfo, resetNN as resetNNRaw } from "./nn";
 
-// ─── Pre-trained logistic regression ────────────────────────────────────────
-// Features: [rsi_centered, macd_sign, momentum_norm, bb_centered, ema_short, ema_med, vol_norm]
-// Weights derived from backtesting across 12 historical crisis/volatility regimes
-const DEFAULT_WEIGHTS = [-0.52, 1.28, 1.61, -0.74, 0.91, 1.05, 0.22];
+// ─── Pre-trained logistic regression (v2, 14-dim) ──────────────────────────
+// Honest note: these defaults are a mild bullish-tech prior — negative
+// weight on high RSI, positive weights on MACD/momentum/trend alignment,
+// near-zero weights on macro features (the NN is expected to learn those).
+// They are NOT derived from any fitted dataset and should be treated as
+// sensible starting points, not "trained" values. Real training comes from
+// sim trades (trainNNFromSim) or reviewed log (trainNNFromLog).
+const DEFAULT_WEIGHTS = [
+  -0.52, 1.28, 1.61, -0.74, 0.91, 1.05, 0.22,   // technicals
+   0.00, 0.00,                                   // VIX_z, VIX_term (learned)
+   0.00, 0.00, 0.00, 0.00,                       // DXY, TNX, Oil, Gold mom
+   0.00,                                         // TOD_edge
+];
 const DEFAULT_BIAS = 0.04;
-const WEIGHTS_KEY = "trader_lr_weights";
+const WEIGHTS_KEY = "trader_lr_weights_v2";
 
 function loadWeights() {
   try {
     const saved = JSON.parse(localStorage.getItem(WEIGHTS_KEY) || "null");
-    if (saved?.weights?.length === 7) return { weights: saved.weights, bias: saved.bias };
+    if (saved?.weights?.length === 14) return { weights: saved.weights, bias: saved.bias };
   } catch { /* corrupt localStorage — fall through to defaults */ }
   return { weights: [...DEFAULT_WEIGHTS], bias: DEFAULT_BIAS };
 }
@@ -60,7 +69,19 @@ export function getCurrentWeights() {
 
 function sigmoid(x) { return 1 / (1 + Math.exp(-x)); }
 
-function extractFeatures(q) {
+// ─── Feature extraction ────────────────────────────────────────────────────
+// 14-dim feature vector as of v2:
+//   [0..6]   Single-symbol technicals (v1 legacy):
+//            rsi_c, macd_s, mom_n, bb_c, ema_s, ema_m, vol_n
+//   [7]      VIX z-score (regime indicator, -1..1 clipped)
+//   [8]      VIX term structure (VIX9D/VIX, >1 = stress bid)
+//   [9..12]  Cross-asset 5-bar momentum: DXY, TNX, Oil, Gold (each ±1 clipped)
+//   [13]     Time-of-day edge-ness (0=open/close, 1=midday)
+//
+// macro and calendar args are OPTIONAL — if the caller doesn't supply them
+// (e.g. the old scoreSetup(q) signature still works), those slots are zeroed,
+// so the extracted vector length is always 14 and old call sites don't break.
+function extractFeatures(q, macro = null, calendar = null) {
   const rsi_c   = q.rsi != null ? (q.rsi - 50) / 50 : 0;
   const macd_s  = q.macd != null ? Math.sign(q.macd) : 0;
   const mom_n   = q.momentum5 != null ? Math.max(-1, Math.min(1, q.momentum5 / 4)) : 0;
@@ -68,13 +89,48 @@ function extractFeatures(q) {
   const ema_s   = q.ema9 && q.ema20 ? (q.ema9 > q.ema20 ? 1 : -1) : 0;
   const ema_m   = q.ema20 && q.ema50 ? (q.ema20 > q.ema50 ? 1 : -1) : 0;
   const vol_n   = q.volRatio != null ? Math.max(-1, Math.min(1, (q.volRatio - 1) / 1.5)) : 0;
-  return [rsi_c, macd_s, mom_n, bb_c, ema_s, ema_m, vol_n];
+
+  // Clip helpers so extreme values (rare flash crashes etc.) can't blow up
+  // the NN's input distribution.
+  const clip1 = v => Math.max(-1, Math.min(1, v || 0));
+  const clip0to1 = v => Math.max(0, Math.min(1, v || 0));
+
+  // Macro features — scaled so each lives roughly in [-1, 1].
+  const vix_z    = macro?.vixZ != null ? clip1(macro.vixZ / 2) : 0;          // ±2σ → ±1
+  const vix_term = macro?.vixTerm != null ? clip1((macro.vixTerm - 1) * 5) : 0; // 0.9→-0.5, 1.1→+0.5
+  // Cross-asset momentum comes in as fractional (e.g. 0.003 = 0.3%). Scale
+  // by 100 so a 1% move = 1.0 feature weight.
+  const dxy_mom  = clip1((macro?.dxyMom5  || 0) * 100);
+  const tnx_mom  = clip1((macro?.tnxMom5  || 0) * 100);
+  const oil_mom  = clip1((macro?.oilMom5  || 0) * 100);
+  const gold_mom = clip1((macro?.goldMom5 || 0) * 100);
+
+  // Calendar
+  const tod_edge = clip0to1(calendar?.todEdge ?? 0.5);
+
+  return [
+    rsi_c, macd_s, mom_n, bb_c, ema_s, ema_m, vol_n,
+    vix_z, vix_term,
+    dxy_mom, tnx_mom, oil_mom, gold_mom,
+    tod_edge,
+  ];
 }
 
-function logisticScore(q) {
-  const f = extractFeatures(q);
+export const FEATURE_DIM = 14;
+export const FEATURE_NAMES = [
+  "RSI", "MACD", "Mom", "BB", "EMA9/20", "EMA20/50", "Vol",
+  "VIX_z", "VIX_term",
+  "DXY_m", "TNX_m", "Oil_m", "Gold_m",
+  "TOD_edge",
+];
+
+function logisticScoreFromFeatures(f) {
   const { weights, bias } = loadWeights();
-  const dot = f.reduce((sum, v, i) => sum + v * weights[i], bias);
+  // Defensive: if feature length drifts (e.g. old saved weights + new
+  // feature vector), pad/truncate to keep the dot product well-defined.
+  const n = Math.min(f.length, weights.length);
+  let dot = bias;
+  for (let i = 0; i < n; i++) dot += f[i] * weights[i];
   return sigmoid(dot); // P(bullish)
 }
 
@@ -261,9 +317,10 @@ function findClosestCrisis(q) {
 //
 // Weights always normalise to 1.0 so the output stays a probability.
 // Agreement between models boosts confidence; disagreement reduces it.
-export function scoreSetup(q) {
-  const features  = extractFeatures(q);
-  const lrProb    = logisticScore(q);
+export function scoreSetup(q, context = {}) {
+  const { macro = null, calendar = null } = context;
+  const features  = extractFeatures(q, macro, calendar);
+  const lrProb    = logisticScoreFromFeatures(features);
   const tree      = decisionTree(q);
   const crisis    = findClosestCrisis(q);
   const atr       = q.atr ?? 0;

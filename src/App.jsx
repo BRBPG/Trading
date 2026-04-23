@@ -10,6 +10,8 @@ import { calcADX, calcWilliamsR, calcStochastic, calcROC, calcZScore,
 import { BUFFETT_SYSTEM_PROMPT, buildBuffettContext } from "./buffett";
 import { cleanBars, assessQuality, cleaningSummary } from "./cleaning";
 import { downloadExport, importState } from "./persistence";
+import { fetchMacroSnapshot } from "./macro";
+import { calendarFeatures } from "./calendar";
 
 const FH_QUOTE  = (sym, key) => `https://finnhub.io/api/v1/quote?symbol=${sym}&token=${key}`;
 const FH_METRIC = (sym, key) => `https://finnhub.io/api/v1/stock/metric?symbol=${sym}&metric=all&token=${key}`;
@@ -509,11 +511,11 @@ function ApiKeyModal({ onSave }) {
 }
 
 // Rank all loaded quotes by model edge and return the top N
-function rankOpportunities(quotes, topN = 3) {
+function rankOpportunities(quotes, topN = 3, context = {}) {
   return Object.values(quotes)
     .filter(q => q && q.price)
     .map(q => {
-      const m = scoreSetup(q);
+      const m = scoreSetup(q, context);
       const edge = Math.abs(parseFloat(m.lrProb) - 50); // 0–50, higher = more conviction
       const treeBoost = m.treeSignal === "STRONG_BUY" || m.treeSignal === "STRONG_SELL" ? 8 : 0;
       const volBoost = (q.volRatio ?? 1) > 1.3 ? 4 : 0;
@@ -524,8 +526,8 @@ function rankOpportunities(quotes, topN = 3) {
     .slice(0, topN);
 }
 
-function buildBestOpportunityContext(quotes, news = []) {
-  const top = rankOpportunities(quotes, 3);
+function buildBestOpportunityContext(quotes, news = [], context = {}) {
+  const top = rankOpportunities(quotes, 3, context);
   const blocks = top.map(({ q, m }, i) => {
     const pct52 = q.high52 && q.low52 ? ((q.price - q.low52) / (q.high52 - q.low52) * 100).toFixed(0) : "?";
     return `
@@ -554,11 +556,11 @@ INSTRUCTION: Review all three candidates. Choose the ONE with the cleanest, high
 ${DEEP_DIRECTIVE}`;
 }
 
-function buildContext(quotes, selected, news = []) {
+function buildContext(quotes, selected, news = [], context = {}) {
   const q = quotes[selected];
   if (!q) return `[No data for ${selected}]`;
   const pct52 = q.high52&&q.low52 ? ((q.price-q.low52)/(q.high52-q.low52)*100).toFixed(0) : "?";
-  const model = scoreSetup(q);
+  const model = scoreSetup(q, context);
   const session = q.session || getMarketSession(selected);
   const sessLine = session === "OPEN"
     ? `Market session: OPEN`
@@ -627,13 +629,13 @@ ${snapshot}`;
 // ─── Verdict parser — tolerates both QUICK and IN-DEPTH output formats ─────
 // QUICK:  "⚡ NVDA — BUY @ $875.40"   "SL $853 | TP $942 | R/R 3:1 | HIGH"
 // DEEP:   "⚡ BUY @ $875.40 | SL $853 | TP $942 | R/R 3:1 | HIGH"
-function parseTradeData(reply, q, symbol) {
+function parseTradeData(reply, q, symbol, context = {}) {
   if (!q) return null;
   const verdictMatch = reply.match(/[⚡]\s*(?:[A-Z.]{1,6}\s+[—–-]\s+)?(BUY|SELL|AVOID)\b/i)
                     || reply.match(/FINAL VERDICT:\s*(BUY|SELL|AVOID)/i)
                     || reply.match(/\b(BUY|SELL|AVOID)\b\s+@\s*\$/i);
   if (!verdictMatch) return null;
-  const model = scoreSetup(q);
+  const model = scoreSetup(q, context);
   const stop   = parseFloat(reply.match(/(?:Stop|SL):\s*\$?([\d.]+)/i)?.[1]) || null;
   const target = parseFloat(reply.match(/(?:Target|TP):\s*\$?([\d.]+)/i)?.[1]) || null;
   const rr     = parseFloat(reply.match(/R\/R:?\s*([\d.]+)/i)?.[1]) || null;
@@ -668,6 +670,12 @@ export default function App() {
   const [loggedMsgIds, setLoggedMsgIds] = useState(new Set());
   const [news, setNews] = useState([]);
   const [newsLoading, setNewsLoading] = useState(false);
+  // Macro snapshot (VIX, VIX term, DXY/TNX/Oil/Gold momentum, credit spread)
+  // refreshed every 2 minutes in parallel with quotes. scoreSetup consumes
+  // this to compute the 7 new macro+calendar features alongside the 7 legacy
+  // technicals. `null` until the first fetch completes; all-zero feature
+  // contributions in that gap (safe default).
+  const [macro, setMacro] = useState(null);
   const [simState, setSimState] = useState({ running: false, phase: null, symbol: null, done: 0, total: 0 });
   const [simResult, setSimResult] = useState(null);
   // Max-hold (timeout) for the simulator. Stop and target still exit early
@@ -721,7 +729,12 @@ export default function App() {
   // than flipping the whole dashboard back to SIMULATED.
   const refreshAll = useCallback(async (silent=false) => {
     if (!silent) setRefreshing(true);
-    const results = await Promise.all(WATCHLIST.map(s=>fetchQuote(s, finnhubKey)));
+    // Fan out quotes + macro in parallel. Macro has its own 2-min cache so
+    // this call is nearly free after the first refresh.
+    const [results, macroSnap] = await Promise.all([
+      Promise.all(WATCHLIST.map(s=>fetchQuote(s, finnhubKey))),
+      fetchMacroSnapshot().catch(() => null),
+    ]);
     setQuotes(prev => {
       const map = { ...prev };
       results.forEach((r, i) => {
@@ -737,6 +750,7 @@ export default function App() {
       });
       return map;
     });
+    if (macroSnap) setMacro(macroSnap);
     setLastRefresh(Date.now());
     if (!silent) setRefreshing(false);
   }, [finnhubKey]);
@@ -777,7 +791,8 @@ export default function App() {
 
   async function sendToAI(userText, mode = "deep") {
     setThinking(true);
-    const context = buildContext(quotes, selected, news);
+    const modelCtx = { macro, calendar: calendarFeatures() };
+    const context = buildContext(quotes, selected, news, modelCtx);
     const directive = mode === "quick" ? QUICK_DIRECTIVE : DEEP_DIRECTIVE;
     const fullContent = `${context}\n${directive}\n\nUSER: ${userText}`;
     const newHistory = [...chatHistory, { role:"user", content:fullContent }];
@@ -807,7 +822,7 @@ export default function App() {
       const reply = data.content?.filter(b=>b.type==="text").map(b=>b.text).join("\n")||"No response.";
       setChatHistory(prev=>[...prev,{role:"assistant",content:reply}]);
       const q = quotes[selected];
-      const tradeData = parseTradeData(reply, q, selected);
+      const tradeData = parseTradeData(reply, q, selected, modelCtx);
       const msgId = Date.now();
       setMessages(prev=>[...prev,{id: msgId, type:"bot", text:reply, tradeData}]);
     } catch(err) {
@@ -825,7 +840,8 @@ export default function App() {
     if (thinking || Object.keys(quotes).length < 3) return;
     setThinking(true);
     setTab("chat");
-    const context = buildBestOpportunityContext(quotes, news);
+    const modelCtx = { macro, calendar: calendarFeatures() };
+    const context = buildBestOpportunityContext(quotes, news, modelCtx);
     setMessages(prev=>[...prev,{type:"user",text:"⚡ BEST OPPORTUNITY SCAN — rank all stocks and pick ONE trade now."}]);
     const newHistory = [...chatHistory, { role:"user", content:context }];
     setChatHistory(newHistory);
@@ -860,7 +876,7 @@ export default function App() {
       const pickedSym = symMatch ? WATCHLIST.find(s => s === symMatch[1].toUpperCase()) : null;
       const logSym = pickedSym || selected;
       const q = quotes[logSym];
-      const tradeData = parseTradeData(reply, q, logSym);
+      const tradeData = parseTradeData(reply, q, logSym, modelCtx);
       if (tradeData && pickedSym) setSelected(pickedSym);
       const msgId = Date.now();
       setMessages(prev=>[...prev,{id: msgId, type:"bot", text:reply, tradeData}]);
@@ -1170,7 +1186,7 @@ export default function App() {
 
           {tab==="model"&&(()=>{
             const q = quotes[selected];
-            const m = q ? scoreSetup(q) : null;
+            const m = q ? scoreSetup(q, { macro, calendar: calendarFeatures() }) : null;
             return (
               <div style={{flex:1,overflowY:"auto",padding:14,fontSize:11,color:"#888"}}>
                 {!m ? <div>No data</div> : (

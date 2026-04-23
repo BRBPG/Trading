@@ -22,6 +22,8 @@ import { computeIndicators } from "./mockData";
 import { calcADX, calcWilliamsR, calcStochastic, calcROC, calcZScore,
          calcCMF, calcMaxDrawdown, calcSharpe } from "./quant";
 import { fetchPolygonBars, hasPolygonKey } from "./polygon";
+import { fetchMacroHistorical } from "./macro";
+import { calendarFeaturesAt } from "./calendar";
 
 const YAHOO_PROXIES = [
   u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
@@ -186,6 +188,12 @@ export async function runBacktest(symbols, opts = {}) {
   const HOLD_BARS = Math.round(holdHours * 12); // 5-min bars per hour = 12
   const WARMUP_BARS = 60;
 
+  // Pre-fetch macro history ONCE per backtest run — the at(t) helper does
+  // cheap in-memory binary-search lookups per entry, so this is O(symbols ×
+  // samples) with no extra network I/O inside the main loop.
+  onProgress({ phase: "fetching_macro", done: 0, total: symbols.length });
+  const macroHist = await fetchMacroHistorical(daysAgo + 2).catch(() => null);
+
   const trades = [];
   const errors = [];
   let barsSource = null;  // "polygon" | "yahoo" | mixed — reported back to UI
@@ -209,7 +217,11 @@ export async function runBacktest(symbols, opts = {}) {
     for (const i of entries) {
       const q = buildQuoteAt(symbol, bars, i);
       if (!q) continue;
-      const model = scoreSetup(q);
+      const modelCtx = {
+        macro: macroHist?.at(bars.timestamps[i]) || null,
+        calendar: calendarFeaturesAt(bars.timestamps[i]),
+      };
+      const model = scoreSetup(q, modelCtx);
       const verdict = parseFloat(model.compositeProb) > 50 ? "BUY" : "SELL";
       const sim = simulateOutcome(bars, i, verdict, HOLD_BARS, q.atr, costBps);
       if (!sim || !sim.outcome) continue;

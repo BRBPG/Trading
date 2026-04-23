@@ -74,26 +74,48 @@ export function winsorizeReturns(closes, lowerPct = 0.001, upperPct = 0.999) {
   return { closes: out, capped };
 }
 
-// ─── Zero-volume bar handling ───────────────────────────────────────────────
-// During OPEN session, a 0-volume 1-minute bar is almost always a feed gap or
-// a halt, not legitimate data. Forward-fill the OHLC so indicators don't see
-// a phantom zero print. Pre/post-market minutes can legitimately be empty, so
-// we skip this rule there.
+// ─── Zero-volume / halt / frozen-price bar handling ────────────────────────
+// During OPEN session, these shapes are almost always data problems:
+//   - zero volume        = feed gap or halt
+//   - high == low        = tape frozen (LULD band, auction, halt)
+//   - price unchanged across 3+ consecutive bars with any volume = suspect
+// Forward-fill the OHLC so indicators don't see phantom prints. Cap the
+// consecutive fill length at MAX_CONSEC_FFILL to avoid propagating bad data
+// across long halts — if a symbol halts for 30+ bars it's no longer safe
+// to compute VWAP / MACD / BB from the pre-halt baseline. Pre/post-market
+// minutes can legitimately be empty, so we skip this rule there.
+const MAX_CONSEC_FFILL = 3;
+
 export function cleanZeroVolumeBars({ closes, highs, lows, volumes }, session = "OPEN") {
   if (session !== "OPEN") {
-    return { closes: [...closes], highs: [...highs], lows: [...lows], volumes: [...volumes], zeroVolFilled: 0 };
+    return { closes: [...closes], highs: [...highs], lows: [...lows], volumes: [...volumes], zeroVolFilled: 0, haltBars: 0, frozenBars: 0, ffillAborted: 0 };
   }
   const c = [...closes], h = [...highs], l = [...lows], v = [...volumes];
-  let filled = 0;
+  let filled = 0, haltBars = 0, frozenBars = 0, ffillAborted = 0, consecFill = 0;
   for (let i = 1; i < v.length; i++) {
-    if (!v[i]) {
+    const zeroVol = !v[i];
+    const frozenBar = h[i] != null && l[i] != null && h[i] === l[i];
+    const needsFill = zeroVol || (frozenBar && v[i] > 0);
+    if (needsFill) {
+      if (consecFill >= MAX_CONSEC_FFILL) {
+        // Don't keep propagating; leave the bar untouched so downstream
+        // quality assessment sees it as real. Count as an abort event.
+        ffillAborted++;
+        consecFill = 0;
+        continue;
+      }
+      consecFill++;
+      if (zeroVol) haltBars++;
+      if (frozenBar && !zeroVol) frozenBars++;
       c[i] = c[i - 1];
       h[i] = Math.max(h[i] || c[i - 1], c[i - 1]);
       l[i] = Math.min(l[i] || c[i - 1], c[i - 1]);
       filled++;
+    } else {
+      consecFill = 0;
     }
   }
-  return { closes: c, highs: h, lows: l, volumes: v, zeroVolFilled: filled };
+  return { closes: c, highs: h, lows: l, volumes: v, zeroVolFilled: filled, haltBars, frozenBars, ffillAborted };
 }
 
 // ─── OHLC consistency clamp ─────────────────────────────────────────────────
@@ -144,6 +166,9 @@ export function cleanBars(bars, session = "OPEN", anchors = {}) {
       hampelFlagged: hamp.flagged.length,
       winsorised:    win.capped,
       zeroVolFilled: zv.zeroVolFilled,
+      haltBars:      zv.haltBars || 0,
+      frozenBars:    zv.frozenBars || 0,
+      ffillAborted:  zv.ffillAborted || 0,
       totalTouched:  hamp.flagged.length + win.capped + zv.zeroVolFilled,
     },
   };
