@@ -19,7 +19,9 @@
 
 import { trainGBM, predictGBM } from "./gbm";
 
-const REGIME_KEY = "trader_regime_v1";
+function regimeKeyFor(universe = "equities") {
+  return universe === "crypto" ? "trader_regime_v1_crypto" : "trader_regime_v1";
+}
 const MIN_SAMPLES_PER_REGIME = 30;
 
 // Regime classifier: returns "high_vol" | "low_vol" | "neutral"
@@ -36,7 +38,7 @@ export function classifyRegime(macro) {
 // its own macro.vixZ at entry-time (set by the backtester via the modelCtx
 // pipeline) — but if the sim trades don't include that field directly, we
 // approximate using the sample's stored features (vix_z is feature index 7).
-export function trainRegimeModels(simTrades) {
+export function trainRegimeModels(simTrades, universe = "equities") {
   if (!simTrades || simTrades.length < MIN_SAMPLES_PER_REGIME * 2) {
     return {
       error: `Need ≥${MIN_SAMPLES_PER_REGIME * 2} sim trades total, got ${simTrades?.length || 0}`,
@@ -79,7 +81,7 @@ export function trainRegimeModels(simTrades) {
     counts: result.counts,
     updatedAt: new Date().toISOString(),
   };
-  localStorage.setItem(REGIME_KEY, JSON.stringify(payload));
+  localStorage.setItem(regimeKeyFor(universe), JSON.stringify(payload));
 
   return {
     ok: true,
@@ -93,23 +95,23 @@ export function trainRegimeModels(simTrades) {
   };
 }
 
-export function loadRegimeModels() {
+export function loadRegimeModels(universe = "equities") {
   try {
-    const saved = JSON.parse(localStorage.getItem(REGIME_KEY) || "null");
+    const saved = JSON.parse(localStorage.getItem(regimeKeyFor(universe)) || "null");
     if (saved && (saved.high || saved.low)) return saved;
   } catch { /* fall through */ }
   return null;
 }
 
-export function resetRegimeModels() {
-  localStorage.removeItem(REGIME_KEY);
+export function resetRegimeModels(universe = "equities") {
+  localStorage.removeItem(regimeKeyFor(universe));
 }
 
 // Predict using the regime-appropriate model. Returns { prob, regime, used }
 // where `used` indicates which model was consulted (or null if neither
 // regime model exists / regime is neutral).
-export function predictRegime(features, macro) {
-  const models = loadRegimeModels();
+export function predictRegime(features, macro, universe = "equities") {
+  const models = loadRegimeModels(universe);
   if (!models) return null;
 
   const regime = classifyRegime(macro);
@@ -124,8 +126,8 @@ export function predictRegime(features, macro) {
   return null;
 }
 
-export function getRegimeInfo() {
-  const models = loadRegimeModels();
+export function getRegimeInfo(universe = "equities") {
+  const models = loadRegimeModels(universe);
   if (!models) return null;
   return {
     highTrained: !!models.high,

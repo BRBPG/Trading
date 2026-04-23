@@ -25,7 +25,15 @@
 // PEAD (earnings drift) features on top of v2's 14 inputs. Storage key
 // bumped so any v2 weights are discarded cleanly rather than feeding the
 // wrong shape into inference.
-const NN_KEY = "trader_nn_weights_v3";
+// Per-universe storage. Equities keeps the bare v3 key (back-compat with
+// weights users have already trained); crypto gets a suffix so it trains
+// independently. Architecture (16→16→8→1) is shared across universes —
+// only the trained weights diverge.
+function nnKeyFor(universe = "equities") {
+  return universe === "crypto"
+    ? "trader_nn_weights_v3_crypto"
+    : "trader_nn_weights_v3";
+}
 const NN_INPUT_DIM = 16;
 const NN_HIDDEN1 = 16;
 const NN_HIDDEN2 = 8;
@@ -65,20 +73,20 @@ function initWeights() {
   };
 }
 
-export function loadNN() {
+export function loadNN(universe = "equities") {
   try {
-    const saved = JSON.parse(localStorage.getItem(NN_KEY) || "null");
+    const saved = JSON.parse(localStorage.getItem(nnKeyFor(universe)) || "null");
     if (saved?.W1 && saved.W1.length === NN_HIDDEN1 && saved.W1[0].length === NN_INPUT_DIM) return saved;
   } catch { /* fall through */ }
   return initWeights();
 }
 
-function saveNN(W) {
-  localStorage.setItem(NN_KEY, JSON.stringify({ ...W, updatedAt: new Date().toISOString() }));
+function saveNN(W, universe = "equities") {
+  localStorage.setItem(nnKeyFor(universe), JSON.stringify({ ...W, updatedAt: new Date().toISOString() }));
 }
 
-export function resetNN() {
-  localStorage.removeItem(NN_KEY);
+export function resetNN(universe = "equities") {
+  localStorage.removeItem(nnKeyFor(universe));
 }
 
 // ─── Feature normalisation ────────────────────────────────────────────────
@@ -108,8 +116,8 @@ function forward(W, x) {
   return { xn, z1, a1, z2, a2, z3, a3 };
 }
 
-export function predictNN(features) {
-  const W = loadNN();
+export function predictNN(features, universe = "equities") {
+  const W = loadNN(universe);
   if (!W.trainedOn) return null; // Untrained — callers should fall back to LR
   return forward(W, features).a3[0];
 }
@@ -125,8 +133,8 @@ export function scoreWithWeights(W, samples) {
   }));
 }
 
-export function getNNInfo() {
-  const W = loadNN();
+export function getNNInfo(universe = "equities") {
+  const W = loadNN(universe);
   return {
     trainedOn: W.trainedOn || 0,
     epochs: W.epochs || 0,
@@ -149,6 +157,7 @@ export function trainNN(samples, opts = {}) {
     // persisting to localStorage. Used by walk-forward so each fold trains
     // independently and doesn't clobber the production NN.
     isolated = false,
+    universe = "equities",
   } = opts;
 
   if (samples.length < 8) {
@@ -167,7 +176,7 @@ export function trainNN(samples, opts = {}) {
   // Initialise / carry forward. When isolated, always start from fresh random
   // weights — mixing persisted weights into a per-fold training set would
   // leak information across folds and defeat the point of walk-forward.
-  let W = isolated ? initWeights() : loadNN();
+  let W = isolated ? initWeights() : loadNN(universe);
   if (!W.trainedOn) W = initWeights();
 
   // Fit normalisation on current batch
@@ -243,7 +252,7 @@ export function trainNN(samples, opts = {}) {
         W.epochs = (W.epochs || 0) + epoch + 1;
         W.trainedOn = samples.length;
         W.finalLoss = avgLoss;
-        if (!isolated) saveNN(W);
+        if (!isolated) saveNN(W, universe);
         return { trained: samples.length, epochs: epoch + 1, loss: avgLoss, history, reason: "Early stop — loss plateau", weights: isolated ? W : undefined };
       }
     }
@@ -252,6 +261,6 @@ export function trainNN(samples, opts = {}) {
   W.epochs = (W.epochs || 0) + epochs;
   W.trainedOn = samples.length;
   W.finalLoss = history[history.length - 1];
-  if (!isolated) saveNN(W);
+  if (!isolated) saveNN(W, universe);
   return { trained: samples.length, epochs, loss: W.finalLoss, history, reason: "Completed all epochs", weights: isolated ? W : undefined };
 }

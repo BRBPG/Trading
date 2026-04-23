@@ -2,38 +2,53 @@ import { predictNN, trainNN as trainNNRaw, getNNInfo, resetNN as resetNNRaw } fr
 import { predictGBM, loadGBM, trainGBM as trainGBMRaw, saveGBM, getGBMInfo, resetGBM as resetGBMRaw } from "./gbm";
 import { predictRegime, getRegimeInfo, trainRegimeModels as trainRegimeRaw, resetRegimeModels as resetRegimeRaw } from "./regime";
 
-// ─── Pre-trained logistic regression (v3, 16-dim) ──────────────────────────
-// Honest note: these defaults are a mild bullish-tech prior + a PEAD prior
-// (positive surpriseDecayed → bullish drift expected). Macro weights stay
-// at zero because the NN is better suited to learn non-linear macro
-// interactions. These are SENSIBLE STARTING POINTS, not fitted values.
-// Real training comes from trainNNFromSim or trainNNFromLog.
-const DEFAULT_WEIGHTS = [
+// ─── Pre-trained logistic regression (v3, 16-dim, PER UNIVERSE) ────────────
+// Separate default weights + storage keys per universe. Equity defaults
+// encode a mild bullish-tech prior (MACD/momentum/EMA trend-following
+// positive). Crypto defaults are NEUTRAL — no prior at all — because the
+// equity bullish-tech prior is actively anti-signal on crypto (baseline
+// multi-sim: equity-trained-prior on crypto = 0.456 AUC, confidently wrong
+// in the wrong direction). Crypto models learn their weights from sim /
+// log training only.
+const DEFAULT_WEIGHTS_EQUITIES = [
   -0.52, 1.28, 1.61, -0.74, 0.91, 1.05, 0.22,   // technicals (legacy)
    0.00, 0.00,                                   // VIX_z, VIX_term (learned)
    0.00, 0.00, 0.00, 0.00,                       // DXY, TNX, Oil, Gold mom
    0.00,                                         // TOD_edge
    0.00, 0.50,                                   // PEAD days (learned), surprise prior
 ];
+const DEFAULT_WEIGHTS_CRYPTO = new Array(16).fill(0);
 const DEFAULT_BIAS = 0.04;
-const WEIGHTS_KEY = "trader_lr_weights_v3";
+const DEFAULT_BIAS_CRYPTO = 0.0;  // no directional prior
 
-function loadWeights() {
-  try {
-    const saved = JSON.parse(localStorage.getItem(WEIGHTS_KEY) || "null");
-    if (saved?.weights?.length === 16) return { weights: saved.weights, bias: saved.bias };
-  } catch { /* corrupt localStorage — fall through to defaults */ }
-  return { weights: [...DEFAULT_WEIGHTS], bias: DEFAULT_BIAS };
+function weightsKeyFor(universe) {
+  return universe === "crypto"
+    ? "trader_lr_weights_v3_crypto"
+    : "trader_lr_weights_v3";       // leave equities key unchanged for back-compat
 }
 
-function saveWeights(weights, bias) {
-  localStorage.setItem(WEIGHTS_KEY, JSON.stringify({ weights, bias, updatedAt: new Date().toISOString() }));
+function defaultWeightsFor(universe) {
+  return universe === "crypto"
+    ? { weights: [...DEFAULT_WEIGHTS_CRYPTO], bias: DEFAULT_BIAS_CRYPTO }
+    : { weights: [...DEFAULT_WEIGHTS_EQUITIES], bias: DEFAULT_BIAS };
+}
+
+function loadWeights(universe = "equities") {
+  try {
+    const saved = JSON.parse(localStorage.getItem(weightsKeyFor(universe)) || "null");
+    if (saved?.weights?.length === 16) return { weights: saved.weights, bias: saved.bias };
+  } catch { /* corrupt localStorage — fall through to defaults */ }
+  return defaultWeightsFor(universe);
+}
+
+function saveWeights(weights, bias, universe = "equities") {
+  localStorage.setItem(weightsKeyFor(universe), JSON.stringify({ weights, bias, updatedAt: new Date().toISOString() }));
 }
 
 // Gradient descent update: minimise binary cross-entropy on reviewed trades
 // lr = learning rate, epochs = passes over the data
-export function adaptWeights(reviewedLog, lr = 0.08, epochs = 40) {
-  const { weights, bias } = loadWeights();
+export function adaptWeights(reviewedLog, lr = 0.08, epochs = 40, universe = "equities") {
+  const { weights, bias } = loadWeights(universe);
   const w = [...weights];
   let b = bias;
 
@@ -57,16 +72,16 @@ export function adaptWeights(reviewedLog, lr = 0.08, epochs = 40) {
     }
   }
 
-  saveWeights(w, b);
+  saveWeights(w, b, universe);
   return { weights: w, bias: b, trained: samples.length };
 }
 
-export function resetWeights() {
-  localStorage.removeItem(WEIGHTS_KEY);
+export function resetWeights(universe = "equities") {
+  localStorage.removeItem(weightsKeyFor(universe));
 }
 
-export function getCurrentWeights() {
-  return loadWeights();
+export function getCurrentWeights(universe = "equities") {
+  return loadWeights(universe);
 }
 
 function sigmoid(x) { return 1 / (1 + Math.exp(-x)); }
@@ -86,7 +101,7 @@ function sigmoid(x) { return 1 / (1 + Math.exp(-x)); }
 // All context args (macro, calendar, pead) are OPTIONAL — missing slots are
 // zeroed so the vector length is always 16 and callers without context
 // still work.
-function extractFeatures(q, macro = null, calendar = null, pead = null) {
+function extractFeatures(q, macro = null, calendar = null, pead = null, universe = "equities") {
   const rsi_c   = q.rsi != null ? (q.rsi - 50) / 50 : 0;
   const macd_s  = q.macd != null ? Math.sign(q.macd) : 0;
   const mom_n   = q.momentum5 != null ? Math.max(-1, Math.min(1, q.momentum5 / 4)) : 0;
@@ -100,22 +115,36 @@ function extractFeatures(q, macro = null, calendar = null, pead = null) {
   const clip1 = v => Math.max(-1, Math.min(1, v || 0));
   const clip0to1 = v => Math.max(0, Math.min(1, v || 0));
 
-  // Macro features — scaled so each lives roughly in [-1, 1].
-  const vix_z    = macro?.vixZ != null ? clip1(macro.vixZ / 2) : 0;          // ±2σ → ±1
-  const vix_term = macro?.vixTerm != null ? clip1((macro.vixTerm - 1) * 5) : 0; // 0.9→-0.5, 1.1→+0.5
-  // Cross-asset momentum comes in as fractional (e.g. 0.003 = 0.3%). Scale
-  // by 100 so a 1% move = 1.0 feature weight.
-  const dxy_mom  = clip1((macro?.dxyMom5  || 0) * 100);
-  const tnx_mom  = clip1((macro?.tnxMom5  || 0) * 100);
-  const oil_mom  = clip1((macro?.oilMom5  || 0) * 100);
-  const gold_mom = clip1((macro?.goldMom5 || 0) * 100);
+  // Is this a crypto asset? Equity-specific macro/calendar/PEAD features
+  // either produce nonsense (VIX on BTC) or timing-misaligned noise
+  // (earnings drift on a coin with no earnings). Zero those slots so they
+  // don't actively mispredict — the crypto-trained models can then place
+  // their own (near-zero) weights on those slots and ignore them.
+  const isCrypto = universe === "crypto";
 
-  // Calendar
-  const tod_edge = clip0to1(calendar?.todEdge ?? 0.5);
+  // Equity macro — zero for crypto
+  const vix_z    = isCrypto ? 0 : (macro?.vixZ != null ? clip1(macro.vixZ / 2) : 0);
+  const vix_term = isCrypto ? 0 : (macro?.vixTerm != null ? clip1((macro.vixTerm - 1) * 5) : 0);
+  // Cross-asset: DXY has some crypto relevance per literature (Pyo & Lee,
+  // Liu-Tsyvinski) but TNX/Oil/Gold are equity-centric. For Phase 3b the
+  // pragmatic move is zero them all for crypto and let Phase 3c add
+  // crypto-native cross-asset (BTC dominance, ETH/BTC, stablecoin supply).
+  const dxy_mom  = isCrypto ? 0 : clip1((macro?.dxyMom5  || 0) * 100);
+  const tnx_mom  = isCrypto ? 0 : clip1((macro?.tnxMom5  || 0) * 100);
+  const oil_mom  = isCrypto ? 0 : clip1((macro?.oilMom5  || 0) * 100);
+  const gold_mom = isCrypto ? 0 : clip1((macro?.goldMom5 || 0) * 100);
 
-  // PEAD (earnings drift) — both already normalised in earnings.js
-  const pead_days = clip1(pead?.daysSinceEarnings ?? 0);
-  const pead_surp = clip1(pead?.surpriseDecayed ?? 0);
+  // Calendar — time-of-day edge is equity U-shape (open/close spikes).
+  // Crypto has a different Asia/EU/US overlap profile (Eross et al. 2019);
+  // leaving the equity-calibrated TOD slot at 0.5 would bias mid-session
+  // predictions. Zero it for crypto until Phase 3c adds a crypto-native
+  // session-position feature.
+  const tod_edge = isCrypto ? 0 : clip0to1(calendar?.todEdge ?? 0.5);
+
+  // PEAD — no earnings concept on crypto. pead is already null in crypto
+  // mode (gated upstream) so the ?? 0 fallback fires, but be explicit.
+  const pead_days = isCrypto ? 0 : clip1(pead?.daysSinceEarnings ?? 0);
+  const pead_surp = isCrypto ? 0 : clip1(pead?.surpriseDecayed ?? 0);
 
   return [
     rsi_c, macd_s, mom_n, bb_c, ema_s, ema_m, vol_n,
@@ -135,8 +164,8 @@ export const FEATURE_NAMES = [
   "PEAD_days", "PEAD_surp",
 ];
 
-function logisticScoreFromFeatures(f) {
-  const { weights, bias } = loadWeights();
+function logisticScoreFromFeatures(f, universe = "equities") {
+  const { weights, bias } = loadWeights(universe);
   // Defensive: if feature length drifts (e.g. old saved weights + new
   // feature vector), pad/truncate to keep the dot product well-defined.
   const n = Math.min(f.length, weights.length);
@@ -334,8 +363,8 @@ function findClosestCrisis(q) {
 // Agreement between models boosts confidence; disagreement reduces it.
 export function scoreSetup(q, context = {}) {
   const { macro = null, calendar = null, pead = null, universe = "equities" } = context;
-  const features  = extractFeatures(q, macro, calendar, pead);
-  const lrProb    = logisticScoreFromFeatures(features);
+  const features  = extractFeatures(q, macro, calendar, pead, universe);
+  const lrProb    = logisticScoreFromFeatures(features, universe);
   // Crisis analogue is a curated library of 55 EQUITY regimes (1929, 2008,
   // 2020 COVID, etc.). Matching BTC to "2008 Financial Crisis" produces
   // nonsense — different asset class, different dynamics. Suppress for
@@ -348,8 +377,8 @@ export function scoreSetup(q, context = {}) {
   const price     = q.price ?? 0;
 
   // ── NN probability (null if untrained) ──────────────────────────────
-  const nnProb    = predictNN(features);
-  const nnInfo    = getNNInfo();
+  const nnProb    = predictNN(features, universe);
+  const nnInfo    = getNNInfo(universe);
   const nnReady   = nnProb != null;
 
   // ── GBM probability (null if untrained) ─────────────────────────────
@@ -363,12 +392,12 @@ export function scoreSetup(q, context = {}) {
   // the universal GBM. This lets the model learn separate weight sets for
   // high-VIX vs low-VIX markets where the same features have different
   // meanings (e.g. low RSI = buy signal in calm, panic-trap in crisis).
-  const universalGBM  = loadGBM();
+  const universalGBM  = loadGBM(universe);
   const universalProb = universalGBM ? predictGBM(universalGBM, features) : null;
-  const regimePred    = macro ? predictRegime(features, macro) : null;
+  const regimePred    = macro ? predictRegime(features, macro, universe) : null;
   const gbmProb   = regimePred?.prob != null ? regimePred.prob : universalProb;
-  const gbmInfo   = getGBMInfo();
-  const regimeInfo = getRegimeInfo();
+  const gbmInfo   = getGBMInfo(universe);
+  const regimeInfo = getRegimeInfo(universe);
   const gbmReady  = gbmProb != null;
   const gbmSource = regimePred?.used || (universalProb != null ? "universal" : null);
 
@@ -499,7 +528,7 @@ export function scoreSetup(q, context = {}) {
 // which silently dropped every sim trade and produced "Need at least 8 samples"
 // even when the backtester returned 100+ trades.
 
-export function trainNNFromLog(reviewedLog) {
+export function trainNNFromLog(reviewedLog, universe = "equities") {
   const samples = reviewedLog
     .filter(d => d.reviewed && d.outcome && d.features)
     .map(d => ({
@@ -507,10 +536,10 @@ export function trainNNFromLog(reviewedLog) {
       y: d.outcome === "WIN" ? 1 : 0,
       ageDays: (Date.now() - new Date(d.timestamp).getTime()) / (24 * 3600 * 1000),
     }));
-  return trainNNRaw(samples);
+  return trainNNRaw(samples, { universe });
 }
 
-export function trainNNFromSim(simTrades) {
+export function trainNNFromSim(simTrades, universe = "equities") {
   const samples = simTrades
     .filter(d => d.outcome && d.features)
     .map(d => ({
@@ -518,19 +547,19 @@ export function trainNNFromSim(simTrades) {
       y: d.outcome === "WIN" ? 1 : 0,
       ageDays: d.ageDays || 0,
     }));
-  return trainNNRaw(samples);
+  return trainNNRaw(samples, { universe });
 }
 
 // Back-compat alias — older imports of trainNN keep working (= log training).
 export const trainNN = trainNNFromLog;
 
-export function resetNN() { resetNNRaw(); }
+export function resetNN(universe = "equities") { resetNNRaw(universe); }
 export { getNNInfo };
 
 // ─── GBM wrappers ──────────────────────────────────────────────────────────
 // Same shape as the NN wrappers. trainGBM returns the trained model and
 // also persists it via saveGBM (so subsequent scoreSetup calls pick it up).
-export function trainGBMFromLog(reviewedLog) {
+export function trainGBMFromLog(reviewedLog, universe = "equities") {
   const samples = reviewedLog
     .filter(d => d.reviewed && d.outcome && d.features)
     .map(d => ({
@@ -541,11 +570,11 @@ export function trainGBMFromLog(reviewedLog) {
     return { trained: 0, rounds: 0, reason: `Need ≥20 reviewed samples, got ${samples.length}` };
   }
   const result = trainGBMRaw(samples);
-  if (result.trees) saveGBM(result);
+  if (result.trees) saveGBM(result, universe);
   return result;
 }
 
-export function trainGBMFromSim(simTrades) {
+export function trainGBMFromSim(simTrades, universe = "equities") {
   const samples = simTrades
     .filter(d => d.outcome && d.features)
     .map(d => ({
@@ -556,18 +585,18 @@ export function trainGBMFromSim(simTrades) {
     return { trained: 0, rounds: 0, reason: `Need ≥20 sim samples, got ${samples.length}` };
   }
   const result = trainGBMRaw(samples);
-  if (result.trees) saveGBM(result);
+  if (result.trees) saveGBM(result, universe);
   return result;
 }
 
-export function resetGBM() { resetGBMRaw(); }
+export function resetGBM(universe = "equities") { resetGBMRaw(universe); }
 export { getGBMInfo };
 
 // ─── Regime-conditional models ─────────────────────────────────────────────
-export function trainRegimeFromSim(simTrades) {
-  return trainRegimeRaw(simTrades);
+export function trainRegimeFromSim(simTrades, universe = "equities") {
+  return trainRegimeRaw(simTrades, universe);
 }
-export function resetRegime() { resetRegimeRaw(); }
+export function resetRegime(universe = "equities") { resetRegimeRaw(universe); }
 export { getRegimeInfo };
 
 // ─── Decision log (localStorage) ────────────────────────────────────────────

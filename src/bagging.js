@@ -24,7 +24,9 @@
 // Stored as an array of weight vectors under a dedicated localStorage key;
 // independent of the single-LR weights used by the composite (model.js).
 
-const BAG_KEY = "trader_lr_bag_v2";
+function bagKeyFor(universe = "equities") {
+  return universe === "crypto" ? "trader_lr_bag_v2_crypto" : "trader_lr_bag_v2";
+}
 const N_BAGS = 30;
 const BAG_EPOCHS = 50;
 const BAG_LR = 0.05;
@@ -106,26 +108,26 @@ export function predictBag(bag, features) {
   };
 }
 
-export function saveBag(bag) {
+export function saveBag(bag, universe = "equities") {
   if (!bag) return;
-  localStorage.setItem(BAG_KEY, JSON.stringify({ ...bag, updatedAt: new Date().toISOString() }));
+  localStorage.setItem(bagKeyFor(universe), JSON.stringify({ ...bag, updatedAt: new Date().toISOString() }));
 }
 
-export function loadBag() {
+export function loadBag(universe = "equities") {
   try {
-    const saved = JSON.parse(localStorage.getItem(BAG_KEY) || "null");
+    const saved = JSON.parse(localStorage.getItem(bagKeyFor(universe)) || "null");
     if (saved?.bags?.length && saved.featureDim) return saved;
   } catch { /* fall through */ }
   return null;
 }
 
-export function resetBag() {
-  localStorage.removeItem(BAG_KEY);
+export function resetBag(universe = "equities") {
+  localStorage.removeItem(bagKeyFor(universe));
 }
 
 // Convenience for the UI — trains from sim trades with the same shape
 // trainNNFromSim expects ({ x, y, ageDays }).
-export function trainBagFromSim(simTrades) {
+export function trainBagFromSim(simTrades, universe = "equities") {
   const samples = simTrades
     .filter(d => d.outcome && d.features)
     .map(d => ({
@@ -136,6 +138,6 @@ export function trainBagFromSim(simTrades) {
   if (samples.length < 10) return { error: `Need ≥10 samples, got ${samples.length}` };
   const bag = trainBag(samples);
   if (bag.error) return bag;
-  saveBag(bag);
+  saveBag(bag, universe);
   return { ok: true, trainedOn: bag.trainedOn, nBags: bag.nBags };
 }

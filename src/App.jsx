@@ -1219,6 +1219,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         costBps,                    // round-trip costs baked in
         polygonKey: polygonKey || null,
         earningsMap,                // PEAD features applied per-entry, point-in-time
+        universe,                   // routes scoreSetup to the correct per-universe trained models
         onProgress: (p) => setSimState(prev => ({ ...prev, ...p, running: true })),
       });
       const metrics = computeSimMetrics(res.trades);
@@ -1298,6 +1299,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
           costBps,
           polygonKey: polygonKey || null,
           earningsMap,
+          universe,
           onProgress: () => {},
         });
         if (!res.trades.length) continue;
@@ -1368,13 +1370,13 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         //   - LR Bag: 30 bootstrap LRs, gives ensemble uncertainty
         // The composite ensemble in scoreSetup picks them up automatically
         // on the next refresh (each is loaded from localStorage).
-        const nnOut     = trainNNFromSim(simResult.trades);
-        const gbmOut    = trainGBMFromSim(simResult.trades);
-        const bagOut    = trainBagFromSim(simResult.trades);
+        const nnOut     = trainNNFromSim(simResult.trades, universe);
+        const gbmOut    = trainGBMFromSim(simResult.trades, universe);
+        const bagOut    = trainBagFromSim(simResult.trades, universe);
         // Regime-conditional GBMs need ≥60 trades (30 each side); skip
         // silently with a status if there aren't enough samples on each
         // side of the VIX-z midpoint.
-        const regimeOut = trainRegimeFromSim(simResult.trades);
+        const regimeOut = trainRegimeFromSim(simResult.trades, universe);
         setTrainResult({ ...nnOut, gbm: gbmOut, bag: bagOut, regime: regimeOut });
       } catch (err) {
         setTrainResult({ error: err.message || String(err) });
@@ -1657,7 +1659,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                       </div>
                       {/* Bagged ensemble uncertainty band — only shown if bag is trained */}
                       {(() => {
-                        const bag = loadBag();
+                        const bag = loadBag(universe);
                         if (!bag || !m.features) return null;
                         const bp = predictBag(bag, m.features);
                         if (!bp) return null;
@@ -1966,7 +1968,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
                         <div style={{fontSize:9,color:"#7FD8A6",letterSpacing:2}}>🧠 TRAIN NN ON SIMULATED TRADES</div>
                         {(() => { const info = getNNInfo(); return info.trainedOn > 0 && (
-                          <button onClick={()=>{resetNN();setTrainResult(null);}}
+                          <button onClick={()=>{resetNN(universe);setTrainResult(null);}}
                             style={{background:"#1A0808",border:"1px solid #4A1A1A",color:"#E74C3C",fontSize:8,padding:"3px 8px",cursor:"pointer",fontFamily:"inherit",letterSpacing:1}}>
                             RESET NN
                           </button>
@@ -2318,7 +2320,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
           {tab==="log"&&(()=>{
             const stats = getPerformanceStats();
             const reviewed = decisionLog.filter(d=>d.reviewed && d.features);
-            const wts = getCurrentWeights();
+            const wts = getCurrentWeights(universe);
             // FEATURE_NAMES is now imported from model.js (14 entries, kept
             // in sync with the feature vector). The local 7-entry copy was
             // silently truncating the display of the 7 new macro+calendar
@@ -2338,9 +2340,9 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                       disabled={reviewed.length < 2}
                       onClick={()=>{
                         const reviewedSet = decisionLog.filter(d=>d.reviewed);
-                        const lrRes  = adaptWeights(reviewedSet);
-                        const nnRes  = reviewedSet.length >= 8  ? trainNNFromLog(reviewedSet)  : null;
-                        const gbmRes = reviewedSet.length >= 20 ? trainGBMFromLog(reviewedSet) : null;
+                        const lrRes  = adaptWeights(reviewedSet, 0.08, 40, universe);
+                        const nnRes  = reviewedSet.length >= 8  ? trainNNFromLog(reviewedSet, universe)  : null;
+                        const gbmRes = reviewedSet.length >= 20 ? trainGBMFromLog(reviewedSet, universe) : null;
                         alert(
                           `LR (logistic regression):\n` +
                           `  Updated from ${lrRes.trained} reviewed trades (40 epochs).\n\n` +
@@ -2362,7 +2364,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                       🧠 LEARN ({reviewed.length} trades)
                     </button>
                     <button
-                      onClick={()=>{resetWeights();alert("Model weights reset to defaults.");}}
+                      onClick={()=>{resetWeights(universe);alert(`LR weights reset for ${universe}.`);}}
                       style={{background:"#111",border:"1px solid #2A2A2A",color:"#444",
                         fontSize:9,padding:"4px 8px",cursor:"pointer",fontFamily:"inherit",letterSpacing:1}}>
                       RESET MODEL

@@ -207,6 +207,7 @@ export async function runBacktest(symbols, opts = {}) {
     costBps = 15,  // round-trip in basis points; realistic retail default
     polygonKey = null,
     earningsMap = {},  // { symbol → earnings[] } for PEAD features
+    universe = "equities",  // routes scoreSetup to the correct per-universe models
     onProgress = () => {},
   } = opts;
 
@@ -256,6 +257,7 @@ export async function runBacktest(symbols, opts = {}) {
         ? computePeadFeatures(earningsMap[symbol], barTsMs)
         : null;
       const modelCtx = {
+        universe,
         macro: macroHist?.at(bars.timestamps[i]) || null,
         calendar: calendarFeaturesAt(bars.timestamps[i]),
         pead,

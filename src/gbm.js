@@ -23,7 +23,12 @@
 // Storage: trees are plain JS objects {feature, threshold, left, right} or
 // {value} for leaves — trivially JSON-serialisable to localStorage.
 
-const GBM_KEY = "trader_gbm_v1";
+// Per-universe storage — GBM weights diverge cleanly between equities and
+// crypto because the features in effect differ (equity-only slots zeroed
+// on crypto) and the training sets are disjoint.
+function gbmKeyFor(universe = "equities") {
+  return universe === "crypto" ? "trader_gbm_v1_crypto" : "trader_gbm_v1";
+}
 const N_ROUNDS_DEFAULT = 100;
 const MAX_DEPTH_DEFAULT = 4;
 const LEARNING_RATE_DEFAULT = 0.1;
@@ -237,25 +242,25 @@ export function predictGBM(model, x) {
 }
 
 // ─── Persistence ───────────────────────────────────────────────────────────
-export function saveGBM(model) {
+export function saveGBM(model, universe = "equities") {
   if (!model) return;
-  localStorage.setItem(GBM_KEY, JSON.stringify({ ...model, updatedAt: new Date().toISOString() }));
+  localStorage.setItem(gbmKeyFor(universe), JSON.stringify({ ...model, updatedAt: new Date().toISOString() }));
 }
 
-export function loadGBM() {
+export function loadGBM(universe = "equities") {
   try {
-    const saved = JSON.parse(localStorage.getItem(GBM_KEY) || "null");
+    const saved = JSON.parse(localStorage.getItem(gbmKeyFor(universe)) || "null");
     if (saved?.trees && saved.trees.length > 0) return saved;
   } catch { /* fall through */ }
   return null;
 }
 
-export function resetGBM() {
-  localStorage.removeItem(GBM_KEY);
+export function resetGBM(universe = "equities") {
+  localStorage.removeItem(gbmKeyFor(universe));
 }
 
-export function getGBMInfo() {
-  const m = loadGBM();
+export function getGBMInfo(universe = "equities") {
+  const m = loadGBM(universe);
   if (!m) return { trainedOn: 0, rounds: 0, finalLoss: null };
   return {
     trainedOn: m.trainedOn || 0,
