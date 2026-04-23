@@ -13,11 +13,19 @@
 
 const KEYS = {
   log:       "trader_decision_log",
-  lrWeights: "trader_lr_weights",
-  nnWeights: "trader_nn_weights_v1",
+  lrWeights: "trader_lr_weights_v2",
+  nnWeights: "trader_nn_weights_v2",
+  lrBag:     "trader_lr_bag_v2",
+  // Legacy keys we should also include so users migrating from older
+  // exports don't silently lose reviewed-log history on import.
+  logLegacy: "trader_decision_log",
 };
 
-const SCHEMA_VERSION = 1;
+// Bumped to 2 with the 14-dim feature vector + bagging. Imports from v1
+// payloads still work — old lrWeights (7-dim) and old nnWeights are simply
+// ignored because their shape no longer matches; the log always restores.
+const SCHEMA_VERSION = 2;
+const COMPATIBLE_SCHEMAS = [1, 2];
 
 export function exportState() {
   const payload = {
@@ -27,6 +35,7 @@ export function exportState() {
     log:       safeParse(localStorage.getItem(KEYS.log)) ?? [],
     lrWeights: safeParse(localStorage.getItem(KEYS.lrWeights)) ?? null,
     nnWeights: safeParse(localStorage.getItem(KEYS.nnWeights)) ?? null,
+    lrBag:     safeParse(localStorage.getItem(KEYS.lrBag)) ?? null,
   };
   return payload;
 }

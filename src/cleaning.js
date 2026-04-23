@@ -149,7 +149,18 @@ export function assessQuality({ flagged, capped, zeroVolFilled, lastFetched, ses
 export function cleanBars(bars, session = "OPEN", anchors = {}) {
   const zv   = cleanZeroVolumeBars(bars, session);
   const hamp = hampelFilter(zv.closes, 7, 3);
-  const win  = winsorizeReturns(hamp.cleaned, 0.001, 0.999);
+
+  // Winsorise EXCLUDING the last bar when an anchor.last will overwrite it.
+  // Otherwise the winsoriser caps the bar, the anchor restores the real
+  // price, and the next refresh sees the same outlier and re-caps — a loop
+  // that permanently stamps "suspect" quality on low-vol assets like GLD.
+  const willAnchorLast = anchors.last != null;
+  const winInput = willAnchorLast ? hamp.cleaned.slice(0, -1) : hamp.cleaned;
+  const winResult  = winsorizeReturns(winInput, 0.001, 0.999);
+  const winCloses = willAnchorLast
+    ? [...winResult.closes, hamp.cleaned[hamp.cleaned.length - 1]]
+    : winResult.closes;
+  const win = { closes: winCloses, capped: winResult.capped };
 
   const closes = win.closes;
   if (anchors.first != null && closes.length > 0) closes[0] = anchors.first;

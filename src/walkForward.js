@@ -71,7 +71,14 @@ function auc(preds) {
 }
 
 export function runWalkForward(simTrades, opts = {}) {
-  const { folds = 5, epochs = 80 } = opts;
+  const { folds = 5, epochs = 80, embargoSec = 3 * 60 * 60 } = opts;
+  // embargoSec: gap in seconds between the LAST timestamp in the train set and
+  // the FIRST allowed timestamp in the test set. This plugs a subtle leak:
+  // our trades have 3-hour holds, so two entries 30 minutes apart have
+  // OVERLAPPING forward windows. If one is in train and the other in test, the
+  // model effectively sees the label of a future test trade during training.
+  // Default embargo = one max-hold window = 3h = 10800s, which purges any
+  // overlap. This is Marcos López de Prado's "purged k-fold with embargo".
 
   // Chronological sort — walk-forward only makes sense in time order.
   const all = toSamples(simTrades).sort((a, b) => a.timestamp - b.timestamp);
@@ -85,13 +92,23 @@ export function runWalkForward(simTrades, opts = {}) {
   const foldSize = Math.floor(all.length / folds);
   const foldResults = [];
   const allPreds = [];
+  let totalPurged = 0;
 
-  // Fold i: train on [0 .. i*foldSize), test on [i*foldSize .. (i+1)*foldSize).
-  // We skip fold 0 because there's no earlier training set.
+  // Fold i: train on [0 .. i*foldSize), test on [i*foldSize .. (i+1)*foldSize),
+  // PURGING any train sample whose timestamp is within embargoSec of any test
+  // sample's timestamp. We skip fold 0 because there's no earlier training.
   for (let i = 1; i < folds; i++) {
-    const trainSet = all.slice(0, i * foldSize);
+    const rawTrain = all.slice(0, i * foldSize);
     const testSet  = all.slice(i * foldSize, (i + 1) * foldSize);
-    if (trainSet.length < 8 || testSet.length === 0) continue;
+    if (rawTrain.length < 8 || testSet.length === 0) continue;
+
+    // Find the earliest test-set timestamp and purge train samples whose
+    // timestamp (representing the ENTRY — forward label extends after) could
+    // overlap with the test set's label window.
+    const firstTestT = testSet[0].timestamp;
+    const trainSet = rawTrain.filter(s => s.timestamp <= firstTestT - embargoSec);
+    totalPurged += rawTrain.length - trainSet.length;
+    if (trainSet.length < 8) continue;
 
     const t = trainNNRaw(trainSet, { isolated: true, epochs });
     if (!t.weights) continue;
@@ -119,6 +136,8 @@ export function runWalkForward(simTrades, opts = {}) {
   // Aggregate OOS metrics over all folds' predictions pooled together.
   return {
     samples: all.length,
+    purgedByEmbargo: totalPurged,
+    embargoSec,
     folds: foldResults,
     overall: {
       oosSamples: allPreds.length,

@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
 import { generateMockQuote, generateLiveIndicators, computeIndicators } from "./mockData";
-import { scoreSetup, logDecision, reviewDecision, getPerformanceStats, getLog, adaptWeights, resetWeights, getCurrentWeights, trainNNFromLog, trainNNFromSim, resetNN, getNNInfo } from "./model";
+import { scoreSetup, logDecision, reviewDecision, getPerformanceStats, getLog, adaptWeights, resetWeights, getCurrentWeights, trainNNFromLog, trainNNFromSim, resetNN, getNNInfo, FEATURE_NAMES } from "./model";
 import { computeSimMetrics, summariseEdge } from "./simMetrics";
 import { runWalkForward, interpretWF } from "./walkForward";
 import { runBacktest } from "./backtest";
@@ -12,6 +12,8 @@ import { cleanBars, assessQuality, cleaningSummary } from "./cleaning";
 import { downloadExport, importState } from "./persistence";
 import { fetchMacroSnapshot } from "./macro";
 import { calendarFeatures } from "./calendar";
+import { recommendSize } from "./sizing";
+import { trainBagFromSim, loadBag, predictBag } from "./bagging";
 
 const FH_QUOTE  = (sym, key) => `https://finnhub.io/api/v1/quote?symbol=${sym}&token=${key}`;
 const FH_METRIC = (sym, key) => `https://finnhub.io/api/v1/stock/metric?symbol=${sym}&metric=all&token=${key}`;
@@ -264,13 +266,34 @@ async function fetchIntradayBars(symbol) {
 
 // Run the raw candle series through the cleaning pipeline, then recompute
 // indicators on the CLEANED bars so RSI/MACD/ATR/EMA reflect validated data.
-function cleanAndRecompute(live, session, anchors) {
-  const cleanedBars = cleanBars(
-    { closes: live.closes, highs: live.highs, lows: live.lows, volumes: live.volumes },
-    session,
-    anchors,
-  );
-  const { closes, highs, lows, volumes, cleaning } = cleanedBars;
+function cleanAndRecompute(live, session, anchors, { skipCleaning = false } = {}) {
+  // When skipCleaning=true (synthetic fallback bars), we bypass Hampel +
+  // winsorisation. The synthetic walker generates a Gaussian random walk
+  // with tiny per-bar moves — there are no real outliers to find, and
+  // winsorising the anchor-induced jump was the original cause of the GLD
+  // "suspect on every refresh" bug. Still applies anchors + clampOHLC.
+  let closes, highs, lows, volumes, cleaning;
+  if (skipCleaning) {
+    closes = [...live.closes];
+    highs = [...live.highs];
+    lows = [...live.lows];
+    volumes = [...live.volumes];
+    if (anchors.last != null && closes.length > 0) closes[closes.length - 1] = anchors.last;
+    if (anchors.first != null && closes.length > 0) closes[0] = anchors.first;
+    // Clamp OHLC for consistency
+    for (let i = 0; i < closes.length; i++) {
+      if (closes[i] > highs[i]) highs[i] = closes[i];
+      if (closes[i] < lows[i])  lows[i]  = closes[i];
+    }
+    cleaning = { hampelFlagged: 0, winsorised: 0, zeroVolFilled: 0, haltBars: 0, frozenBars: 0, ffillAborted: 0, totalTouched: 0, skipped: true };
+  } else {
+    const cleanedBars = cleanBars(
+      { closes: live.closes, highs: live.highs, lows: live.lows, volumes: live.volumes },
+      session,
+      anchors,
+    );
+    ({ closes, highs, lows, volumes, cleaning } = cleanedBars);
+  }
   const indicators = computeIndicators(closes, highs, lows, volumes);
   return {
     closes, highs, lows, volumes, ...indicators,
@@ -312,7 +335,7 @@ async function fetchQuote(symbol, finnhubKey) {
       zScore:     calcZScore(closes),
       cmf:        calcCMF(highs, lows, closes, volumes),
       maxDrawdown:calcMaxDrawdown(closes),
-      sharpe:     calcSharpe(closes),
+      sharpe:     calcSharpe(closes, 0.053, 252 * 78), // 5-min US session
     };
     const extendedMove = session !== "OPEN" ? { price: y.price, changePct, change } : null;
     const quality = assessQuality({
@@ -384,8 +407,10 @@ async function fetchQuote(symbol, finnhubKey) {
       ? realBars
       : generateLiveIndicators(symbol, price, prevClose);
     // Anchor last close to Finnhub's real-time price regardless of source —
-    // Yahoo's final 5m bar can lag by up to 60 seconds.
-    const live = cleanAndRecompute(rawLive, session, { last: price });
+    // Yahoo's final 5m bar can lag by up to 60 seconds. Skip cleaning on
+    // synthetic fallback — running Hampel/winsorise on a random walk is
+    // pure waste and causes false-positive "suspect" flags.
+    const live = cleanAndRecompute(rawLive, session, { last: price }, { skipCleaning: !usedRealBars });
     const { closes, highs, lows, volumes, cleaning } = live;
 
     const quant = {
@@ -396,7 +421,7 @@ async function fetchQuote(symbol, finnhubKey) {
       zScore:     calcZScore(closes),
       cmf:        calcCMF(highs, lows, closes, volumes),
       maxDrawdown:calcMaxDrawdown(closes),
-      sharpe:     calcSharpe(closes),
+      sharpe:     calcSharpe(closes, 0.053, 252 * 78), // 5-min US session
     };
 
     // When the market is NOT open, the Finnhub quote.c reflects extended-hours
@@ -988,8 +1013,12 @@ export default function App() {
     // trainNNFromSim runs synchronously and would otherwise lock the UI.
     setTimeout(() => {
       try {
-        const out = trainNNFromSim(simResult.trades);
-        setTrainResult(out);
+        // Train both the NN (flexible) and the LR bag (calibrated + uncertainty)
+        // on the same sim batch. Running them together means the UI's
+        // uncertainty band is always aligned with the NN's current state.
+        const nnOut = trainNNFromSim(simResult.trades);
+        const bagOut = trainBagFromSim(simResult.trades);
+        setTrainResult({ ...nnOut, bag: bagOut });
       } catch (err) {
         setTrainResult({ error: err.message || String(err) });
       }
@@ -1201,12 +1230,34 @@ export default function App() {
                       </div>
                       <div style={{marginTop:6,fontSize:10,color:"#888"}}>
                         Confidence: <b style={{color:"#FFF"}}>{m.confidence}%</b>
-                        &nbsp;·&nbsp; Agreement: <b style={{color:m.agreement.count>=3?"#2ECC71":m.agreement.count===2?"#C9A84C":"#E74C3C"}}>{m.agreement.count}/3 models</b>
+                        &nbsp;·&nbsp; Agreement: <b style={{color:m.agreement.count>=m.agreement.total?"#2ECC71":m.agreement.count>=(m.agreement.total-1)?"#C9A84C":"#E74C3C"}}>{m.agreement.count}/{m.agreement.total} {m.agreement.total===1?"(NN untrained)":"models"}</b>
                         &nbsp;·&nbsp; Weights: LR {(m.weights.lr*100).toFixed(0)}% · NN {(m.weights.nn*100).toFixed(0)}% · Tree {(m.weights.tree*100).toFixed(0)}%
                       </div>
                       <div style={{marginTop:8,width:"100%",height:8,background:"#0A0A0A",borderRadius:4,overflow:"hidden"}}>
                         <div style={{width:`${m.compositeProb}%`,height:"100%",background:m.compositeProb>58?"#2ECC71":m.compositeProb<42?"#E74C3C":"#C9A84C"}}/>
                       </div>
+                      {/* Bagged ensemble uncertainty band — only shown if bag is trained */}
+                      {(() => {
+                        const bag = loadBag();
+                        if (!bag || !m.features) return null;
+                        const bp = predictBag(bag, m.features);
+                        if (!bp) return null;
+                        const meanPct = (bp.mean * 100).toFixed(1);
+                        const stdPct = (bp.std * 100).toFixed(1);
+                        const widePct = bp.std > 0.12;
+                        return (
+                          <div style={{marginTop:10,paddingTop:8,borderTop:"1px solid #1A3A2A"}}>
+                            <div style={{fontSize:8,color:"#7FD8A6",letterSpacing:2,marginBottom:4}}>
+                              BAGGED-LR UNCERTAINTY ({bp.nBags} bootstrap models)
+                            </div>
+                            <div style={{fontSize:11,color:"#D8D0C0"}}>
+                              Mean <b style={{color:"#7FD8A6"}}>{meanPct}%</b> ± <b style={{color:widePct?"#E74C3C":"#C9A84C"}}>{stdPct}%</b>
+                              &nbsp;·&nbsp; band <span style={{color:"#888"}}>{(bp.min*100).toFixed(0)}–{(bp.max*100).toFixed(0)}%</span>
+                              {widePct && <span style={{color:"#E74C3C",marginLeft:6}}> ⚠ wide — low ensemble agreement</span>}
+                            </div>
+                          </div>
+                        );
+                      })()}
                     </div>
 
                     {/* ═══ LR ═══ */}
@@ -1461,6 +1512,12 @@ export default function App() {
                             for <b style={{color:"#FFF"}}>{trainResult.epochs}</b> epochs
                             {trainResult.loss != null && <> (final loss <b style={{color:"#FFF"}}>{trainResult.loss.toFixed(4)}</b>)</>}.
                             Stopped: {trainResult.reason}</div>
+                          {trainResult.bag?.ok && (
+                            <div>✓ LR bag (<b style={{color:"#FFF"}}>{trainResult.bag.nBags}</b> bootstrap models) trained on <b style={{color:"#FFF"}}>{trainResult.bag.trainedOn}</b> samples — ensemble ready for uncertainty-aware predictions.</div>
+                          )}
+                          {trainResult.bag?.error && (
+                            <div style={{color:"#C9A84C"}}>⚠ LR bag: {trainResult.bag.error}</div>
+                          )}
                           {trainResult.history?.length > 0 && (
                             <svg width="100%" height="40" style={{marginTop:6,background:"#080808"}} viewBox="0 0 200 40" preserveAspectRatio="none">
                               <polyline
@@ -1584,6 +1641,43 @@ export default function App() {
                         ))}
                       </div>
                     </div>
+
+                    {/* ═══ POSITION SIZING ═══ */}
+                    {(() => {
+                      const sz = recommendSize(q, m);
+                      if (!sz.explanation) return null;
+                      const pctOfAccount = (sz.sizePct * 100).toFixed(2);
+                      const notional = sz.notionalPct?.toFixed(1);
+                      return (
+                        <div style={{background:"#111",border:"1px solid #1E1E1E",padding:12}}>
+                          <div style={{fontSize:9,color:"#555",letterSpacing:2,marginBottom:8}}>
+                            POSITION SIZING — vol-targeted × fractional Kelly × 2% cap
+                          </div>
+                          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6,marginBottom:8}}>
+                            <div>
+                              <div style={{fontSize:8,color:"#444",letterSpacing:1}}>ACCOUNT RISK</div>
+                              <div style={{fontSize:14,color:"#7FD8A6",fontWeight:900}}>{pctOfAccount}%</div>
+                              <div style={{fontSize:8,color:"#555"}}>of account on this trade</div>
+                            </div>
+                            <div>
+                              <div style={{fontSize:8,color:"#444",letterSpacing:1}}>NOTIONAL SIZE</div>
+                              <div style={{fontSize:14,color:"#C9A84C",fontWeight:900}}>{notional}%</div>
+                              <div style={{fontSize:8,color:"#555"}}>of account as position</div>
+                            </div>
+                            <div>
+                              <div style={{fontSize:8,color:"#444",letterSpacing:1}}>BINDING CONSTRAINT</div>
+                              <div style={{fontSize:10,color:"#D87FD8",fontWeight:700,marginTop:3,textTransform:"uppercase",letterSpacing:1}}>{sz.explanation.binding}</div>
+                            </div>
+                          </div>
+                          <div style={{fontSize:8,color:"#666",lineHeight:1.6,borderTop:"1px solid #1A1A1A",paddingTop:6}}>
+                            ANN VOL {((sz.explanation.annualisedVol||0)*100).toFixed(1)}% ·
+                            VOL-TARGET×{sz.explanation.volMultiplier?.toFixed(2)} ·
+                            KELLY {(sz.explanation.kelly*100).toFixed(2)}% ·
+                            MODEL EDGE {(sz.explanation.edge*100).toFixed(0)}%
+                          </div>
+                        </div>
+                      );
+                    })()}
                   </div>
                 )}
               </div>
@@ -1594,7 +1688,10 @@ export default function App() {
             const stats = getPerformanceStats();
             const reviewed = decisionLog.filter(d=>d.reviewed && d.features);
             const wts = getCurrentWeights();
-            const FEATURE_NAMES = ["RSI","MACD","Mom","BB","EMA9/20","EMA20/50","Vol"];
+            // FEATURE_NAMES is now imported from model.js (14 entries, kept
+            // in sync with the feature vector). The local 7-entry copy was
+            // silently truncating the display of the 7 new macro+calendar
+            // LR weights.
             return (
               <div style={{flex:1,overflowY:"auto",padding:14}}>
                 {/* Header row */}

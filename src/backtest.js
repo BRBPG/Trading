@@ -19,8 +19,6 @@
 
 import { scoreSetup } from "./model";
 import { computeIndicators } from "./mockData";
-import { calcADX, calcWilliamsR, calcStochastic, calcROC, calcZScore,
-         calcCMF, calcMaxDrawdown, calcSharpe } from "./quant";
 import { fetchPolygonBars, hasPolygonKey } from "./polygon";
 import { fetchMacroHistorical } from "./macro";
 import { calendarFeaturesAt } from "./calendar";
@@ -75,28 +73,26 @@ async function fetchYahooHistorical(symbol, daysAgo = 7) {
 
 // Build a fake quote object at time-step i using only bars [0..i]
 function buildQuoteAt(symbol, bars, i) {
+  // LOOK-AHEAD FIX: in live trading, at the moment we decide to enter, the
+  // close of bar i is the MOST RECENT observation we have. We cannot also
+  // trade at that same close — we trade the next available bar. So features
+  // are built from closes[0..i] (inclusive, the signal-decision bar), and
+  // entry happens at closes[i+1] in the simulateOutcome loop. The sim loop's
+  // j=i+1 forward iteration starts at the entry bar.
   const closes = bars.closes.slice(0, i + 1);
   const highs  = bars.highs.slice(0, i + 1);
   const lows   = bars.lows.slice(0, i + 1);
   const volumes = bars.volumes.slice(0, i + 1);
-  if (closes.length < 60) return null;
+  if (closes.length < 100) return null;  // bumped from 60: EMA50 + BB20 need proper warmup
 
   const ind = computeIndicators(closes, highs, lows, volumes);
-  const quant = {
-    adx:        calcADX(highs, lows, closes),
-    williamsR:  calcWilliamsR(highs, lows, closes),
-    stochastic: calcStochastic(highs, lows, closes),
-    roc:        calcROC(closes),
-    zScore:     calcZScore(closes),
-    cmf:        calcCMF(highs, lows, closes, volumes),
-    maxDrawdown:calcMaxDrawdown(closes),
-    sharpe:     calcSharpe(closes),
-  };
+  // NOTE: scoreSetup never reads q.quant, so the full quant block that
+  // used to live here was pure dead work in the sim hot path. Removed.
   const price = closes[closes.length - 1];
   return {
     symbol, price,
     prevClose: closes[Math.max(0, closes.length - 79)],  // ~1 day back at 5m
-    closes, highs, lows, volumes, quant,
+    closes, highs, lows, volumes,
     ...ind,
   };
 }
@@ -110,14 +106,20 @@ function buildQuoteAt(symbol, bars, i) {
 //   getting filled at stop or target also costs spread/slippage.
 function simulateOutcome(bars, i, verdict, holdBars, atr, costBps = 15) {
   if (!atr || atr <= 0) return null;
-  const entry = bars.closes[i];
+  // Signal is formed from bars [0..i] (close of bar i is the latest input).
+  // Earliest realistic entry is bar i+1 — we've already consumed bar i's
+  // close as an input; we can't both use it and trade at it. Exit simulation
+  // walks forward from i+2.
+  const entryIdx = i + 1;
+  if (entryIdx >= bars.closes.length) return null;
+  const entry = bars.closes[entryIdx];
   const stopDist = 1.5 * atr;
   const tgtDist  = 3.0 * atr;
 
-  const endIdx = Math.min(i + holdBars, bars.closes.length - 1);
+  const endIdx = Math.min(entryIdx + holdBars, bars.closes.length - 1);
   let hitStop = false, hitTarget = false;
 
-  for (let j = i + 1; j <= endIdx; j++) {
+  for (let j = entryIdx + 1; j <= endIdx; j++) {
     const hi = bars.highs[j], lo = bars.lows[j];
     if (verdict === "BUY") {
       if (lo <= entry - stopDist) { hitStop = true; break; }
@@ -211,7 +213,8 @@ export async function runBacktest(symbols, opts = {}) {
     if (barsSource == null) barsSource = fetched.source;
     else if (barsSource !== fetched.source) barsSource = "mixed";
 
-    const entries = pickEntries(bars.closes.length, WARMUP_BARS, HOLD_BARS, samplesPerSymbol);
+    // Reserve +1 bar beyond HOLD_BARS because entry is now at i+1, not i.
+    const entries = pickEntries(bars.closes.length, WARMUP_BARS, HOLD_BARS + 1, samplesPerSymbol);
     onProgress({ phase: "simulating", symbol, candidates: entries.length, done: s, total: symbols.length });
 
     for (const i of entries) {

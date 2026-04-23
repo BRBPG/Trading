@@ -154,8 +154,12 @@ function decisionTree(q) {
   }
 
   // ═ STRONG signals — multiple factors aligned ═
-  const bullFactors = [ema_s_bull, ema_m_bull, macd_bull, mom > 1, rsi > 45 && rsi < 65, vol > 1.2, bb > 0.5].filter(Boolean).length;
-  const bearFactors = [!ema_s_bull, !ema_m_bull, !macd_bull, mom < -1, rsi < 55 && rsi > 35, vol > 1.2, bb < 0.5].filter(Boolean).length;
+  // RSI bands are DISJOINT: 50-65 bullish, 35-50 bearish. The 50 midline is
+  // neutral. Prior code used 45-65 / 35-55 which double-counted the 45-55
+  // band — a flat tape at RSI 50 would simultaneously add to bull AND bear
+  // factor counts, making STRONG_BUY and STRONG_SELL tallies inflate together.
+  const bullFactors = [ema_s_bull, ema_m_bull, macd_bull, mom > 1, rsi >= 50 && rsi < 65, vol > 1.2, bb > 0.5].filter(Boolean).length;
+  const bearFactors = [!ema_s_bull, !ema_m_bull, !macd_bull, mom < -1, rsi >= 35 && rsi < 50, vol > 1.2, bb < 0.5].filter(Boolean).length;
 
   if (bullFactors >= 6 && rsi < 75) {
     return { signal: "STRONG_BUY", strength: 0.9, reason: `Full-stack bull alignment — ${bullFactors}/7 bullish factors. EMAs stacked, MACD positive, momentum up, price holding above BB midline.` };
@@ -353,11 +357,27 @@ export function scoreSetup(q, context = {}) {
   compositeProb = Math.max(0.01, Math.min(0.99, compositeProb + crisisBias * (crisis?.similarity ?? 0)));
 
   // ── Agreement boost — if LR, NN, Tree all point same way, amplify confidence ──
+  // When the NN is untrained, it has NO OPINION. Previous behaviour forced
+  // nnDir = lrDir, which guaranteed at least 2/3 agreement and "boosted"
+  // confidence vacuously for the first ~50 trades of a new install. Now: if
+  // NN isn't ready, we only count 2-way agreement between LR and Tree.
   const lrDir   = lrProb > 0.5   ? 1 : -1;
   const treeDir = treeScore > 0.5 ? 1 : -1;
-  const nnDir   = nnReady ? (nnProb > 0.5 ? 1 : -1) : lrDir;
-  const agreeCount = (lrDir === treeDir ? 1 : 0) + (lrDir === nnDir ? 1 : 0) + (treeDir === nnDir ? 1 : 0);
-  const agreementBoost = agreeCount >= 3 ? 1.20 : agreeCount === 2 ? 1.0 : 0.75;
+  const nnDir   = nnReady ? (nnProb > 0.5 ? 1 : -1) : null;
+  let agreeCount, agreeTotal;
+  if (nnReady) {
+    agreeCount = (lrDir === treeDir ? 1 : 0) + (lrDir === nnDir ? 1 : 0) + (treeDir === nnDir ? 1 : 0);
+    agreeTotal = 3;
+  } else {
+    agreeCount = lrDir === treeDir ? 1 : 0;
+    agreeTotal = 1;
+  }
+  // Boost scales to the pool size — with only LR+Tree we can't reach a
+  // "3/3" state, so full agreement in 2-model mode earns the 2/3 boost tier.
+  const agreementBoost =
+    agreeTotal === 3
+      ? (agreeCount >= 3 ? 1.20 : agreeCount === 2 ? 1.0 : 0.75)
+      : (agreeCount === 1 ? 1.0 : 0.75);
 
   const rawConfidence = Math.abs(compositeProb - 0.5) * 200;
   const confidence    = Math.min(100, Math.round(rawConfidence * agreementBoost));
@@ -378,7 +398,7 @@ export function scoreSetup(q, context = {}) {
     weights: { lr: lrW, nn: nnW, tree: treeW, crisisBias },
     direction,
     confidence,
-    agreement: { count: agreeCount, boost: agreementBoost },
+    agreement: { count: agreeCount, total: agreeTotal, boost: agreementBoost },
     treeSignal: tree.signal,
     treeStrength: tree.strength,
     treeReason: tree.reason,

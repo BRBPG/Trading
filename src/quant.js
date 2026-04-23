@@ -86,14 +86,20 @@ export function calcMaxDrawdown(closes) {
   return maxDD*100;
 }
 
-// ─── Sharpe Ratio (annualised estimate) ──────────────────────────────────────
-export function calcSharpe(closes, rfRate = 0.053) {
+// ─── Sharpe Ratio (annualised, bar-frequency-aware) ─────────────────────────
+// Default barsPerYear=252 assumes DAILY bars. For intraday the caller must
+// pass the correct value — a US equity session is ~78 five-min bars, so
+// 252 × 78 = 19,656. Previously this function was unconditionally applying
+// the daily factor to 5-min return series, inflating reported Sharpe by a
+// factor of √78 ≈ 8.8×.
+export function calcSharpe(closes, rfRate = 0.053, barsPerYear = 252) {
   if (closes.length < 10) return null;
   const ret = [];
   for (let i = 1; i < closes.length; i++) ret.push((closes[i]-closes[i-1])/closes[i-1]);
   const mean = ret.reduce((a,b)=>a+b,0)/ret.length;
   const sd = Math.sqrt(ret.reduce((a,b)=>a+(b-mean)**2,0)/ret.length);
-  const annMean = mean*252, annSD = sd*Math.sqrt(252);
+  const annMean = mean * barsPerYear;
+  const annSD   = sd   * Math.sqrt(barsPerYear);
   return annSD > 0 ? (annMean-rfRate)/annSD : 0;
 }
 
