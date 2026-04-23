@@ -47,6 +47,11 @@ const WATCHLIST = ["SPY","QQQ","AAPL","MSFT","AMZN","NVDA","AMD","TSM","TSLA","I
 // on TW.L via the regular WATCHLIST iteration — only the backtest loop
 // skips it.
 const BACKTEST_SYMBOLS = WATCHLIST.filter(s => !s.includes("."));
+// Symbols whose per-bar vol is high enough to materially destabilise sims:
+// quantum names introduce ±5-6% per-bar moves that dominate the variance
+// across multi-sim runs. Excluding them via the diagnostic toggle isolates
+// whether the apparent edge is robust or a quantum-name-day artefact.
+const HIGH_VOL_SYMBOLS = ["IONQ", "RGTI"];
 
 // ─── Market-session detection (pure, client-side) ───────────────────────────
 // US stocks:   premarket 04:00-09:30 ET, open 09:30-16:00 ET, after 16:00-20:00 ET
@@ -756,6 +761,11 @@ export default function App() {
   // effects like PEAD and factor momentum live; intraday is mostly noise
   // net of costs. Changing this resets maxHoldHours to a sensible default.
   const [simInterval, setSimInterval] = useState("5m");
+  // Diagnostic: temporarily exclude high-vol speculative names (IONQ, RGTI)
+  // from the sim. Their 5-6% per-bar vol dominates run-to-run variance.
+  // Toggle on to test whether the underlying signal is stable once the
+  // noise sources are removed. Live dashboard / live ANALYZE unaffected.
+  const [excludeHighVol, setExcludeHighVol] = useState(false);
   // Round-trip transaction cost applied to every simulated trade's P&L.
   const [costBps, setCostBps] = useState(15);
   // How far back the backtester fetches bars. Capped at 7 on Yahoo, unlimited
@@ -1003,7 +1013,6 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
       }
       const reply = data.content?.filter(b=>b.type==="text").map(b=>b.text).join("\n")||"No response.";
       setChatHistory(prev=>[...prev,{role:"assistant",content:reply}]);
-      setMessages(prev=>[...prev,{type:"bot",text:reply}]);
       // Detect which symbol was picked (new "PICK: SYM" format, or fall back to
       // matching any watchlist symbol appearing early in the reply)
       const pickMatch = reply.match(/PICK:\s*([A-Z.]{2,6})/i);
@@ -1014,6 +1023,8 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
       const tradeData = parseTradeData(reply, q, logSym, modelCtx);
       if (tradeData && pickedSym) setSelected(pickedSym);
       const msgId = Date.now();
+      // Single setMessages call — previously this fired twice (once without
+      // tradeData, once with), producing a duplicate bot message in the chat.
       setMessages(prev=>[...prev,{id: msgId, type:"bot", text:reply, tradeData}]);
     } catch(err) {
       setMessages(prev=>[...prev,{type:"bot",text:`⚠️ Connection failed: ${err.message}`}]);
@@ -1073,7 +1084,10 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
   // (c) train repeatedly on the same simulated set if you like.
   async function runSimulation() {
     if (simState.running) return;
-    setSimState({ running: true, phase: "starting", symbol: null, done: 0, total: BACKTEST_SYMBOLS.length });
+    const expectedSyms = excludeHighVol
+      ? BACKTEST_SYMBOLS.filter(s => !HIGH_VOL_SYMBOLS.includes(s))
+      : BACKTEST_SYMBOLS;
+    setSimState({ running: true, phase: "starting", symbol: null, done: 0, total: expectedSyms.length });
     setSimResult(null);
     setTrainResult(null);
     try {
@@ -1091,7 +1105,10 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
       const samples = isDaily
         ? Math.min(30, Math.max(5, Math.floor(simDaysAgo / 10)))
         : (simDaysAgo <= 7 ? 10 : simDaysAgo <= 30 ? 20 : 40);
-      const res = await runBacktest(BACKTEST_SYMBOLS, {
+      const symsForRun = excludeHighVol
+        ? BACKTEST_SYMBOLS.filter(s => !HIGH_VOL_SYMBOLS.includes(s))
+        : BACKTEST_SYMBOLS;
+      const res = await runBacktest(symsForRun, {
         interval: simInterval,
         daysAgo: simDaysAgo,
         holdHours: maxHoldHours,    // max-hold = timeout; in daily mode this is days, not hours
@@ -1167,7 +1184,10 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         const samples = simInterval === "1d"
           ? Math.min(30, Math.max(5, Math.floor(simDaysAgo / 10)))
           : (simDaysAgo <= 7 ? 10 : simDaysAgo <= 30 ? 20 : 40);
-        const res = await runBacktest(BACKTEST_SYMBOLS, {
+        const symsForRun = excludeHighVol
+        ? BACKTEST_SYMBOLS.filter(s => !HIGH_VOL_SYMBOLS.includes(s))
+        : BACKTEST_SYMBOLS;
+      const res = await runBacktest(symsForRun, {
           interval: simInterval,
           daysAgo: simDaysAgo,
           holdHours: maxHoldHours,
@@ -1659,6 +1679,20 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                               <option value={50}>50 bps (worst)</option>
                             </select>
                           </div>
+                          {/* Diagnostic toggle — exclude high-vol speculative names from
+                              the sim. When the multi-sim shows high std dev, this is the
+                              first thing to test: do IONQ/RGTI variance bombs disappear?
+                              If std dev tightens, they're the source. */}
+                          <label style={{display:"flex",alignItems:"center",gap:6,cursor:simState.running?"not-allowed":"pointer"}}
+                            title="Diagnostic. Excludes IONQ + RGTI (5-6% per-bar vol) from the sim/training pipeline. Use to test whether high per-run AUC variance is driven by these names. Live dashboard unaffected.">
+                            <input type="checkbox" checked={excludeHighVol}
+                              disabled={simState.running}
+                              onChange={e=>setExcludeHighVol(e.target.checked)}
+                              style={{accentColor:"#E74C3C"}}/>
+                            <span style={{fontSize:8,color:excludeHighVol?"#E74C3C":"#666",letterSpacing:1}}>
+                              EXCLUDE HIGH-VOL ({HIGH_VOL_SYMBOLS.join("/")})
+                            </span>
+                          </label>
                         </div>
                       </div>
                       <div style={{fontSize:10,color:"#888",lineHeight:1.6,marginBottom:10}}>
