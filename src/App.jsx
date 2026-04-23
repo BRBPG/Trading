@@ -856,6 +856,10 @@ export default function App() {
   const [multiSimResult, setMultiSimResult] = useState(null);
   const [multiSimRunning, setMultiSimRunning] = useState(false);
   const [multiSimState, setMultiSimState] = useState({ phase: null, run: 0, total: 0 });
+  // Number of sims in the multi-sim batch. Default 20 — enough for a tight
+  // 95% CI on the mean AUC (~±0.02) without running for 30 minutes.
+  // 10 = quick exploratory, 20 = standard, 50 = thorough.
+  const [multiSimNRuns, setMultiSimNRuns] = useState(20);
   const [trainResult, setTrainResult] = useState(null);
   const [training, setTraining] = useState(false);
   const chatRef = useRef(null);
@@ -1277,11 +1281,20 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
     if (multiSimRunning) return;
     setMultiSimRunning(true);
     setMultiSimResult(null);
-    const N_RUNS = 5;
+    // N configurable from the UI. Session-scoped bars cache makes each
+    // additional sim nearly free after the first, so going from 5 → 20
+    // runs only increases total time by the WF computation (fractions of
+    // a second per run for our sample sizes). With 20 runs the std-error
+    // on the mean AUC tightens ~2× — enough to distinguish a real 0.53
+    // edge from noise.
+    const N_RUNS = multiSimNRuns;
     const aucs = [];
     const accs = [];
     const losses = [];
     const tradeCounts = [];
+    // Track per-symbol aggregated stats across all runs to find which
+    // names are carrying vs dragging the multi-sim AUC.
+    const perSymbolStats = {};  // symbol → { total: n, wins: n, pnl: sum }
     try {
       for (let i = 0; i < N_RUNS; i++) {
         setMultiSimState({ phase: "sim", run: i + 1, total: N_RUNS });
@@ -1313,6 +1326,13 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
           accs.push(wf.overall.oosAccuracy);
           losses.push(wf.overall.oosLogLoss);
         }
+        // Aggregate per-symbol trade stats across this run for the summary.
+        for (const t of res.trades) {
+          const ps = perSymbolStats[t.symbol] ||= { total: 0, wins: 0, pnl: 0 };
+          ps.total++;
+          if (t.outcome === "WIN") ps.wins++;
+          ps.pnl += t.pnlPct || 0;
+        }
       }
 
       if (aucs.length < 3) {
@@ -1321,15 +1341,46 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         return;
       }
 
-      // Trimmed mean: drop min and max, average the rest. Removes one
-      // unlucky tail and one lucky tail.
+      // ─── Statistics ───────────────────────────────────────────────────
+      // For N_RUNS sims we care about three things:
+      //  1. Central tendency: trimmed mean (drops top + bottom, robust to
+      //     one lucky and one unlucky outlier)
+      //  2. Uncertainty: 95% CI via normal approximation to the mean
+      //     (se = std / sqrt(n), CI = mean ± 1.96*se). At n=20 this is
+      //     well-approximated by normal; at n<10 the CI widens materially
+      //     because student-t kicks in.
+      //  3. Shape: histogram of per-run AUCs, min/max, IQR.
       const sortedAUC = [...aucs].sort((a, b) => a - b);
-      const trimmed = sortedAUC.slice(1, -1);
+      // Trim ~10% from each tail for robust mean (at N=20, drop 2 each side)
+      const trimPct = 0.10;
+      const trimCount = Math.max(1, Math.floor(sortedAUC.length * trimPct));
+      const trimmed = sortedAUC.slice(trimCount, -trimCount);
       const mean = arr => arr.reduce((a, b) => a + b, 0) / arr.length;
       const std  = arr => {
         const m = mean(arr);
         return Math.sqrt(arr.reduce((s, v) => s + (v - m) ** 2, 0) / arr.length);
       };
+      const muAUC = mean(aucs);
+      const sigmaAUC = std(aucs);
+      const seAUC = sigmaAUC / Math.sqrt(aucs.length);
+      // Percentile helper (used for IQR)
+      const pctile = (arr, p) => {
+        const sorted = [...arr].sort((a, b) => a - b);
+        const idx = Math.max(0, Math.min(sorted.length - 1, Math.floor(p * sorted.length)));
+        return sorted[idx];
+      };
+
+      // Per-symbol aggregated breakdown sorted best→worst by win rate.
+      const symbolBreakdown = Object.entries(perSymbolStats)
+        .map(([symbol, s]) => ({
+          symbol,
+          total: s.total,
+          wins: s.wins,
+          winRate: s.wins / s.total,
+          avgPnl: s.pnl / s.total,
+          totalPnl: s.pnl,
+        }))
+        .sort((a, b) => b.winRate - a.winRate);
 
       setMultiSimResult({
         runs: aucs.length,
@@ -1337,13 +1388,19 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         accs,
         losses,
         tradeCounts,
-        meanAUC: mean(aucs),
+        meanAUC: muAUC,
         trimmedMeanAUC: mean(trimmed),
-        stdAUC: std(aucs),
+        stdAUC: sigmaAUC,
+        seAUC,
+        ci95Low:  muAUC - 1.96 * seAUC,
+        ci95High: muAUC + 1.96 * seAUC,
+        iqrLow:   pctile(aucs, 0.25),
+        iqrHigh:  pctile(aucs, 0.75),
         minAUC: Math.min(...aucs),
         maxAUC: Math.max(...aucs),
         meanAccuracy: mean(accs),
         meanLogLoss: mean(losses),
+        symbolBreakdown,
       });
     } catch (err) {
       setMultiSimResult({ error: err.message || String(err) });
@@ -2133,13 +2190,28 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
 
                     {/* ═══ MULTI-SIM AVERAGING ═══ */}
                     <div style={{background:"#0A140F",border:"1px solid #2A6A4F",padding:12}}>
-                      <div style={{fontSize:9,color:"#7FD8A6",letterSpacing:2,marginBottom:8}}>📊 MULTI-SIM AVERAGING (defends against multiple-testing self-deception)</div>
+                      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8,flexWrap:"wrap",gap:6}}>
+                        <div style={{fontSize:9,color:"#7FD8A6",letterSpacing:2}}>📊 MULTI-SIM AVERAGING — statistical edge test</div>
+                        <div style={{display:"flex",alignItems:"center",gap:6}}
+                          title="Number of independent sims to average. More runs = tighter confidence interval but longer wall-clock. With the session bars cache, each additional run after the first is nearly free (just re-samples entry points from already-fetched bars). 20 runs at tight SE gives a statistically meaningful answer; 50 for definitive.">
+                          <span style={{fontSize:8,color:"#666",letterSpacing:1,cursor:"help"}}>RUNS</span>
+                          <select value={multiSimNRuns} onChange={e=>setMultiSimNRuns(Number(e.target.value))}
+                            disabled={multiSimRunning}
+                            style={{background:"#080808",border:"1px solid #2A2A2A",color:"#7FD8A6",fontFamily:"inherit",fontSize:9,padding:"2px 6px"}}>
+                            <option value={5}>5 (quick, weak SE)</option>
+                            <option value={10}>10 (exploratory)</option>
+                            <option value={20}>20 (standard)</option>
+                            <option value={30}>30 (thorough)</option>
+                            <option value={50}>50 (definitive)</option>
+                          </select>
+                        </div>
+                      </div>
                       <div style={{fontSize:10,color:"#888",lineHeight:1.6,marginBottom:10}}>
-                        Runs <b>5 independent</b> sims + walk-forwards back-to-back, then computes the
-                        <b style={{color:"#7FD8A6"}}> trimmed mean AUC</b> (drops the highest and lowest, averages
-                        the middle three). One sim hitting AUC 0.62 by luck is statistically meaningless;
-                        the trimmed mean of 5 sims is honest. Use this <b>before</b> deciding to train.
-                        <br/>Takes ~3-10 minutes depending on horizon and Polygon rate limits.
+                        Runs <b>{multiSimNRuns} independent</b> sims + walk-forwards, caches bars across runs so the
+                        network cost is paid once. Reports <b style={{color:"#7FD8A6"}}>95% CI</b> on the mean AUC
+                        (the honest answer to "could this be luck?"), trimmed-mean, std dev, and per-symbol
+                        breakdown. One sim at AUC 0.62 is statistically meaningless — the {multiSimNRuns}-run
+                        trimmed mean with a tight CI is not.
                       </div>
                       <button onClick={runMultiSim} disabled={multiSimRunning}
                         style={{background:multiSimRunning?"#111":"#0F1F18",
@@ -2149,7 +2221,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                           fontFamily:"inherit",letterSpacing:2,fontWeight:700,width:"100%"}}>
                         {multiSimRunning
                           ? `${multiSimState.phase || "starting"}... run ${multiSimState.run}/${multiSimState.total}`
-                          : "▶ RUN 5-SIM AVERAGE"}
+                          : `▶ RUN ${multiSimNRuns}-SIM AVERAGE`}
                       </button>
                       {multiSimResult?.error && (
                         <div style={{marginTop:10,fontSize:10,color:"#E74C3C"}}>⚠ {multiSimResult.error}</div>
@@ -2182,30 +2254,112 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                               <div style={{fontSize:9,color:"#555",letterSpacing:2}}>VERDICT — {r.runs}-RUN TRIMMED MEAN</div>
                               <div style={{fontSize:13,color:verdict.color,fontWeight:900,marginTop:2}}>{verdict.label}</div>
                             </div>
-                            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:10}}>
+                            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6,marginBottom:10}}>
                               {[
                                 ["TRIMMED MEAN AUC", r.trimmedMeanAUC.toFixed(3), r.trimmedMeanAUC>=0.55?"#2ECC71":r.trimmedMeanAUC>=0.52?"#C9A84C":"#E74C3C"],
                                 ["RAW MEAN AUC",     r.meanAUC.toFixed(3), "#888"],
+                                ["95% CI ON MEAN",   `[${r.ci95Low.toFixed(3)}, ${r.ci95High.toFixed(3)}]`, (r.ci95Low>0.50?"#2ECC71":r.ci95High<0.50?"#E74C3C":"#C9A84C")],
                                 ["AUC STD DEV",      r.stdAUC.toFixed(3), r.stdAUC<0.03?"#2ECC71":r.stdAUC<0.06?"#C9A84C":"#E74C3C"],
+                                ["IQR",              `[${r.iqrLow.toFixed(3)}, ${r.iqrHigh.toFixed(3)}]`, "#888"],
                                 ["RANGE",            `${r.minAUC.toFixed(3)} – ${r.maxAUC.toFixed(3)}`, "#888"],
                                 ["MEAN OOS ACC",     `${(r.meanAccuracy*100).toFixed(1)}%`, "#888"],
-                                ["MEAN LOG-LOSS",    r.meanLogLoss.toFixed(4), "#888"],
+                                ["MEAN LOG-LOSS",    r.meanLogLoss.toFixed(4), r.meanLogLoss<0.69?"#2ECC71":r.meanLogLoss<0.75?"#C9A84C":"#E74C3C"],
+                                ["SE(MEAN)",         r.seAUC.toFixed(4), "#888"],
                               ].map(([k,v,c])=>(
                                 <div key={k} style={{padding:"6px 8px",background:"#080808",border:"1px solid #1A1A1A"}}>
                                   <div style={{fontSize:8,color:"#555",letterSpacing:1}}>{k}</div>
-                                  <div style={{fontSize:12,color:c,fontWeight:700,marginTop:2}}>{v}</div>
+                                  <div style={{fontSize:11,color:c,fontWeight:700,marginTop:2}}>{v}</div>
                                 </div>
                               ))}
                             </div>
-                            <div style={{padding:"6px 10px",background:"#080808",border:"1px solid #1A1A1A",fontSize:10,color:"#888"}}>
-                              <div style={{fontSize:8,color:"#555",letterSpacing:2,marginBottom:4}}>PER-RUN AUCs (sorted)</div>
-                              {[...r.aucs].sort((a,b)=>a-b).map((auc,i)=>(
-                                <span key={i} style={{marginRight:10,color:i===0||i===r.aucs.length-1?"#666":"#CCC"}}>
-                                  {i===0||i===r.aucs.length-1 ? "⊘" : "·"} {auc.toFixed(3)}
-                                </span>
-                              ))}
-                              <div style={{fontSize:8,color:"#555",marginTop:4}}>⊘ = trimmed (high/low). Verdict uses the middle {r.runs - 2}.</div>
+
+                            {/* Histogram of per-run AUCs — visual sanity check
+                                on the distribution shape. If the histogram is
+                                bimodal or has a long tail, the point-estimate
+                                metrics are misleading. */}
+                            <div style={{padding:"6px 10px",background:"#080808",border:"1px solid #1A1A1A",marginBottom:10}}>
+                              <div style={{fontSize:8,color:"#555",letterSpacing:2,marginBottom:6}}>AUC DISTRIBUTION HISTOGRAM ({r.runs} runs, bins of 0.025)</div>
+                              {(() => {
+                                // 16 bins covering AUC 0.30 to 0.70 (0.025 each)
+                                const bins = new Array(16).fill(0);
+                                for (const a of r.aucs) {
+                                  const idx = Math.max(0, Math.min(15, Math.floor((a - 0.30) / 0.025)));
+                                  bins[idx]++;
+                                }
+                                const maxCount = Math.max(1, ...bins);
+                                return (
+                                  <div style={{display:"flex",alignItems:"flex-end",height:50,gap:2}}>
+                                    {bins.map((c, i) => {
+                                      const center = 0.30 + (i + 0.5) * 0.025;
+                                      const isAt50 = center >= 0.4875 && center < 0.5125;
+                                      const barColor = isAt50 ? "#C9A84C"
+                                        : center >= 0.55 ? "#2ECC71"
+                                        : center < 0.50 ? "#E74C3C"
+                                        : "#888";
+                                      return (
+                                        <div key={i} title={`${center.toFixed(3)}±0.0125: ${c} run${c!==1?"s":""}`}
+                                          style={{
+                                            flex:1,
+                                            height:`${(c/maxCount)*100}%`,
+                                            background:c>0?barColor:"#1A1A1A",
+                                            minHeight:c>0?2:0,
+                                          }}/>
+                                      );
+                                    })}
+                                  </div>
+                                );
+                              })()}
+                              <div style={{display:"flex",justifyContent:"space-between",fontSize:7,color:"#555",marginTop:2}}>
+                                <span>0.30</span><span>0.40</span><span style={{color:"#C9A84C"}}>0.50 (coin)</span><span>0.60</span><span>0.70</span>
+                              </div>
                             </div>
+
+                            {/* Per-run AUC list for transparency */}
+                            <div style={{padding:"6px 10px",background:"#080808",border:"1px solid #1A1A1A",fontSize:9,color:"#888",marginBottom:10}}>
+                              <div style={{fontSize:8,color:"#555",letterSpacing:2,marginBottom:4}}>PER-RUN AUCs (sorted; outer 10% trimmed)</div>
+                              <div style={{lineHeight:1.8}}>
+                                {[...r.aucs].sort((a,b)=>a-b).map((auc,i,a) => {
+                                  const trimN = Math.max(1, Math.floor(a.length * 0.10));
+                                  const isTrimmed = i < trimN || i >= a.length - trimN;
+                                  return (
+                                    <span key={i} style={{marginRight:8,color:isTrimmed?"#555":auc>0.50?"#7FD8A6":"#C9A84C"}}>
+                                      {isTrimmed ? "⊘" : "·"}{auc.toFixed(3)}
+                                    </span>
+                                  );
+                                })}
+                              </div>
+                            </div>
+
+                            {/* Per-symbol aggregated breakdown — which names
+                                are driving the result. Useful for deciding
+                                which symbols to drop from the watchlist. */}
+                            {r.symbolBreakdown?.length > 0 && (
+                              <div style={{padding:"6px 10px",background:"#080808",border:"1px solid #1A1A1A"}}>
+                                <div style={{fontSize:8,color:"#555",letterSpacing:2,marginBottom:6}}>PER-SYMBOL AGGREGATED ({r.symbolBreakdown.reduce((s,x)=>s+x.total,0)} total trades)</div>
+                                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:4,fontSize:9}}>
+                                  <div style={{color:"#555"}}>SYMBOL</div>
+                                  <div style={{color:"#555"}}>TRADES</div>
+                                  <div style={{color:"#555"}}>WIN-RATE</div>
+                                  <div style={{color:"#555"}}>AVG P&amp;L</div>
+                                  {r.symbolBreakdown.map(s => (
+                                    <React.Fragment key={s.symbol}>
+                                      <div style={{color:"#CCC",letterSpacing:1}}>{s.symbol}</div>
+                                      <div style={{color:"#888"}}>{s.total}</div>
+                                      <div style={{color:s.winRate>=0.55?"#2ECC71":s.winRate>=0.45?"#888":"#E74C3C"}}>
+                                        {(s.winRate*100).toFixed(0)}% ({s.wins}/{s.total})
+                                      </div>
+                                      <div style={{color:s.avgPnl>0?"#2ECC71":"#E74C3C"}}>
+                                        {s.avgPnl>=0?"+":""}{s.avgPnl.toFixed(2)}%
+                                      </div>
+                                    </React.Fragment>
+                                  ))}
+                                </div>
+                                <div style={{fontSize:8,color:"#555",marginTop:6,lineHeight:1.5}}>
+                                  Symbols with &lt;45% win-rate across {r.runs} runs are likely dragging the model.
+                                  Consider excluding them from BACKTEST_SYMBOLS or investigating why features don't fit.
+                                </div>
+                              </div>
+                            )}
                           </div>
                         );
                       })()}

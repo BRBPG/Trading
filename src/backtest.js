@@ -29,18 +29,64 @@ const YAHOO_PROXIES = [
   u => `https://corsproxy.io/?${encodeURIComponent(u)}`,
 ];
 
+// ─── Session bars cache ─────────────────────────────────────────────────────
+// The old multi-sim fetched historical bars for every symbol on every run
+// (5 runs × 15 symbols = 75 Polygon calls = 15 min at Starter's 5/min limit).
+// That was the tax that made only 5 runs feasible, which was the tax that
+// made results statistically thin.
+//
+// Cache bars in-memory for the session keyed by (symbol, interval, daysAgo,
+// source). First fetch populates; subsequent calls in the same page reuse.
+// TTL 10 min — enough for a full multi-sim session (20-50 runs) but short
+// enough that re-running after a break picks up fresh data.
+//
+// Impact: after warmup, each additional sim just re-samples entry points
+// from already-fetched bars — near-zero network cost. Can comfortably run
+// 20+ sims where 5 was the previous practical ceiling.
+const barsCache = new Map();  // key → { bars, source, fetchedAt }
+const BARS_CACHE_TTL_MS = 10 * 60 * 1000;
+
+function cacheKey(symbol, interval, daysAgo, hasPolygon) {
+  return `${symbol}|${interval}|${daysAgo}|${hasPolygon ? "poly" : "yh"}`;
+}
+
 // Try Polygon first if a key is available and (a) we need more history than
-// Yahoo gives for 5-min bars, or (b) we need daily bars at any horizon.
+// Yahoo gives for 5-min bars, or (b) we need daily bars at any horizon,
+// or (c) this is a crypto symbol (Polygon Crypto covers these cleanly now).
 // Otherwise Yahoo is fine and free.
 async function fetchHistoricalBars(symbol, daysAgo, polygonKey, interval = "5m") {
-  if (hasPolygonKey(polygonKey) && (daysAgo > 7 || interval === "1d")) {
+  const hasPoly = hasPolygonKey(polygonKey);
+  const isCrypto = /-USD(T)?$/.test(symbol.toUpperCase());
+
+  // Check session cache first — avoids re-hitting Polygon rate limits on
+  // repeat sims over the same window.
+  const key = cacheKey(symbol, interval, daysAgo, hasPoly);
+  const hit = barsCache.get(key);
+  if (hit && Date.now() - hit.fetchedAt < BARS_CACHE_TTL_MS) {
+    return { bars: hit.bars, source: hit.source, cached: true };
+  }
+
+  // Route to Polygon when the subscription can cover it — crypto always
+  // benefits from Polygon Crypto when present, equities only when we need
+  // more than Yahoo's 7d 5-min or any daily horizon.
+  if (hasPoly && (isCrypto || daysAgo > 7 || interval === "1d")) {
     const p = await fetchPolygonBars(symbol, daysAgo, polygonKey, interval);
-    if (p) return { bars: p, source: "polygon" };
+    if (p) {
+      barsCache.set(key, { bars: p, source: "polygon", fetchedAt: Date.now() });
+      return { bars: p, source: "polygon", cached: false };
+    }
   }
   const y = await fetchYahooHistorical(symbol, daysAgo, interval);
-  if (y) return { bars: y, source: "yahoo" };
+  if (y) {
+    barsCache.set(key, { bars: y, source: "yahoo", fetchedAt: Date.now() });
+    return { bars: y, source: "yahoo", cached: false };
+  }
   return null;
 }
+
+// Exposed so the UI can show cache state + let user force-clear between runs.
+export function clearBarsCache() { barsCache.clear(); }
+export function barsCacheSize() { return barsCache.size; }
 
 async function fetchYahooHistorical(symbol, daysAgo = 7, interval = "5m") {
   // Yahoo caps at ~60 days for 5-min bars but supports several years of daily.
