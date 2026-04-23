@@ -21,12 +21,12 @@
 //   • Dropout — sample counts too small for it to add signal.
 //   • Batch norm — overkill at this scale.
 
-// v2 architecture: 14 → 16 → 8 → 1 (393 params). Dimensions bumped from v1
-// (7→8→4→1, 105 params) to accommodate the new macro + calendar features.
-// Storage key changes so any v1 weights are discarded cleanly rather than
-// feeding the wrong shape into inference.
-const NN_KEY = "trader_nn_weights_v2";
-const NN_INPUT_DIM = 14;
+// v3 architecture: 16 → 16 → 8 → 1 (433 params). Two more inputs for the
+// PEAD (earnings drift) features on top of v2's 14 inputs. Storage key
+// bumped so any v2 weights are discarded cleanly rather than feeding the
+// wrong shape into inference.
+const NN_KEY = "trader_nn_weights_v3";
+const NN_INPUT_DIM = 16;
 const NN_HIDDEN1 = 16;
 const NN_HIDDEN2 = 8;
 

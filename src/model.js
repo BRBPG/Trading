@@ -1,25 +1,25 @@
 import { predictNN, trainNN as trainNNRaw, getNNInfo, resetNN as resetNNRaw } from "./nn";
 
-// ─── Pre-trained logistic regression (v2, 14-dim) ──────────────────────────
-// Honest note: these defaults are a mild bullish-tech prior — negative
-// weight on high RSI, positive weights on MACD/momentum/trend alignment,
-// near-zero weights on macro features (the NN is expected to learn those).
-// They are NOT derived from any fitted dataset and should be treated as
-// sensible starting points, not "trained" values. Real training comes from
-// sim trades (trainNNFromSim) or reviewed log (trainNNFromLog).
+// ─── Pre-trained logistic regression (v3, 16-dim) ──────────────────────────
+// Honest note: these defaults are a mild bullish-tech prior + a PEAD prior
+// (positive surpriseDecayed → bullish drift expected). Macro weights stay
+// at zero because the NN is better suited to learn non-linear macro
+// interactions. These are SENSIBLE STARTING POINTS, not fitted values.
+// Real training comes from trainNNFromSim or trainNNFromLog.
 const DEFAULT_WEIGHTS = [
-  -0.52, 1.28, 1.61, -0.74, 0.91, 1.05, 0.22,   // technicals
+  -0.52, 1.28, 1.61, -0.74, 0.91, 1.05, 0.22,   // technicals (legacy)
    0.00, 0.00,                                   // VIX_z, VIX_term (learned)
    0.00, 0.00, 0.00, 0.00,                       // DXY, TNX, Oil, Gold mom
    0.00,                                         // TOD_edge
+   0.00, 0.50,                                   // PEAD days (learned), surprise prior
 ];
 const DEFAULT_BIAS = 0.04;
-const WEIGHTS_KEY = "trader_lr_weights_v2";
+const WEIGHTS_KEY = "trader_lr_weights_v3";
 
 function loadWeights() {
   try {
     const saved = JSON.parse(localStorage.getItem(WEIGHTS_KEY) || "null");
-    if (saved?.weights?.length === 14) return { weights: saved.weights, bias: saved.bias };
+    if (saved?.weights?.length === 16) return { weights: saved.weights, bias: saved.bias };
   } catch { /* corrupt localStorage — fall through to defaults */ }
   return { weights: [...DEFAULT_WEIGHTS], bias: DEFAULT_BIAS };
 }
@@ -70,18 +70,21 @@ export function getCurrentWeights() {
 function sigmoid(x) { return 1 / (1 + Math.exp(-x)); }
 
 // ─── Feature extraction ────────────────────────────────────────────────────
-// 14-dim feature vector as of v2:
+// 16-dim feature vector as of v3:
 //   [0..6]   Single-symbol technicals (v1 legacy):
 //            rsi_c, macd_s, mom_n, bb_c, ema_s, ema_m, vol_n
 //   [7]      VIX z-score (regime indicator, -1..1 clipped)
 //   [8]      VIX term structure (VIX9D/VIX, >1 = stress bid)
 //   [9..12]  Cross-asset 5-bar momentum: DXY, TNX, Oil, Gold (each ±1 clipped)
 //   [13]     Time-of-day edge-ness (0=open/close, 1=midday)
+//   [14]     PEAD: daysSinceEarnings, [-1,1], -1 = just announced
+//   [15]     PEAD: surprise × exp(-days/30), [-1,1], surprise carries the
+//            drift direction for ~30-60 days post-announcement.
 //
-// macro and calendar args are OPTIONAL — if the caller doesn't supply them
-// (e.g. the old scoreSetup(q) signature still works), those slots are zeroed,
-// so the extracted vector length is always 14 and old call sites don't break.
-function extractFeatures(q, macro = null, calendar = null) {
+// All context args (macro, calendar, pead) are OPTIONAL — missing slots are
+// zeroed so the vector length is always 16 and callers without context
+// still work.
+function extractFeatures(q, macro = null, calendar = null, pead = null) {
   const rsi_c   = q.rsi != null ? (q.rsi - 50) / 50 : 0;
   const macd_s  = q.macd != null ? Math.sign(q.macd) : 0;
   const mom_n   = q.momentum5 != null ? Math.max(-1, Math.min(1, q.momentum5 / 4)) : 0;
@@ -108,20 +111,26 @@ function extractFeatures(q, macro = null, calendar = null) {
   // Calendar
   const tod_edge = clip0to1(calendar?.todEdge ?? 0.5);
 
+  // PEAD (earnings drift) — both already normalised in earnings.js
+  const pead_days = clip1(pead?.daysSinceEarnings ?? 0);
+  const pead_surp = clip1(pead?.surpriseDecayed ?? 0);
+
   return [
     rsi_c, macd_s, mom_n, bb_c, ema_s, ema_m, vol_n,
     vix_z, vix_term,
     dxy_mom, tnx_mom, oil_mom, gold_mom,
     tod_edge,
+    pead_days, pead_surp,
   ];
 }
 
-export const FEATURE_DIM = 14;
+export const FEATURE_DIM = 16;
 export const FEATURE_NAMES = [
   "RSI", "MACD", "Mom", "BB", "EMA9/20", "EMA20/50", "Vol",
   "VIX_z", "VIX_term",
   "DXY_m", "TNX_m", "Oil_m", "Gold_m",
   "TOD_edge",
+  "PEAD_days", "PEAD_surp",
 ];
 
 function logisticScoreFromFeatures(f) {
@@ -322,8 +331,8 @@ function findClosestCrisis(q) {
 // Weights always normalise to 1.0 so the output stays a probability.
 // Agreement between models boosts confidence; disagreement reduces it.
 export function scoreSetup(q, context = {}) {
-  const { macro = null, calendar = null } = context;
-  const features  = extractFeatures(q, macro, calendar);
+  const { macro = null, calendar = null, pead = null } = context;
+  const features  = extractFeatures(q, macro, calendar, pead);
   const lrProb    = logisticScoreFromFeatures(features);
   const tree      = decisionTree(q);
   const crisis    = findClosestCrisis(q);

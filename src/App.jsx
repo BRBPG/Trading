@@ -12,6 +12,7 @@ import { cleanBars, assessQuality, cleaningSummary } from "./cleaning";
 import { downloadExport, importState } from "./persistence";
 import { fetchMacroSnapshot } from "./macro";
 import { calendarFeatures } from "./calendar";
+import { getEarningsBatch, computePeadFeatures } from "./earnings";
 import { recommendSize } from "./sizing";
 import { trainBagFromSim, loadBag, predictBag } from "./bagging";
 
@@ -26,9 +27,9 @@ const FH_METRIC = (sym, key) => `https://finnhub.io/api/v1/stock/metric?symbol=$
 //   - EV / autos (TSLA)
 //   - Quantum computing (IONQ, RGTI — pure-play, high-vol speculative names)
 //   - Airline (UAL) — left in for consumer-discretionary / travel exposure
-//   - Commodities (USO = WTI oil ETF, GLD = gold ETF)
+//   - Commodities (USO = WTI oil ETF, BNO = Brent oil ETF, GLD = gold ETF)
 //   - LSE (TW.L = Taylor Wimpey, UK housebuilder) — routed through Yahoo
-const WATCHLIST = ["SPY","QQQ","AAPL","MSFT","AMZN","NVDA","AMD","TSM","TSLA","IONQ","RGTI","UAL","USO","GLD","TW.L"];
+const WATCHLIST = ["SPY","QQQ","AAPL","MSFT","AMZN","NVDA","AMD","TSM","TSLA","IONQ","RGTI","UAL","USO","BNO","GLD","TW.L"];
 
 // Subset of the watchlist fed into the backtest / sim / training pipeline.
 // Non-US listings (anything with a dot-suffix, currently just TW.L) are
@@ -564,10 +565,14 @@ function ApiKeyModal({ onSave }) {
 
 // Rank all loaded quotes by model edge and return the top N
 function rankOpportunities(quotes, topN = 3, context = {}) {
+  // context.earningsMap is { symbol → earnings[] } — per-symbol PEAD data
+  // that needs per-symbol context building. macro/calendar are shared.
+  const { earningsMap = {}, ...sharedCtx } = context;
   return Object.values(quotes)
     .filter(q => q && q.price)
     .map(q => {
-      const m = scoreSetup(q, context);
+      const pead = earningsMap[q.symbol] ? computePeadFeatures(earningsMap[q.symbol]) : null;
+      const m = scoreSetup(q, { ...sharedCtx, pead });
       const edge = Math.abs(parseFloat(m.lrProb) - 50); // 0–50, higher = more conviction
       const treeBoost = m.treeSignal === "STRONG_BUY" || m.treeSignal === "STRONG_SELL" ? 8 : 0;
       const volBoost = (q.volRatio ?? 1) > 1.3 ? 4 : 0;
@@ -687,7 +692,14 @@ function parseTradeData(reply, q, symbol, context = {}) {
                     || reply.match(/FINAL VERDICT:\s*(BUY|SELL|AVOID)/i)
                     || reply.match(/\b(BUY|SELL|AVOID)\b\s+@\s*\$/i);
   if (!verdictMatch) return null;
-  const model = scoreSetup(q, context);
+  // If the caller passed earningsMap, resolve per-symbol PEAD for this
+  // specific trade. Otherwise context.pead (if set for the selected symbol)
+  // passes through unchanged.
+  const { earningsMap, ...sharedCtx } = context;
+  const perSymCtx = earningsMap?.[symbol]
+    ? { ...sharedCtx, pead: computePeadFeatures(earningsMap[symbol]) }
+    : context;
+  const model = scoreSetup(q, perSymCtx);
   const stop   = parseFloat(reply.match(/(?:Stop|SL):\s*\$?([\d.]+)/i)?.[1]) || null;
   const target = parseFloat(reply.match(/(?:Target|TP):\s*\$?([\d.]+)/i)?.[1]) || null;
   const rr     = parseFloat(reply.match(/R\/R:?\s*([\d.]+)/i)?.[1]) || null;
@@ -728,12 +740,22 @@ export default function App() {
   // technicals. `null` until the first fetch completes; all-zero feature
   // contributions in that gap (safe default).
   const [macro, setMacro] = useState(null);
+  // Earnings history per symbol — Finnhub /stock/earnings results. Cached
+  // 1 week in localStorage; refreshed lazily on mount. Feeds the two PEAD
+  // features (daysSinceEarnings + surpriseDecayed). Missing data = zero
+  // PEAD contribution, safe default.
+  const [earningsMap, setEarningsMap] = useState({});
   const [simState, setSimState] = useState({ running: false, phase: null, symbol: null, done: 0, total: 0 });
   const [simResult, setSimResult] = useState(null);
   // Max-hold (timeout) for the simulator. Stop and target still exit early
   // on the first bar that touches them — this only governs how long the trade
   // is held when NEITHER stop nor target has been hit.
   const [maxHoldHours, setMaxHoldHours] = useState(3);
+  // Horizon mode: "5m" (intraday 5-min bars, hold 1-24h) vs "1d" (daily
+  // bars, hold 1-20 days). The daily horizon is where published retail
+  // effects like PEAD and factor momentum live; intraday is mostly noise
+  // net of costs. Changing this resets maxHoldHours to a sensible default.
+  const [simInterval, setSimInterval] = useState("5m");
   // Round-trip transaction cost applied to every simulated trade's P&L.
   const [costBps, setCostBps] = useState(15);
   // How far back the backtester fetches bars. Capped at 7 on Yahoo, unlimited
@@ -837,13 +859,26 @@ export default function App() {
     return () => clearInterval(id);
   }, []);
 
+  // Earnings fetch — once per session. Caches 1 week in localStorage so the
+  // Finnhub calls don't happen on every reload. PEAD features depend on this
+  // map being populated; if the fetch fails (no key, symbol uncovered), the
+  // feature just contributes zero — safe degradation.
+  useEffect(() => {
+    if (!finnhubKey) return;
+    getEarningsBatch(BACKTEST_SYMBOLS, finnhubKey).then(setEarningsMap).catch(() => {});
+  }, [finnhubKey]);
+
   useEffect(() => {
     if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight;
   }, [messages, thinking]);
 
   async function sendToAI(userText, mode = "deep") {
     setThinking(true);
-    const modelCtx = { macro, calendar: calendarFeatures() };
+    const modelCtx = {
+      macro,
+      calendar: calendarFeatures(),
+      pead: computePeadFeatures(earningsMap[selected]),
+    };
     const context = buildContext(quotes, selected, news, modelCtx);
     const directive = mode === "quick" ? QUICK_DIRECTIVE : DEEP_DIRECTIVE;
     const fullContent = `${context}\n${directive}\n\nUSER: ${userText}`;
@@ -892,7 +927,7 @@ export default function App() {
     if (thinking || Object.keys(quotes).length < 3) return;
     setThinking(true);
     setTab("chat");
-    const modelCtx = { macro, calendar: calendarFeatures() };
+    const modelCtx = { macro, calendar: calendarFeatures(), earningsMap };
     const context = buildBestOpportunityContext(quotes, news, modelCtx);
     setMessages(prev=>[...prev,{type:"user",text:"⚡ BEST OPPORTUNITY SCAN — rank all stocks and pick ONE trade now."}]);
     const newHistory = [...chatHistory, { role:"user", content:context }];
@@ -994,16 +1029,25 @@ export default function App() {
     setSimResult(null);
     setTrainResult(null);
     try {
+      // In daily mode we want MORE samples per symbol because each historical
+      // day contains at most one entry point (vs 78 candidate bars/day in
+      // 5-min mode). Bump the sample rate accordingly.
+      const isDaily = simInterval === "1d";
+      const samples = isDaily
+        ? Math.min(50, Math.max(5, Math.floor(simDaysAgo / 2)))
+        : (simDaysAgo <= 7 ? 10 : simDaysAgo <= 30 ? 20 : 40);
       const res = await runBacktest(BACKTEST_SYMBOLS, {
+        interval: simInterval,
         daysAgo: simDaysAgo,
-        holdHours: maxHoldHours,    // max-hold = timeout; stop/target still exit early
-        samplesPerSymbol: simDaysAgo <= 7 ? 10 : simDaysAgo <= 30 ? 20 : 40,
+        holdHours: maxHoldHours,    // max-hold = timeout; in daily mode this is days, not hours
+        samplesPerSymbol: samples,
         costBps,                    // round-trip costs baked in
         polygonKey: polygonKey || null,
+        earningsMap,                // PEAD features applied per-entry, point-in-time
         onProgress: (p) => setSimState(prev => ({ ...prev, ...p, running: true })),
       });
       const metrics = computeSimMetrics(res.trades);
-      setSimResult({ ...res, metrics, holdHours: maxHoldHours, costBps });
+      setSimResult({ ...res, metrics, holdHours: maxHoldHours, costBps, interval: simInterval });
       setWfResult(null); // stale — forces user to re-run WF on the new sim
     } catch (err) {
       setSimResult({ error: err.message || String(err) });
@@ -1242,7 +1286,11 @@ export default function App() {
 
           {tab==="model"&&(()=>{
             const q = quotes[selected];
-            const m = q ? scoreSetup(q, { macro, calendar: calendarFeatures() }) : null;
+            const m = q ? scoreSetup(q, {
+              macro,
+              calendar: calendarFeatures(),
+              pead: computePeadFeatures(earningsMap[selected]),
+            }) : null;
             return (
               <div style={{flex:1,overflowY:"auto",padding:14,fontSize:11,color:"#888"}}>
                 {!m ? <div>No data</div> : (
@@ -1344,16 +1392,41 @@ export default function App() {
                       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8,flexWrap:"wrap",gap:6}}>
                         <div style={{fontSize:9,color:"#5AACDF",letterSpacing:2}}>🎲 SIMULATE (real candles → labelled trades)</div>
                         <div style={{display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
-                          <div style={{display:"flex",alignItems:"center",gap:6}} title={polygonKey ? "Polygon key detected — longer histories available." : "No Polygon key — capped at 7 days by Yahoo. Enter a key via KEY button to unlock longer horizons."}>
+                          <div style={{display:"flex",alignItems:"center",gap:6}}
+                            title="Intraday (5-min) = short-term, noisy, costs eat edge. Daily = swing-trade horizon where published retail effects (PEAD, momentum) actually live. Daily is the recommended mode for finding genuine edge.">
+                            <span style={{fontSize:8,color:"#666",letterSpacing:1,cursor:"help"}}>HORIZON</span>
+                            <select value={simInterval} onChange={e=>{
+                              const v = e.target.value;
+                              setSimInterval(v);
+                              // Reset hold to a sensible default for the new mode
+                              if (v === "1d" && maxHoldHours < 24) setMaxHoldHours(5);
+                              if (v === "5m" && maxHoldHours >= 24) setMaxHoldHours(3);
+                              // Daily mode needs more days to be useful
+                              if (v === "1d" && simDaysAgo < 90) setSimDaysAgo(polygonKey ? 180 : 7);
+                            }}
+                              disabled={simState.running}
+                              style={{background:"#080808",border:"1px solid #2A2A2A",color:simInterval==="1d"?"#D87FD8":"#5AACDF",fontFamily:"inherit",fontSize:9,padding:"2px 6px"}}>
+                              <option value="5m">intraday (5-min)</option>
+                              <option value="1d">daily (1-20d swing)</option>
+                            </select>
+                          </div>
+                          <div style={{display:"flex",alignItems:"center",gap:6}} title={polygonKey ? "Polygon key detected — longer histories available." : "No Polygon key — capped at 7 days by Yahoo (5-min) / unlimited for daily. Enter a key via KEY button."}>
                             <span style={{fontSize:8,color:"#666",letterSpacing:1,cursor:"help"}}>DAYS AGO</span>
                             <select value={simDaysAgo} onChange={e=>setSimDaysAgo(Number(e.target.value))}
                               disabled={simState.running}
                               style={{background:"#080808",border:"1px solid #2A2A2A",color:polygonKey?"#7FD8A6":"#5AACDF",fontFamily:"inherit",fontSize:9,padding:"2px 6px"}}>
-                              <option value={7}>7d (Yahoo)</option>
-                              <option value={30} disabled={!polygonKey}>30d {polygonKey?"":"(Polygon)"}</option>
-                              <option value={90} disabled={!polygonKey}>90d {polygonKey?"":"(Polygon)"}</option>
-                              <option value={180} disabled={!polygonKey}>180d {polygonKey?"":"(Polygon)"}</option>
-                              <option value={365} disabled={!polygonKey}>1y {polygonKey?"":"(Polygon)"}</option>
+                              {simInterval === "5m" ? <>
+                                <option value={7}>7d (Yahoo)</option>
+                                <option value={30} disabled={!polygonKey}>30d {polygonKey?"":"(Polygon)"}</option>
+                                <option value={90} disabled={!polygonKey}>90d {polygonKey?"":"(Polygon)"}</option>
+                                <option value={180} disabled={!polygonKey}>180d {polygonKey?"":"(Polygon)"}</option>
+                                <option value={365} disabled={!polygonKey}>1y {polygonKey?"":"(Polygon)"}</option>
+                              </> : <>
+                                <option value={90}>90d (~60 trades)</option>
+                                <option value={180}>180d (~130 trades)</option>
+                                <option value={365}>1y (~250 trades)</option>
+                                <option value={730} disabled={!polygonKey}>2y {polygonKey?"":"(Polygon)"}</option>
+                              </>}
                             </select>
                           </div>
                           <div style={{display:"flex",alignItems:"center",gap:6}}>
@@ -1361,10 +1434,18 @@ export default function App() {
                             <select value={maxHoldHours} onChange={e=>setMaxHoldHours(Number(e.target.value))}
                               disabled={simState.running}
                               style={{background:"#080808",border:"1px solid #2A2A2A",color:"#5AACDF",fontFamily:"inherit",fontSize:9,padding:"2px 6px"}}>
-                              <option value={1}>1h</option>
-                              <option value={3}>3h (default)</option>
-                              <option value={6}>6h</option>
-                              <option value={24}>1d</option>
+                              {simInterval === "5m" ? <>
+                                <option value={1}>1h</option>
+                                <option value={3}>3h (default)</option>
+                                <option value={6}>6h</option>
+                                <option value={24}>1d</option>
+                              </> : <>
+                                <option value={1}>1 day</option>
+                                <option value={3}>3 days</option>
+                                <option value={5}>5 days (default)</option>
+                                <option value={10}>10 days</option>
+                                <option value={20}>20 days</option>
+                              </>}
                             </select>
                           </div>
                           <div style={{display:"flex",alignItems:"center",gap:6}} title="Round-trip cost: commission + spread + slippage, deducted from every trade's P&L before outcome labelling. 15 bps = 0.15% (realistic retail default on liquid US equities). 0 bps = gross / pre-cost.">
@@ -1382,13 +1463,13 @@ export default function App() {
                         </div>
                       </div>
                       <div style={{fontSize:10,color:"#888",lineHeight:1.6,marginBottom:10}}>
-                        Fetches real 5-min candles for {BACKTEST_SYMBOLS.length} US-session watchlist symbols (non-US listings like TW.L skipped — session hours don't align with US macro features),
-                        samples ~10 random entries per symbol, runs the current model verdict at each, then walks
+                        Fetches real {simInterval === "1d" ? "daily" : "5-min"} candles for {BACKTEST_SYMBOLS.length} US-session symbols (non-US skipped),
+                        samples random entries per symbol, runs the current model verdict at each, then walks
                         forward bar-by-bar. <b style={{color:"#5AACDF"}}>Stop or target exits the trade IMMEDIATELY</b> on
-                        the first bar that touches them — the max-hold above is only the <i>timeout</i> for trades that
-                        hit neither. Round-trip transaction cost (commission + spread + slippage) is deducted from
-                        every trade's P&amp;L <b style={{color:"#C9A84C"}}>before</b> outcome labelling, so the win rate
-                        and edge shown are <b>net of costs</b>.
+                        the first bar that touches them — max-hold is only the <i>timeout</i> for trades that
+                        hit neither. Round-trip cost deducted <b style={{color:"#C9A84C"}}>before</b> outcome labelling,
+                        so win rate and edge are <b>net of costs</b>.
+                        {simInterval === "1d" && <> <span style={{color:"#D87FD8"}}>Daily mode</span> uses a 1-to-20-day swing horizon where published retail effects actually live — generally higher AUC ceiling than intraday.</>}
                       </div>
                       <button onClick={runSimulation} disabled={simState.running}
                         style={{background:simState.running?"#111":"#0A1A2A",

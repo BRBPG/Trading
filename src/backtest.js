@@ -22,29 +22,39 @@ import { computeIndicators } from "./mockData";
 import { fetchPolygonBars, hasPolygonKey } from "./polygon";
 import { fetchMacroHistorical } from "./macro";
 import { calendarFeaturesAt } from "./calendar";
+import { computePeadFeatures } from "./earnings";
 
 const YAHOO_PROXIES = [
   u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
   u => `https://corsproxy.io/?${encodeURIComponent(u)}`,
 ];
 
-// Try Polygon first if a key is available and daysAgo exceeds Yahoo's
-// effective 5-min history cap (~60 days). Otherwise Yahoo is fine and faster.
-async function fetchHistoricalBars(symbol, daysAgo, polygonKey) {
-  if (hasPolygonKey(polygonKey) && daysAgo > 7) {
-    const p = await fetchPolygonBars(symbol, daysAgo, polygonKey);
+// Try Polygon first if a key is available and (a) we need more history than
+// Yahoo gives for 5-min bars, or (b) we need daily bars at any horizon.
+// Otherwise Yahoo is fine and free.
+async function fetchHistoricalBars(symbol, daysAgo, polygonKey, interval = "5m") {
+  if (hasPolygonKey(polygonKey) && (daysAgo > 7 || interval === "1d")) {
+    const p = await fetchPolygonBars(symbol, daysAgo, polygonKey, interval);
     if (p) return { bars: p, source: "polygon" };
   }
-  const y = await fetchYahooHistorical(symbol, daysAgo);
+  const y = await fetchYahooHistorical(symbol, daysAgo, interval);
   if (y) return { bars: y, source: "yahoo" };
   return null;
 }
 
-async function fetchYahooHistorical(symbol, daysAgo = 7) {
-  // Yahoo's 5-min history is capped at ~60 days; clamp to stay within that.
-  const clamped = Math.min(Math.max(daysAgo + 1, 2), 60);
-  const range = `${clamped}d`;
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=5m&range=${range}`;
+async function fetchYahooHistorical(symbol, daysAgo = 7, interval = "5m") {
+  // Yahoo caps at ~60 days for 5-min bars but supports several years of daily.
+  // For daily mode we can pull up to 10 years without issue.
+  const isDaily = interval === "1d";
+  const yInterval = isDaily ? "1d" : "5m";
+  const clamped = isDaily
+    ? Math.max(daysAgo + 1, 10)
+    : Math.min(Math.max(daysAgo + 1, 2), 60);
+  // Yahoo wants specific range strings for longer spans
+  const range = isDaily
+    ? (daysAgo <= 30 ? "1mo" : daysAgo <= 90 ? "3mo" : daysAgo <= 180 ? "6mo" : daysAgo <= 365 ? "1y" : "2y")
+    : `${clamped}d`;
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=${yInterval}&range=${range}`;
   for (const proxy of YAHOO_PROXIES) {
     try {
       const res = await fetch(proxy(url), { signal: AbortSignal.timeout(12000) });
@@ -177,18 +187,28 @@ function pickEntries(totalBars, warmup, forward, n) {
 }
 
 // Main entry — returns training samples ready for trainNN()
+// interval: "5m" intraday (original) or "1d" daily. In daily mode:
+//   holdHours is interpreted as holdDays (default 5d = 1-week swing)
+//   HOLD_BARS = holdDays (one bar per day)
+//   WARMUP_BARS = 50 (enough for EMA50 on daily series)
 export async function runBacktest(symbols, opts = {}) {
   const {
+    interval = "5m",
     daysAgo = 7,
     holdHours = 3,
     samplesPerSymbol = 10,
     costBps = 15,  // round-trip in basis points; realistic retail default
     polygonKey = null,
+    earningsMap = {},  // { symbol → earnings[] } for PEAD features
     onProgress = () => {},
   } = opts;
 
-  const HOLD_BARS = Math.round(holdHours * 12); // 5-min bars per hour = 12
-  const WARMUP_BARS = 60;
+  // In daily mode, holdHours becomes "hold days" — the user's 1/3/5/10 day
+  // dropdown values pass through as bar counts directly. The 5-min mode
+  // still treats holdHours as hours × 12 bars/hour.
+  const isDaily = interval === "1d";
+  const HOLD_BARS = isDaily ? Math.round(holdHours) : Math.round(holdHours * 12);
+  const WARMUP_BARS = isDaily ? 50 : 60;
 
   // Pre-fetch macro history ONCE per backtest run — the at(t) helper does
   // cheap in-memory binary-search lookups per entry, so this is O(symbols ×
@@ -204,7 +224,7 @@ export async function runBacktest(symbols, opts = {}) {
     const symbol = symbols[s];
     onProgress({ phase: "fetching", symbol, done: s, total: symbols.length });
 
-    const fetched = await fetchHistoricalBars(symbol, daysAgo + 1, polygonKey);
+    const fetched = await fetchHistoricalBars(symbol, daysAgo + 1, polygonKey, interval);
     if (!fetched) {
       errors.push({ symbol, reason: "fetch_failed" });
       continue;
@@ -220,9 +240,18 @@ export async function runBacktest(symbols, opts = {}) {
     for (const i of entries) {
       const q = buildQuoteAt(symbol, bars, i);
       if (!q) continue;
+      // PEAD features computed point-in-time against the entry bar's
+      // timestamp — only earnings events BEFORE this bar count, otherwise
+      // we'd leak future knowledge. computePeadFeatures filters by
+      // referenceTimeMs internally.
+      const barTsMs = bars.timestamps[i] * 1000;
+      const pead = earningsMap[symbol]
+        ? computePeadFeatures(earningsMap[symbol], barTsMs)
+        : null;
       const modelCtx = {
         macro: macroHist?.at(bars.timestamps[i]) || null,
         calendar: calendarFeaturesAt(bars.timestamps[i]),
+        pead,
       };
       const model = scoreSetup(q, modelCtx);
       const verdict = parseFloat(model.compositeProb) > 50 ? "BUY" : "SELL";
@@ -251,5 +280,5 @@ export async function runBacktest(symbols, opts = {}) {
 
   onProgress({ phase: "done", trades: trades.length, wins, losses });
 
-  return { trades, wins, losses, errors, costBps, holdHours, daysAgo, barsSource };
+  return { trades, wins, losses, errors, costBps, holdHours, daysAgo, barsSource, interval };
 }

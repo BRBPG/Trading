@@ -17,10 +17,13 @@ export function hasPolygonKey(key) {
   return typeof key === "string" && key.length > 10;
 }
 
-// Fetch 5-min bars for the past {daysAgo} days. Returns the same shape as
-// the Yahoo fetcher: { closes, highs, lows, volumes, timestamps } where
-// timestamps are Unix seconds.
-export async function fetchPolygonBars(symbol, daysAgo = 90, apiKey) {
+// Fetch bars for the past {daysAgo} days at the requested interval.
+// interval is "5m" (5-min bars) or "1d" (daily bars). The URL path differs:
+//   5m → /range/5/minute/
+//   1d → /range/1/day/
+// Same output shape either way: { closes, highs, lows, volumes, timestamps }
+// where timestamps are Unix seconds.
+export async function fetchPolygonBars(symbol, daysAgo = 90, apiKey, interval = "5m") {
   if (!hasPolygonKey(apiKey)) return null;
 
   // Polygon uses YYYY-MM-DD format. Use UTC to avoid local-time edge cases.
@@ -28,9 +31,11 @@ export async function fetchPolygonBars(symbol, daysAgo = 90, apiKey) {
   const from = new Date(to.getTime() - daysAgo * 24 * 60 * 60 * 1000);
   const fmt = d => d.toISOString().slice(0, 10);
 
+  const range = interval === "1d" ? "1/day" : "5/minute";
+
   // adjusted=true applies split/dividend adjustments. sort=asc gives oldest
   // first which is what all our indicators assume.
-  const url = `${POLYGON_BASE}/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/5/minute/${fmt(from)}/${fmt(to)}?adjusted=true&sort=asc&limit=50000&apiKey=${apiKey}`;
+  const url = `${POLYGON_BASE}/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/${range}/${fmt(from)}/${fmt(to)}?adjusted=true&sort=asc&limit=50000&apiKey=${apiKey}`;
 
   try {
     const res = await fetch(url, { signal: AbortSignal.timeout(15000) });

@@ -17,7 +17,7 @@ const VOL_PROFILES = {
   // Airline
   UAL:  { vol: 0.022 },
   // Commodities
-  USO:  { vol: 0.020 }, GLD:  { vol: 0.009 },
+  USO:  { vol: 0.020 }, BNO:  { vol: 0.022 }, GLD:  { vol: 0.009 },
   // LSE
   "TW.L": { vol: 0.018 },
 };
@@ -33,7 +33,7 @@ const FALLBACK_PRICES = {
   TSLA: 248,
   IONQ: 32, RGTI: 12,
   UAL: 68,
-  USO: 78, GLD: 224,
+  USO: 78, BNO: 20, GLD: 224,
   "TW.L": 112,
 };
 

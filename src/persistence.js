@@ -13,19 +13,17 @@
 
 const KEYS = {
   log:       "trader_decision_log",
-  lrWeights: "trader_lr_weights_v2",
-  nnWeights: "trader_nn_weights_v2",
-  lrBag:     "trader_lr_bag_v2",
-  // Legacy keys we should also include so users migrating from older
-  // exports don't silently lose reviewed-log history on import.
-  logLegacy: "trader_decision_log",
+  lrWeights: "trader_lr_weights_v3",
+  nnWeights: "trader_nn_weights_v3",
+  lrBag:     "trader_lr_bag_v2",    // bag storage unchanged; 16-dim works fine
+  earnings:  "trader_earnings_cache_v1", // earnings cache (optional export)
 };
 
-// Bumped to 2 with the 14-dim feature vector + bagging. Imports from v1
-// payloads still work — old lrWeights (7-dim) and old nnWeights are simply
-// ignored because their shape no longer matches; the log always restores.
-const SCHEMA_VERSION = 2;
-const COMPATIBLE_SCHEMAS = [1, 2];
+// Bumped to 3 with the 16-dim feature vector (added PEAD). Imports from
+// v1/v2 payloads still work — old weights are simply ignored on shape
+// mismatch; the log always restores regardless of version.
+const SCHEMA_VERSION = 3;
+const COMPATIBLE_SCHEMAS = [1, 2, 3];
 
 export function exportState() {
   const payload = {
@@ -85,14 +83,18 @@ export function importState(payload, { mode = "replace" } = {}) {
     }
   }
 
-  // Logistic-regression weights
-  if (payload.lrWeights && Array.isArray(payload.lrWeights.weights) && payload.lrWeights.weights.length === 7) {
+  // Logistic-regression weights. Shape check matches current FEATURE_DIM (16)
+  // for v3. Older exports with 7 or 14 weights are silently skipped — they'd
+  // crash at inference since scoreSetup expects 16-dim features.
+  if (payload.lrWeights && Array.isArray(payload.lrWeights.weights) && payload.lrWeights.weights.length === 16) {
     localStorage.setItem(KEYS.lrWeights, JSON.stringify(payload.lrWeights));
     restored.lrWeights = true;
   }
 
-  // Neural network weights
-  if (payload.nnWeights && Array.isArray(payload.nnWeights.W1) && payload.nnWeights.W1.length === 8) {
+  // Neural-network weights. v3 is 16→16→8→1, so W1 is 16×16.
+  if (payload.nnWeights && Array.isArray(payload.nnWeights.W1)
+      && payload.nnWeights.W1.length === 16
+      && payload.nnWeights.W1[0]?.length === 16) {
     localStorage.setItem(KEYS.nnWeights, JSON.stringify(payload.nnWeights));
     restored.nnWeights = true;
   }
