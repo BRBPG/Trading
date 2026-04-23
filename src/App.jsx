@@ -1029,12 +1029,19 @@ export default function App() {
     setSimResult(null);
     setTrainResult(null);
     try {
-      // In daily mode we want MORE samples per symbol because each historical
-      // day contains at most one entry point (vs 78 candidate bars/day in
-      // 5-min mode). Bump the sample rate accordingly.
+      // Sample count per symbol — needs to be tuned for the actual entry
+      // range available per mode, otherwise pickEntries can't fit the
+      // requested N and produces fewer (or none) trades.
+      //
+      // Daily mode: ~250 trading days/year, warmup eats 50, forward eats
+      // the hold period. At 180d daysAgo we get ~70 valid entry bars.
+      // Asking for >40 here leaves no room for non-clustered sampling.
+      //
+      // Intraday (5-min) mode: ~78 bars/day, so 7d = ~550 bars. Much more
+      // room, can safely ask for more samples.
       const isDaily = simInterval === "1d";
       const samples = isDaily
-        ? Math.min(50, Math.max(5, Math.floor(simDaysAgo / 2)))
+        ? Math.min(30, Math.max(5, Math.floor(simDaysAgo / 10)))
         : (simDaysAgo <= 7 ? 10 : simDaysAgo <= 30 ? 20 : 40);
       const res = await runBacktest(BACKTEST_SYMBOLS, {
         interval: simInterval,
@@ -1047,6 +1054,22 @@ export default function App() {
         onProgress: (p) => setSimState(prev => ({ ...prev, ...p, running: true })),
       });
       const metrics = computeSimMetrics(res.trades);
+      // Explicit error surface when NO trades were produced. Without this
+      // the metrics block is gated on metrics != null and the UI shows a
+      // completely blank sim result — "runs and does nothing". The most
+      // common cause is pickEntries not fitting N samples in the available
+      // range; second-most is all symbols failing to fetch.
+      if (!res.trades.length) {
+        const symbolsFetched = res.barsSource != null ? "yes" : "no";
+        const reason = res.errors?.length === BACKTEST_SYMBOLS.length
+          ? `All ${BACKTEST_SYMBOLS.length} symbols failed to fetch. Check Polygon rate limit or Yahoo proxy availability.`
+          : symbolsFetched === "no"
+            ? "No bars were fetched. Check network / API keys."
+            : `0 trades generated despite bars fetched OK. Likely the sample count (${samples}/symbol) doesn't fit the available entry range at ${simDaysAgo}d × ${maxHoldHours}${isDaily?"d":"h"} hold. Try a longer DAYS AGO or shorter MAX HOLD.`;
+        setSimResult({ ...res, error: reason, metrics: null, holdHours: maxHoldHours, costBps, interval: simInterval });
+        setSimState({ running: false, phase: "done", done: 0, total: 0 });
+        return;
+      }
       setSimResult({ ...res, metrics, holdHours: maxHoldHours, costBps, interval: simInterval });
       setWfResult(null); // stale — forces user to re-run WF on the new sim
     } catch (err) {

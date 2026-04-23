@@ -174,14 +174,21 @@ function simulateOutcome(bars, i, verdict, holdBars, atr, costBps = 15) {
   };
 }
 
-// Pick N random entry indices that leave room for the forward window
+// Pick N random entry indices that leave room for the forward window. If the
+// available range is tight (e.g. daily mode with limited history), CAP n at
+// the available range rather than silently returning empty — an empty return
+// here cascades to "sim ran and produced nothing" with no visible error.
 function pickEntries(totalBars, warmup, forward, n) {
   const lo = warmup, hi = totalBars - forward - 1;
-  if (hi - lo < n * 2) return []; // not enough room
+  const range = hi - lo;
+  if (range <= 0) return [];
+  // Allow sampling up to ~80% of available range to avoid total clustering
+  // while still producing output on tight daily-mode histories.
+  const feasibleN = Math.max(1, Math.min(n, Math.floor(range * 0.8)));
   const picks = new Set();
   let guard = 0;
-  while (picks.size < n && guard++ < n * 20) {
-    picks.add(lo + Math.floor(Math.random() * (hi - lo)));
+  while (picks.size < feasibleN && guard++ < feasibleN * 40) {
+    picks.add(lo + Math.floor(Math.random() * range));
   }
   return [...picks].sort((a, b) => a - b);
 }
