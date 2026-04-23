@@ -107,6 +107,17 @@ export function predictNN(features) {
   return forward(W, features).a3[0];
 }
 
+// Score a batch of samples with a given weight set (does NOT touch the
+// persisted NN). Used by walk-forward validation where we train a fresh NN
+// per fold and then evaluate it on held-out data without clobbering the
+// production NN.
+export function scoreWithWeights(W, samples) {
+  return samples.map(s => ({
+    y: s.y,
+    yHat: forward(W, s.x).a3[0],
+  }));
+}
+
 export function getNNInfo() {
   const W = loadNN();
   return {
@@ -127,6 +138,10 @@ export function trainNN(samples, opts = {}) {
     halfLifeDays = 30,
     patience = 5,
     minDeltaPct = 0.001,
+    // When true, train into a fresh weight set and RETURN it without
+    // persisting to localStorage. Used by walk-forward so each fold trains
+    // independently and doesn't clobber the production NN.
+    isolated = false,
   } = opts;
 
   if (samples.length < 8) {
@@ -142,8 +157,10 @@ export function trainNN(samples, opts = {}) {
   // Time-decay weight per sample
   const timeWeight = (ageDays = 0) => Math.pow(0.5, ageDays / halfLifeDays);
 
-  // Initialise / carry forward
-  let W = loadNN();
+  // Initialise / carry forward. When isolated, always start from fresh random
+  // weights — mixing persisted weights into a per-fold training set would
+  // leak information across folds and defeat the point of walk-forward.
+  let W = isolated ? initWeights() : loadNN();
   if (!W.trainedOn) W = initWeights();
 
   // Fit normalisation on current batch
@@ -219,8 +236,8 @@ export function trainNN(samples, opts = {}) {
         W.epochs = (W.epochs || 0) + epoch + 1;
         W.trainedOn = samples.length;
         W.finalLoss = avgLoss;
-        saveNN(W);
-        return { trained: samples.length, epochs: epoch + 1, loss: avgLoss, history, reason: "Early stop — loss plateau" };
+        if (!isolated) saveNN(W);
+        return { trained: samples.length, epochs: epoch + 1, loss: avgLoss, history, reason: "Early stop — loss plateau", weights: isolated ? W : undefined };
       }
     }
   }
@@ -228,6 +245,6 @@ export function trainNN(samples, opts = {}) {
   W.epochs = (W.epochs || 0) + epochs;
   W.trainedOn = samples.length;
   W.finalLoss = history[history.length - 1];
-  saveNN(W);
-  return { trained: samples.length, epochs, loss: W.finalLoss, history, reason: "Completed all epochs" };
+  if (!isolated) saveNN(W);
+  return { trained: samples.length, epochs, loss: W.finalLoss, history, reason: "Completed all epochs", weights: isolated ? W : undefined };
 }

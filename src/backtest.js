@@ -21,15 +21,29 @@ import { scoreSetup } from "./model";
 import { computeIndicators } from "./mockData";
 import { calcADX, calcWilliamsR, calcStochastic, calcROC, calcZScore,
          calcCMF, calcMaxDrawdown, calcSharpe } from "./quant";
+import { fetchPolygonBars, hasPolygonKey } from "./polygon";
 
 const YAHOO_PROXIES = [
   u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
   u => `https://corsproxy.io/?${encodeURIComponent(u)}`,
 ];
 
+// Try Polygon first if a key is available and daysAgo exceeds Yahoo's
+// effective 5-min history cap (~60 days). Otherwise Yahoo is fine and faster.
+async function fetchHistoricalBars(symbol, daysAgo, polygonKey) {
+  if (hasPolygonKey(polygonKey) && daysAgo > 7) {
+    const p = await fetchPolygonBars(symbol, daysAgo, polygonKey);
+    if (p) return { bars: p, source: "polygon" };
+  }
+  const y = await fetchYahooHistorical(symbol, daysAgo);
+  if (y) return { bars: y, source: "yahoo" };
+  return null;
+}
+
 async function fetchYahooHistorical(symbol, daysAgo = 7) {
-  // 5m candles capped at 60 days range by Yahoo — 7 days fits easily.
-  const range = `${Math.max(daysAgo + 1, 2)}d`;
+  // Yahoo's 5-min history is capped at ~60 days; clamp to stay within that.
+  const clamped = Math.min(Math.max(daysAgo + 1, 2), 60);
+  const range = `${clamped}d`;
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=5m&range=${range}`;
   for (const proxy of YAHOO_PROXIES) {
     try {
@@ -165,6 +179,7 @@ export async function runBacktest(symbols, opts = {}) {
     holdHours = 3,
     samplesPerSymbol = 10,
     costBps = 15,  // round-trip in basis points; realistic retail default
+    polygonKey = null,
     onProgress = () => {},
   } = opts;
 
@@ -173,16 +188,20 @@ export async function runBacktest(symbols, opts = {}) {
 
   const trades = [];
   const errors = [];
+  let barsSource = null;  // "polygon" | "yahoo" | mixed — reported back to UI
 
   for (let s = 0; s < symbols.length; s++) {
     const symbol = symbols[s];
     onProgress({ phase: "fetching", symbol, done: s, total: symbols.length });
 
-    const bars = await fetchYahooHistorical(symbol, daysAgo + 1);
-    if (!bars) {
+    const fetched = await fetchHistoricalBars(symbol, daysAgo + 1, polygonKey);
+    if (!fetched) {
       errors.push({ symbol, reason: "fetch_failed" });
       continue;
     }
+    const bars = fetched.bars;
+    if (barsSource == null) barsSource = fetched.source;
+    else if (barsSource !== fetched.source) barsSource = "mixed";
 
     const entries = pickEntries(bars.closes.length, WARMUP_BARS, HOLD_BARS, samplesPerSymbol);
     onProgress({ phase: "simulating", symbol, candidates: entries.length, done: s, total: symbols.length });
@@ -217,5 +236,5 @@ export async function runBacktest(symbols, opts = {}) {
 
   onProgress({ phase: "done", trades: trades.length, wins, losses });
 
-  return { trades, wins, losses, errors, costBps, holdHours };
+  return { trades, wins, losses, errors, costBps, holdHours, daysAgo, barsSource };
 }

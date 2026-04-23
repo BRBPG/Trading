@@ -1,7 +1,8 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import React, { useState, useRef, useEffect, useCallback } from "react";
 import { generateMockQuote, generateLiveIndicators, computeIndicators } from "./mockData";
 import { scoreSetup, logDecision, reviewDecision, getPerformanceStats, getLog, adaptWeights, resetWeights, getCurrentWeights, trainNNFromLog, trainNNFromSim, resetNN, getNNInfo } from "./model";
 import { computeSimMetrics, summariseEdge } from "./simMetrics";
+import { runWalkForward, interpretWF } from "./walkForward";
 import { runBacktest } from "./backtest";
 import { calcADX, calcWilliamsR, calcStochastic, calcROC, calcZScore,
          calcCMF, calcMaxDrawdown, calcSharpe, calcBeta, engineerFeatures,
@@ -460,29 +461,37 @@ function RSIBar({ rsi }) {
 function ApiKeyModal({ onSave }) {
   const [ak, setAk] = useState(()=>localStorage.getItem("anthropic_key")||"");
   const [fk, setFk] = useState(()=>localStorage.getItem("finnhub_key")||"");
-  const valid = ak.startsWith("sk-") && fk.length > 5;
+  const [pk, setPk] = useState(()=>localStorage.getItem("polygon_key")||"");
+  const valid = ak.startsWith("sk-") && fk.length > 5;  // Polygon is optional
   function save() {
     if (!valid) return;
     localStorage.setItem("anthropic_key", ak);
     localStorage.setItem("finnhub_key", fk);
-    onSave(ak, fk);
+    if (pk) localStorage.setItem("polygon_key", pk);
+    else    localStorage.removeItem("polygon_key");
+    onSave(ak, fk, pk);
   }
   return (
     <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.88)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:999}}>
-      <div style={{background:"#0F0F0F",border:"1px solid #C9A84C",padding:28,width:400}}>
-        <div style={{fontSize:14,fontWeight:900,color:"#C9A84C",letterSpacing:3,marginBottom:8}}>◈ API KEYS REQUIRED</div>
+      <div style={{background:"#0F0F0F",border:"1px solid #C9A84C",padding:28,width:420}}>
+        <div style={{fontSize:14,fontWeight:900,color:"#C9A84C",letterSpacing:3,marginBottom:8}}>◈ API KEYS</div>
         <div style={{fontSize:10,color:"#666",marginBottom:16,lineHeight:1.7}}>
-          Both keys are stored locally in your browser only.
+          Keys are stored locally in your browser only. Polygon is optional — without it, backtests fall back to Yahoo and are capped at ~7 days of 5-min history.
         </div>
-        <div style={{fontSize:9,color:"#C9A84C",letterSpacing:2,marginBottom:4}}>ANTHROPIC KEY (AI analysis)</div>
+        <div style={{fontSize:9,color:"#C9A84C",letterSpacing:2,marginBottom:4}}>ANTHROPIC KEY (AI analysis) — REQUIRED</div>
         <input value={ak} onChange={e=>setAk(e.target.value)} placeholder="sk-ant-..."
           style={{width:"100%",boxSizing:"border-box",background:"#080808",border:"1px solid #2A2A2A",
             color:"#D8D0C0",fontFamily:"'Courier New',monospace",fontSize:12,padding:"9px 12px",
             outline:"none",marginBottom:14}}/>
-        <div style={{fontSize:9,color:"#C9A84C",letterSpacing:2,marginBottom:4}}>FINNHUB KEY (live prices)</div>
+        <div style={{fontSize:9,color:"#C9A84C",letterSpacing:2,marginBottom:4}}>FINNHUB KEY (live US prices) — REQUIRED</div>
         <input value={fk} onChange={e=>setFk(e.target.value)} placeholder="your finnhub key..."
-          onKeyDown={e=>e.key==="Enter"&&save()}
           style={{width:"100%",boxSizing:"border-box",background:"#080808",border:"1px solid #2A2A2A",
+            color:"#D8D0C0",fontFamily:"'Courier New',monospace",fontSize:12,padding:"9px 12px",
+            outline:"none",marginBottom:14}}/>
+        <div style={{fontSize:9,color:"#7FD8A6",letterSpacing:2,marginBottom:4}}>POLYGON KEY (long-horizon backtest data) — OPTIONAL</div>
+        <input value={pk} onChange={e=>setPk(e.target.value)} placeholder="leave blank to use Yahoo (7d cap)..."
+          onKeyDown={e=>e.key==="Enter"&&save()}
+          style={{width:"100%",boxSizing:"border-box",background:"#080808",border:"1px solid #1A3A2A",
             color:"#D8D0C0",fontFamily:"'Courier New',monospace",fontSize:12,padding:"9px 12px",
             outline:"none",marginBottom:14}}/>
         <button onClick={save} disabled={!valid}
@@ -651,6 +660,10 @@ export default function App() {
   const [tab, setTab] = useState("chat");
   const [apiKey, setApiKey] = useState(()=>localStorage.getItem("anthropic_key")||"");
   const [finnhubKey, setFinnhubKey] = useState(()=>localStorage.getItem("finnhub_key")||"");
+  // Polygon key is OPTIONAL — only used by the backtest for long-horizon bars.
+  // Its presence/absence has zero effect on the live quote loop (Finnhub + Yahoo
+  // fallback), the cleaning pipeline, or the LR/NN models.
+  const [polygonKey, setPolygonKey] = useState(()=>localStorage.getItem("polygon_key")||"");
   const [decisionLog, setDecisionLog] = useState(()=>getLog());
   const [loggedMsgIds, setLoggedMsgIds] = useState(new Set());
   const [news, setNews] = useState([]);
@@ -662,10 +675,12 @@ export default function App() {
   // is held when NEITHER stop nor target has been hit.
   const [maxHoldHours, setMaxHoldHours] = useState(3);
   // Round-trip transaction cost applied to every simulated trade's P&L.
-  // 15 bps = 0.15% round-trip — realistic for liquid US equities at a
-  // retail broker (0 commission + ~5 bps spread + ~10 bps slippage).
-  // Set to 0 for gross (pre-cost) backtest; raise for illiquid names.
   const [costBps, setCostBps] = useState(15);
+  // How far back the backtester fetches bars. Capped at 7 on Yahoo, unlimited
+  // with Polygon. Set higher for more training data (and more regime variety).
+  const [simDaysAgo, setSimDaysAgo] = useState(7);
+  const [wfResult, setWfResult] = useState(null);
+  const [wfRunning, setWfRunning] = useState(false);
   const [trainResult, setTrainResult] = useState(null);
   const [training, setTraining] = useState(false);
   const chatRef = useRef(null);
@@ -912,18 +927,40 @@ export default function App() {
     setTrainResult(null);
     try {
       const res = await runBacktest(WATCHLIST, {
-        daysAgo: 7,
+        daysAgo: simDaysAgo,
         holdHours: maxHoldHours,    // max-hold = timeout; stop/target still exit early
-        samplesPerSymbol: 10,
+        samplesPerSymbol: simDaysAgo <= 7 ? 10 : simDaysAgo <= 30 ? 20 : 40,
         costBps,                    // round-trip costs baked in
+        polygonKey: polygonKey || null,
         onProgress: (p) => setSimState(prev => ({ ...prev, ...p, running: true })),
       });
       const metrics = computeSimMetrics(res.trades);
       setSimResult({ ...res, metrics, holdHours: maxHoldHours, costBps });
+      setWfResult(null); // stale — forces user to re-run WF on the new sim
     } catch (err) {
       setSimResult({ error: err.message || String(err) });
     }
     setSimState({ running: false, phase: "done", done: 0, total: 0 });
+  }
+
+  // ─── Walk-forward cross-validation ────────────────────────────────────────
+  // Evaluates whether the NN has learned anything real by training on past
+  // folds and testing on future folds, strictly chronologically. Does NOT
+  // touch the production NN weights — each fold trains an isolated copy.
+  function runWF() {
+    if (wfRunning || !simResult?.trades?.length) return;
+    setWfRunning(true);
+    setWfResult(null);
+    // Heavy CPU work — defer so the "running..." UI state paints first.
+    setTimeout(() => {
+      try {
+        const out = runWalkForward(simResult.trades, { folds: 5, epochs: 80 });
+        setWfResult(out);
+      } catch (err) {
+        setWfResult({ error: err.message || String(err) });
+      }
+      setWfRunning(false);
+    }, 50);
   }
 
   // ─── Train NN on the most recent sim batch ────────────────────────────────
@@ -949,7 +986,7 @@ export default function App() {
   const loadedCount = Object.keys(quotes).length;
   const mockCount = Object.values(quotes).filter(q=>q.isMock).length;
 
-  if (!apiKey||!finnhubKey) return <ApiKeyModal onSave={(ak,fk)=>{setApiKey(ak);setFinnhubKey(fk);}}/>;
+  if (!apiKey||!finnhubKey) return <ApiKeyModal onSave={(ak,fk,pk)=>{setApiKey(ak);setFinnhubKey(fk);setPolygonKey(pk||"");}}/>;
 
   return (
     <div style={{display:"flex",flexDirection:"column",height:"100vh",background:"#080808",
@@ -1213,6 +1250,18 @@ export default function App() {
                       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8,flexWrap:"wrap",gap:6}}>
                         <div style={{fontSize:9,color:"#5AACDF",letterSpacing:2}}>🎲 SIMULATE (real candles → labelled trades)</div>
                         <div style={{display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+                          <div style={{display:"flex",alignItems:"center",gap:6}} title={polygonKey ? "Polygon key detected — longer histories available." : "No Polygon key — capped at 7 days by Yahoo. Enter a key via KEY button to unlock longer horizons."}>
+                            <span style={{fontSize:8,color:"#666",letterSpacing:1,cursor:"help"}}>DAYS AGO</span>
+                            <select value={simDaysAgo} onChange={e=>setSimDaysAgo(Number(e.target.value))}
+                              disabled={simState.running}
+                              style={{background:"#080808",border:"1px solid #2A2A2A",color:polygonKey?"#7FD8A6":"#5AACDF",fontFamily:"inherit",fontSize:9,padding:"2px 6px"}}>
+                              <option value={7}>7d (Yahoo)</option>
+                              <option value={30} disabled={!polygonKey}>30d {polygonKey?"":"(Polygon)"}</option>
+                              <option value={90} disabled={!polygonKey}>90d {polygonKey?"":"(Polygon)"}</option>
+                              <option value={180} disabled={!polygonKey}>180d {polygonKey?"":"(Polygon)"}</option>
+                              <option value={365} disabled={!polygonKey}>1y {polygonKey?"":"(Polygon)"}</option>
+                            </select>
+                          </div>
                           <div style={{display:"flex",alignItems:"center",gap:6}}>
                             <span style={{fontSize:8,color:"#666",letterSpacing:1}}>MAX HOLD (timeout)</span>
                             <select value={maxHoldHours} onChange={e=>setMaxHoldHours(Number(e.target.value))}
@@ -1273,7 +1322,7 @@ export default function App() {
                               <div style={{fontSize:9,color:"#555",letterSpacing:2}}>EDGE — NET OF COSTS</div>
                               <div style={{fontSize:13,color:edge.color,fontWeight:900,marginTop:2}}>{edge.label}</div>
                               <div style={{fontSize:9,color:"#666",marginTop:2}}>
-                                {M.n} trades · {(M.winRate*100).toFixed(0)}% wins · max-hold {simResult.holdHours}h ·
+                                {M.n} trades · {(M.winRate*100).toFixed(0)}% wins · {simResult.daysAgo}d of {simResult.barsSource || "?"} bars · max-hold {simResult.holdHours}h ·
                                 <span style={{color:simResult.costBps>0?"#C9A84C":"#666"}}>
                                   {" "}costs {simResult.costBps ?? 0} bps/round-trip
                                 </span>
@@ -1415,6 +1464,96 @@ export default function App() {
                         <div style={{marginTop:10,fontSize:10,color:"#E74C3C"}}>⚠ {trainResult.error}</div>
                       )}
                     </div>
+
+                    {/* ═══ WALK-FORWARD VALIDATION ═══ (honest out-of-sample test) */}
+                    <div style={{background:"#140A14",border:"1px solid #6A2A6A",padding:12}}>
+                      <div style={{fontSize:9,color:"#D87FD8",letterSpacing:2,marginBottom:8}}>🧪 WALK-FORWARD VALIDATION (honest out-of-sample)</div>
+                      <div style={{fontSize:10,color:"#888",lineHeight:1.6,marginBottom:10}}>
+                        Splits sim trades chronologically into 5 folds. For each fold, trains a <b>fresh, isolated</b> NN
+                        on all earlier folds and evaluates on the held-out fold. The production NN is NOT touched.
+                        Out-of-sample metrics are the honest read — if test loss {"≫"} train loss, the model is
+                        overfitting and the edge you see in training is fiction.
+                      </div>
+                      <button onClick={runWF} disabled={wfRunning || !simResult?.trades?.length || simResult?.trades?.length < 40}
+                        style={{background:wfRunning||!simResult?.trades?.length?"#111":"#1A0A1A",
+                          border:`1px solid ${wfRunning||!simResult?.trades?.length?"#2A2A2A":"#6A2A6A"}`,
+                          color:wfRunning||!simResult?.trades?.length?"#666":"#D87FD8",
+                          fontSize:11,padding:"8px 14px",cursor:wfRunning||!simResult?.trades?.length?"not-allowed":"pointer",
+                          fontFamily:"inherit",letterSpacing:2,fontWeight:700,width:"100%"}}>
+                        {wfRunning
+                          ? "validating..."
+                          : !simResult?.trades?.length
+                            ? "▷ WALK-FORWARD (run a simulation first)"
+                            : simResult.trades.length < 40
+                              ? `▷ WALK-FORWARD (need ≥40 trades, have ${simResult.trades.length})`
+                              : `▶ RUN 5-FOLD WALK-FORWARD on ${simResult.trades.length} trades`}
+                      </button>
+
+                      {wfResult?.error && (
+                        <div style={{marginTop:10,fontSize:10,color:"#E74C3C"}}>⚠ {wfResult.error}</div>
+                      )}
+
+                      {wfResult && !wfResult.error && wfResult.overall && (() => {
+                        const O = wfResult.overall;
+                        const v = interpretWF(O);
+                        const overfit = (O.avgTestLoss - O.avgTrainLoss) > 0.1;
+                        return (
+                          <div style={{marginTop:12}}>
+                            <div style={{padding:"8px 10px",background:"#080808",border:`1px solid ${v.color}55`,borderLeft:`3px solid ${v.color}`,marginBottom:10}}>
+                              <div style={{fontSize:9,color:"#555",letterSpacing:2}}>VERDICT — OUT-OF-SAMPLE</div>
+                              <div style={{fontSize:13,color:v.color,fontWeight:900,marginTop:2}}>{v.label}</div>
+                              <div style={{fontSize:9,color:"#666",marginTop:2}}>
+                                {O.oosSamples} OOS predictions across {wfResult.folds.length} folds
+                              </div>
+                            </div>
+
+                            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:10}}>
+                              {[
+                                ["OOS AUC",       O.oosAUC?.toFixed(3) ?? "—",       O.oosAUC>=0.6?"#2ECC71":O.oosAUC>=0.55?"#C9A84C":O.oosAUC>=0.5?"#888":"#E74C3C"],
+                                ["OOS ACCURACY",  `${((O.oosAccuracy||0)*100).toFixed(1)}%`, O.oosAccuracy>=0.55?"#2ECC71":O.oosAccuracy>=0.5?"#C9A84C":"#E74C3C"],
+                                ["OOS LOG-LOSS",  O.oosLogLoss?.toFixed(4) ?? "—",   O.oosLogLoss<0.65?"#2ECC71":O.oosLogLoss<0.70?"#C9A84C":"#E74C3C"],
+                                ["OOS BRIER",     O.oosBrier?.toFixed(4) ?? "—",     O.oosBrier<0.22?"#2ECC71":O.oosBrier<0.25?"#C9A84C":"#E74C3C"],
+                                ["AVG TRAIN LOSS", O.avgTrainLoss?.toFixed(4) ?? "—", "#888"],
+                                ["AVG TEST LOSS",  O.avgTestLoss?.toFixed(4) ?? "—",  overfit?"#E74C3C":"#888"],
+                              ].map(([k,val,c])=>(
+                                <div key={k} style={{padding:"6px 8px",background:"#080808",border:"1px solid #1A1A1A"}}>
+                                  <div style={{fontSize:8,color:"#555",letterSpacing:1}}>{k}</div>
+                                  <div style={{fontSize:12,color:c,fontWeight:700,marginTop:2}}>{val}</div>
+                                </div>
+                              ))}
+                            </div>
+
+                            {overfit && (
+                              <div style={{padding:"6px 10px",background:"#1A0808",border:"1px solid #4A1A1A",color:"#E74C3C",fontSize:10,marginBottom:10}}>
+                                ⚠ Train/test loss gap = {(O.avgTestLoss - O.avgTrainLoss).toFixed(4)}. The NN is memorising training folds
+                                but not generalising to future ones. Get more data or simplify the model.
+                              </div>
+                            )}
+
+                            <div style={{padding:"8px 10px",background:"#080808",border:"1px solid #1A1A1A"}}>
+                              <div style={{fontSize:9,color:"#555",letterSpacing:2,marginBottom:6}}>PER-FOLD BREAKDOWN</div>
+                              <div style={{display:"grid",gridTemplateColumns:"30px 1fr 1fr 1fr 1fr",gap:4,fontSize:9}}>
+                                <div style={{color:"#555"}}>FOLD</div>
+                                <div style={{color:"#555"}}>TRAIN/TEST</div>
+                                <div style={{color:"#555"}}>TEST LOSS</div>
+                                <div style={{color:"#555"}}>ACC</div>
+                                <div style={{color:"#555"}}>AUC</div>
+                                {wfResult.folds.map(f => (
+                                  <React.Fragment key={f.fold}>
+                                    <div style={{color:"#888"}}>{f.fold}</div>
+                                    <div style={{color:"#888"}}>{f.trainSize}/{f.testSize}</div>
+                                    <div style={{color:"#CCC"}}>{f.testLoss?.toFixed(3) ?? "—"}</div>
+                                    <div style={{color:"#CCC"}}>{((f.testAccuracy||0)*100).toFixed(0)}%</div>
+                                    <div style={{color:f.testAUC>=0.6?"#2ECC71":f.testAUC>=0.5?"#C9A84C":"#E74C3C"}}>{f.testAUC?.toFixed(2) ?? "—"}</div>
+                                  </React.Fragment>
+                                ))}
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })()}
+                    </div>
+
                     <div style={{background:"#111",border:"1px solid #1E1E1E",padding:12}}>
                       <div style={{fontSize:9,color:"#555",letterSpacing:2,marginBottom:8}}>SUGGESTED LEVELS (1.5 ATR stop, 3:1 R/R)</div>
                       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
