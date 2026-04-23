@@ -18,7 +18,17 @@ import { trainBagFromSim, loadBag, predictBag } from "./bagging";
 const FH_QUOTE  = (sym, key) => `https://finnhub.io/api/v1/quote?symbol=${sym}&token=${key}`;
 const FH_METRIC = (sym, key) => `https://finnhub.io/api/v1/stock/metric?symbol=${sym}&metric=all&token=${key}`;
 
-const WATCHLIST = ["SPY","QQQ","AAPL","NVDA","TSLA","AMD","MSFT","META","UAL","CCL","XOM","GLD","AMZN","BNO","TW.L"];
+// Watchlist selected by the user. Mix of:
+//   - Broad index ETFs (SPY, QQQ)
+//   - Mega-cap tech (AAPL, MSFT, AMZN)
+//   - Semiconductors (NVDA, AMD, TSM — TSM is the foundry that makes silicon
+//     for the other two; all three move together on semi-cycle news)
+//   - EV / autos (TSLA)
+//   - Quantum computing (IONQ, RGTI — pure-play, high-vol speculative names)
+//   - Airline (UAL) — left in for consumer-discretionary / travel exposure
+//   - Commodities (USO = WTI oil ETF, GLD = gold ETF)
+//   - LSE (TW.L = Taylor Wimpey, UK housebuilder) — routed through Yahoo
+const WATCHLIST = ["SPY","QQQ","AAPL","MSFT","AMZN","NVDA","AMD","TSM","TSLA","IONQ","RGTI","UAL","USO","GLD","TW.L"];
 
 // ─── Market-session detection (pure, client-side) ───────────────────────────
 // US stocks:   premarket 04:00-09:30 ET, open 09:30-16:00 ET, after 16:00-20:00 ET

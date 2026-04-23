@@ -1,16 +1,39 @@
+// Per-symbol daily-vol estimates used by the synthetic candle fallback when
+// live fetch fails. Only consulted by generateMockQuote — has no effect on
+// real Yahoo/Finnhub/Polygon data. Missing entries fall through to 0.015
+// (see generateCandles). Values are rough intraday ranges; exact numbers
+// don't matter because this path is only a fallback, not primary data.
 const VOL_PROFILES = {
-  SPY:  { vol: 0.008 }, QQQ:  { vol: 0.011 }, AAPL: { vol: 0.013 },
-  NVDA: { vol: 0.028 }, TSLA: { vol: 0.035 }, AMD:  { vol: 0.025 },
-  MSFT: { vol: 0.012 }, META: { vol: 0.018 }, UAL:  { vol: 0.022 },
-  CCL:  { vol: 0.025 }, XOM:  { vol: 0.014 }, GLD:  { vol: 0.009 },
-  AMZN: { vol: 0.016 }, BNO:  { vol: 0.022 }, XAUUSD: { vol: 0.009 },
+  // Broad indices
+  SPY:  { vol: 0.008 }, QQQ:  { vol: 0.011 },
+  // Mega-cap tech
+  AAPL: { vol: 0.013 }, MSFT: { vol: 0.012 }, AMZN: { vol: 0.016 },
+  // Semiconductors
+  NVDA: { vol: 0.028 }, AMD:  { vol: 0.025 }, TSM:  { vol: 0.018 },
+  // EV / autos
+  TSLA: { vol: 0.035 },
+  // Quantum — extremely high vol, small-cap behaviour
+  IONQ: { vol: 0.055 }, RGTI: { vol: 0.060 },
+  // Airline
+  UAL:  { vol: 0.022 },
+  // Commodities
+  USO:  { vol: 0.020 }, GLD:  { vol: 0.009 },
+  // LSE
   "TW.L": { vol: 0.018 },
 };
 
+// Synthetic-fallback starting prices. Rough ballpark — doesn't need to match
+// the live price exactly, just needs to be in the right order of magnitude
+// so the random walk doesn't produce nonsense during a full Finnhub + Yahoo
+// outage.
 const FALLBACK_PRICES = {
-  SPY: 530, QQQ: 455, AAPL: 213, NVDA: 875, TSLA: 248,
-  AMD: 158, MSFT: 415, META: 512, UAL: 68, CCL: 19.5,
-  XOM: 112, GLD: 224, AMZN: 195, BNO: 20, XAUUSD: 3300,
+  SPY: 530, QQQ: 455,
+  AAPL: 213, MSFT: 415, AMZN: 195,
+  NVDA: 875, AMD: 158, TSM: 185,
+  TSLA: 248,
+  IONQ: 32, RGTI: 12,
+  UAL: 68,
+  USO: 78, GLD: 224,
   "TW.L": 112,
 };
 
