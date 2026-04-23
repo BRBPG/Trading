@@ -64,12 +64,24 @@ export async function fetchPolygonBars(symbol, daysAgo = 90, apiKey, interval = 
   try {
     const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
     if (!res.ok) {
-      // 403 usually means the subscription doesn't cover this symbol class;
-      // 429 is rate limit. Either way — null signals caller to fall back.
+      // 403 = subscription doesn't cover this symbol class (common for
+      // niche crypto pairs); 429 = rate limit. Surface the reason so the
+      // user can see WHY a symbol dropped out in devtools.
+
+      console.warn(`[polygon] ${polyTicker} → HTTP ${res.status} (${symbol}). Falling back.`);
       return null;
     }
     const data = await res.json();
-    if (data?.status === "ERROR" || !Array.isArray(data?.results)) return null;
+    if (data?.status === "ERROR") {
+
+      console.warn(`[polygon] ${polyTicker} → ${data.error || "ERROR status"} (${symbol})`);
+      return null;
+    }
+    if (!Array.isArray(data?.results)) {
+
+      console.warn(`[polygon] ${polyTicker} → no results array (${symbol}). Response:`, data?.resultsCount, data?.status);
+      return null;
+    }
 
     const closes = [], highs = [], lows = [], volumes = [], timestamps = [];
     for (const bar of data.results) {
@@ -81,9 +93,15 @@ export async function fetchPolygonBars(symbol, daysAgo = 90, apiKey, interval = 
       volumes.push(bar.v ?? 0);
       timestamps.push(Math.floor(bar.t / 1000)); // → seconds to match Yahoo shape
     }
-    if (closes.length < 30) return null;
+    if (closes.length < 30) {
+
+      console.warn(`[polygon] ${polyTicker} → only ${closes.length} bars, need ≥30 (${symbol})`);
+      return null;
+    }
     return { closes, highs, lows, volumes, timestamps };
-  } catch {
+  } catch (err) {
+
+    console.warn(`[polygon] ${polyTicker} → fetch error: ${err.message} (${symbol})`);
     return null;
   }
 }

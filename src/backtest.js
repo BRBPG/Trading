@@ -280,10 +280,18 @@ export async function runBacktest(symbols, opts = {}) {
 
     const fetched = await fetchHistoricalBars(symbol, daysAgo + 1, polygonKey, interval);
     if (!fetched) {
-      errors.push({ symbol, reason: "fetch_failed" });
+      // Diagnostic: log to console so the user can see in devtools which
+      // symbol + source combo is failing. Previously symbols would silently
+      // drop (BNB-USD was missing from crypto multi-sim output entirely).
+      console.warn(`[backtest] fetch_failed for ${symbol} — both Polygon and Yahoo returned null. Symbol may not be covered at the current ${interval}/${daysAgo}d combination.`);
+      errors.push({ symbol, reason: "fetch_failed", polygonKeyPresent: !!polygonKey });
       continue;
     }
     const bars = fetched.bars;
+    // Diagnostic: log which source served each symbol on its FIRST fetch
+    // (i.e. not a cache hit), so we can spot unexpected fallbacks (e.g.
+    // Polygon failing silently for BNB and Yahoo picking up the slack).
+    if (!fetched.cached) console.info(`[backtest] ${symbol} served from ${fetched.source}`);
     if (barsSource == null) barsSource = fetched.source;
     else if (barsSource !== fetched.source) barsSource = "mixed";
 

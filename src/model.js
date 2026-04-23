@@ -404,10 +404,23 @@ export function scoreSetup(q, context = {}) {
   // ── Blend weights ───────────────────────────────────────────────────
   // GBM dominates as it accumulates samples (tabular ML is its forté).
   // NN is a smaller secondary contributor. LR + Tree are baseline priors.
-  const treeWeight = 0.20 + 0.20 * (tree.strength ?? 0.5);
+  //
+  // CRYPTO-SPECIFIC: the decision tree is a hand-coded library of equity
+  // mean-reversion rules (e.g. "RSI > 78 + extended BB → STRONG_SELL").
+  // Those rules fire BACKWARDS on momentum-native crypto assets — BTC
+  // being "overbought by equity standards" usually means continuation, not
+  // reversion. The 20-sim 180d baseline produced log-loss 2.28 (vs random
+  // 0.693) precisely because the tree was making high-confidence WRONG
+  // calls into the composite. Zero the tree weight for crypto; crypto-
+  // specific rules can be layered back in Phase 3c+ with learned rather
+  // than hand-coded thresholds.
+  const treeWeight = isCrypto ? 0 : (0.20 + 0.20 * (tree.strength ?? 0.5));
   const nnWeight   = nnReady  ? Math.min(0.30, nnInfo.trainedOn  / 150) : 0;
   const gbmWeight  = gbmReady ? Math.min(0.45, gbmInfo.trainedOn / 100) : 0;
-  const lrWeight   = 0.40;
+  // Bump LR weight in crypto to 0.60 (from 0.40) to fill the capacity
+  // freed by zeroing the tree. LR with neutral crypto priors (zeros) now
+  // acts as the primary linear signal carrier until GBM/NN are trained.
+  const lrWeight   = isCrypto ? 0.60 : 0.40;
   const totalRaw   = lrWeight + treeWeight + nnWeight + gbmWeight;
 
   const lrW   = lrWeight   / totalRaw;
@@ -445,7 +458,10 @@ export function scoreSetup(q, context = {}) {
   const treeDir = treeScore > 0.5 ? 1 : -1;
   const nnDir   = nnReady  ? (nnProb  > 0.5 ? 1 : -1) : null;
   const gbmDir  = gbmReady ? (gbmProb > 0.5 ? 1 : -1) : null;
-  const dirs = [lrDir, treeDir];
+  // Exclude the tree from agreement counting in crypto mode for the same
+  // reason we zeroed its weight — its directional call is equity-pattern
+  // driven and would pollute the "consensus" metric with backwards signal.
+  const dirs = isCrypto ? [lrDir] : [lrDir, treeDir];
   if (nnReady)  dirs.push(nnDir);
   if (gbmReady) dirs.push(gbmDir);
   let agreeCount = 0, agreeTotal = 0;
