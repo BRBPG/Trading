@@ -428,11 +428,30 @@ export function scoreSetup(q, context = {}) {
 
   const direction = compositeProb > 0.58 ? "BULLISH" : compositeProb < 0.42 ? "BEARISH" : "NEUTRAL";
 
-  // Risk levels from ATR
-  const stopLong  = price > 0 && atr > 0 ? (price - 1.5 * atr).toFixed(2) : null;
-  const stopShort = price > 0 && atr > 0 ? (price + 1.5 * atr).toFixed(2) : null;
-  const tgt3Long  = price > 0 && atr > 0 ? (price + 4.5 * atr).toFixed(2) : null;
-  const tgt3Short = price > 0 && atr > 0 ? (price - 4.5 * atr).toFixed(2) : null;
+  // ── Risk levels from ATR ──────────────────────────────────────────────
+  // TWO sets of levels, because the feature-computing bar frequency
+  // (5-min intraday) gives an ATR that is only appropriate for intraday
+  // (~1-3 hour) trades. For swing trades (~1-5 days) we need a daily-scale
+  // ATR. We don't have daily bars in the live path, so we approximate:
+  //
+  //   daily_ATR ≈ 5-min_ATR × √(bars_per_day) = ATR × √78 ≈ 8.83
+  //
+  // This is the random-walk volatility-scaling approximation. In practice
+  // the ratio is 5-12× depending on intraday autocorrelation, but √78 is
+  // a reasonable central estimate. Conservative vs sqrt(252) which would
+  // over-widen.
+  //
+  // Intraday (tight, scalp horizon):  1.5 ATR stop, 4.5 ATR target (3:1 R/R)
+  // Swing    (wider, 1-5d horizon):   2 daily_ATR stop, 6 daily_ATR target
+  const dailyAtrEst = atr > 0 ? atr * Math.sqrt(78) : 0;
+  const stopLong     = price > 0 && atr > 0 ? (price - 1.5 * atr).toFixed(2) : null;
+  const stopShort    = price > 0 && atr > 0 ? (price + 1.5 * atr).toFixed(2) : null;
+  const tgt3Long     = price > 0 && atr > 0 ? (price + 4.5 * atr).toFixed(2) : null;
+  const tgt3Short    = price > 0 && atr > 0 ? (price - 4.5 * atr).toFixed(2) : null;
+  const swingStopLong    = price > 0 && dailyAtrEst > 0 ? (price - 2 * dailyAtrEst).toFixed(2) : null;
+  const swingStopShort   = price > 0 && dailyAtrEst > 0 ? (price + 2 * dailyAtrEst).toFixed(2) : null;
+  const swingTargetLong  = price > 0 && dailyAtrEst > 0 ? (price + 6 * dailyAtrEst).toFixed(2) : null;
+  const swingTargetShort = price > 0 && dailyAtrEst > 0 ? (price - 6 * dailyAtrEst).toFixed(2) : null;
 
   return {
     features,
@@ -453,6 +472,8 @@ export function scoreSetup(q, context = {}) {
     gbmSource,                  // "high_vol" | "low_vol" | "universal" | null
     regimeInfo,                 // { highTrained, lowTrained, ... } or null
     stopLong, stopShort, tgt3Long, tgt3Short,
+    swingStopLong, swingStopShort, swingTargetLong, swingTargetShort,
+    dailyAtrEst,
   };
 }
 

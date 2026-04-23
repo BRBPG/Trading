@@ -1955,18 +1955,51 @@ export default function App() {
                       })()}
                     </div>
 
+                    {/* ═══ SUGGESTED LEVELS — two horizons side by side ═══ */}
+                    {/* Intraday levels: 1.5× 5-min ATR stop, 4.5× target. For 1-3 HOUR holds.
+                        At swing timeframes these are laughably tight — stop gets hit in
+                        5 minutes of normal market noise. DO NOT use for 1-3 day trades.
+                        Swing levels: 2× daily-equivalent ATR (√78 × 5-min ATR), 6× target.
+                        For 1-5 DAY holds. Wider to respect daily noise envelope. */}
                     <div style={{background:"#111",border:"1px solid #1E1E1E",padding:12}}>
-                      <div style={{fontSize:9,color:"#555",letterSpacing:2,marginBottom:8}}>SUGGESTED LEVELS (1.5 ATR stop, 3:1 R/R)</div>
-                      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
-                        {[["LONG entry",`$${q.price?.toFixed(2)}`],["LONG stop",`$${m.stopLong||"?"}`],
-                          ["LONG target",`$${m.tgt3Long||"?"}`],["SHORT entry",`$${q.price?.toFixed(2)}`],
-                          ["SHORT stop",`$${m.stopShort||"?"}`],["SHORT target",`$${m.tgt3Short||"?"}`]
-                        ].map(([l,v])=>(
-                          <div key={l}>
-                            <div style={{fontSize:8,color:"#444",letterSpacing:1}}>{l}</div>
-                            <div style={{fontSize:12,color:"#C9A84C",fontWeight:700}}>{v}</div>
-                          </div>
-                        ))}
+                      <div style={{fontSize:9,color:"#C9A84C",letterSpacing:2,marginBottom:10}}>SUGGESTED LEVELS — PICK THE ROW THAT MATCHES YOUR INTENDED HOLD</div>
+
+                      {/* Intraday row */}
+                      <div style={{padding:"8px 10px",background:"#0A0A0A",border:"1px solid #1E1E1E",borderLeft:"3px solid #5AACDF",marginBottom:8}}>
+                        <div style={{fontSize:9,color:"#5AACDF",letterSpacing:2,marginBottom:6}}>INTRADAY (1-3h hold) — 1.5×ATR stop, 4.5×ATR target — 3:1 R/R</div>
+                        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6,fontSize:10}}>
+                          {[["LONG entry",`$${q.price?.toFixed(2)}`],["stop",`$${m.stopLong||"?"}`],["target",`$${m.tgt3Long||"?"}`],
+                            ["SHORT entry",`$${q.price?.toFixed(2)}`],["stop",`$${m.stopShort||"?"}`],["target",`$${m.tgt3Short||"?"}`],
+                          ].map(([l,v],i)=>(
+                            <div key={i}>
+                              <div style={{fontSize:8,color:"#444",letterSpacing:1,textTransform:"uppercase"}}>{l}</div>
+                              <div style={{fontSize:11,color:"#C9A84C",fontWeight:700}}>{v}</div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+
+                      {/* Swing row — wider, for 1-5d holds */}
+                      <div style={{padding:"8px 10px",background:"#0A0A0A",border:"1px solid #1E1E1E",borderLeft:"3px solid #7FD8A6"}}>
+                        <div style={{fontSize:9,color:"#7FD8A6",letterSpacing:2,marginBottom:6}}>SWING (1-5d hold) — 2×daily-ATR stop, 6×daily-ATR target — 3:1 R/R
+                          {m.dailyAtrEst > 0 && <span style={{color:"#666"}}> · daily-ATR est ${m.dailyAtrEst.toFixed(2)}</span>}
+                        </div>
+                        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6,fontSize:10}}>
+                          {[["LONG entry",`$${q.price?.toFixed(2)}`],["stop",`$${m.swingStopLong||"?"}`],["target",`$${m.swingTargetLong||"?"}`],
+                            ["SHORT entry",`$${q.price?.toFixed(2)}`],["stop",`$${m.swingStopShort||"?"}`],["target",`$${m.swingTargetShort||"?"}`],
+                          ].map(([l,v],i)=>(
+                            <div key={i}>
+                              <div style={{fontSize:8,color:"#444",letterSpacing:1,textTransform:"uppercase"}}>{l}</div>
+                              <div style={{fontSize:11,color:"#7FD8A6",fontWeight:700}}>{v}</div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                      <div style={{fontSize:9,color:"#555",marginTop:8,lineHeight:1.5}}>
+                        Intraday stop uses 5-min ATR (tight — within normal daily noise).
+                        Swing stop uses √78 × 5-min ATR (daily-equivalent, respects daily range).
+                        Using the wrong set for your hold period is the most common source of
+                        premature stop-outs on swing trades.
                       </div>
                     </div>
 

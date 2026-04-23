@@ -84,7 +84,13 @@ export function recommendSize(q, model, opts = {}) {
 
   if (!q || !q.price || !q.atr) return { sizePct: 0, stopPct: 0, explanation: null };
 
-  const stopDist = 1.5 * q.atr;
+  // Pick stop distance matching the intended horizon. Default "swing" since
+  // that's the primary horizon per the current project direction; callers
+  // can pass horizon: "intraday" to use the tighter 1.5× intraday ATR.
+  const { horizon = "swing" } = opts;
+  const stopDist = horizon === "intraday"
+    ? 1.5 * q.atr
+    : 2 * q.atr * Math.sqrt(78);           // daily-equivalent, matches SWING SUGGESTED LEVELS
   const stopPct = (stopDist / q.price) * 100;
 
   // Confidence direction — vol-targeting applies to the *magnitude* of
