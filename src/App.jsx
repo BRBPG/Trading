@@ -1342,7 +1342,15 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
       }
 
       if (aucs.length < 3) {
-        setMultiSimResult({ error: `Only ${aucs.length}/${N_RUNS} runs produced valid OOS results. Try a longer DAYS AGO or different settings.` });
+        // Include fetchLog in error payload so the diagnostics panel
+        // renders even when no valid OOS predictions were produced —
+        // often the failure reason IS "all trades skipped as neutral"
+        // and the user needs to see that per-symbol table to diagnose.
+        const totalSimTrades = tradeCounts.reduce((a, b) => a + b, 0);
+        const reason = totalSimTrades === 0
+          ? `All 20 runs produced 0 labelled trades — the model is neutral (|prob - 0.5| < 0.02) on every entry. This is EXPECTED for an untrained model: there's no conviction to label on. TRAIN models first (RUN SIMULATION once → TRAIN NN ON SIM), then re-run this diagnostic. See the fetch panel below for per-symbol source status.`
+          : `Only ${aucs.length}/${N_RUNS} runs produced valid OOS results (total sim trades: ${totalSimTrades}). Try a longer DAYS AGO or different settings.`;
+        setMultiSimResult({ error: reason, fetchLog: firstRunFetchLog });
         setMultiSimRunning(false);
         return;
       }
@@ -2264,7 +2272,46 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                           : `▶ RUN ${multiSimNRuns}-SIM AVERAGE`}
                       </button>
                       {multiSimResult?.error && (
-                        <div style={{marginTop:10,fontSize:10,color:"#E74C3C"}}>⚠ {multiSimResult.error}</div>
+                        <>
+                          <div style={{marginTop:10,fontSize:10,color:"#E74C3C",lineHeight:1.6}}>⚠ {multiSimResult.error}</div>
+                          {/* Render fetch diagnostics even in the error case —
+                              often the failure reason is data-related (symbol
+                              dropped silently) or skip-neutral, and the panel
+                              tells the user exactly what happened per-symbol. */}
+                          {multiSimResult.fetchLog?.length > 0 && (() => {
+                            const okCount = multiSimResult.fetchLog.filter(f => f.source).length;
+                            const failCount = multiSimResult.fetchLog.filter(f => !f.source).length;
+                            return (
+                              <div style={{padding:"6px 10px",background:"#080808",border:"1px solid #1A1A1A",marginTop:10}}>
+                                <div style={{fontSize:8,color:"#555",letterSpacing:2,marginBottom:6}}>
+                                  🔍 FETCH DIAGNOSTICS — {okCount} fetched / {failCount} failed ({multiSimResult.fetchLog.length} attempted)
+                                </div>
+                                <div style={{display:"grid",gridTemplateColumns:"1.2fr 0.8fr 0.8fr 0.8fr 1.4fr",gap:4,fontSize:9}}>
+                                  <div style={{color:"#555"}}>SYMBOL</div>
+                                  <div style={{color:"#555"}}>SOURCE</div>
+                                  <div style={{color:"#555"}}>BARS</div>
+                                  <div style={{color:"#555"}}>TRADES</div>
+                                  <div style={{color:"#555"}}>STATUS</div>
+                                  {multiSimResult.fetchLog.map(f => (
+                                    <React.Fragment key={f.symbol}>
+                                      <div style={{color:"#CCC",letterSpacing:1}}>{f.symbol}</div>
+                                      <div style={{color:f.source === "polygon" ? "#7FD8A6" : f.source === "yahoo" ? "#5AACDF" : "#E74C3C"}}>
+                                        {f.source || "—"}
+                                      </div>
+                                      <div style={{color:"#888"}}>{f.bars || 0}</div>
+                                      <div style={{color:f.trades > 0 ? "#888" : "#C9A84C"}}>{f.trades || 0}</div>
+                                      <div style={{color:f.reason === "fetch_failed" ? "#E74C3C" : f.trades === 0 ? "#C9A84C" : "#2ECC71",fontSize:8}}>
+                                        {f.reason === "fetch_failed" ? "FETCH FAILED"
+                                          : f.trades === 0 ? "0 trades (neutral skip)"
+                                          : "OK"}
+                                      </div>
+                                    </React.Fragment>
+                                  ))}
+                                </div>
+                              </div>
+                            );
+                          })()}
+                        </>
                       )}
                       {multiSimResult && !multiSimResult.error && (() => {
                         const r = multiSimResult;
