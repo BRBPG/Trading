@@ -129,9 +129,17 @@ export function generateMockQuote(symbol) {
 // Called when we have real price/prevClose from Finnhub
 export function generateLiveIndicators(symbol, realPrice, realPrevClose) {
   const { closes, highs, lows, volumes } = generateCandles(symbol, realPrice);
-  // Anchor the last candle to the real price and first to prevClose
+  // Anchor the last candle to the real current price. Do NOT also anchor
+  // closes[0] to realPrevClose — the random walker already starts somewhere
+  // close to realPrice and overriding closes[0] creates an artificial
+  // discontinuity vs closes[1] that the winsoriser flags as an outlier on
+  // every refresh. This was particularly visible on low-vol assets like GLD
+  // and XAUUSD (vol=0.009) where the anchor jump dwarfs the natural ~0.13%
+  // bar moves. realPrevClose is still used for the displayed change/changePct
+  // (computed from quote.pc, not from closes[0]).
   closes[closes.length-1] = realPrice;
-  closes[0] = realPrevClose;
+  // realPrevClose is intentionally not used to mutate closes[0]
+  void realPrevClose;
   const indicators = computeIndicators(closes, highs, lows, volumes);
   return { closes, highs, lows, volumes, ...indicators,
     sparkline: closes.slice(-30),

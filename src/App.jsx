@@ -7,6 +7,7 @@ import { calcADX, calcWilliamsR, calcStochastic, calcROC, calcZScore,
          fetchAllNews } from "./quant";
 import { BUFFETT_SYSTEM_PROMPT, buildBuffettContext } from "./buffett";
 import { cleanBars, assessQuality, cleaningSummary } from "./cleaning";
+import { downloadExport, importState } from "./persistence";
 
 const FH_QUOTE  = (sym, key) => `https://finnhub.io/api/v1/quote?symbol=${sym}&token=${key}`;
 const FH_METRIC = (sym, key) => `https://finnhub.io/api/v1/stock/metric?symbol=${sym}&metric=all&token=${key}`;
@@ -247,7 +248,7 @@ async function fetchQuote(symbol, finnhubKey) {
     const rawLive = y.bars
       ? { closes: y.bars.closes, highs: y.bars.highs, lows: y.bars.lows, volumes: y.bars.volumes }
       : generateLiveIndicators(symbol, y.price, y.prevClose);
-    const live = cleanAndRecompute(rawLive, session, { first: y.prevClose, last: y.price });
+    const live = cleanAndRecompute(rawLive, session, { last: y.price });
     const { closes, highs, lows, volumes, cleaning } = live;
 
     const quant = {
@@ -286,7 +287,7 @@ async function fetchQuote(symbol, finnhubKey) {
 
   if (!finnhubKey) {
     const m = generateMockQuote(symbol);
-    const cleaned = cleanAndRecompute(m, session, { first: m.prevClose, last: m.price });
+    const cleaned = cleanAndRecompute(m, session, { last: m.price });
     const quality = assessQuality({
       flagged: cleaned.cleaning.hampelFlagged,
       capped: cleaned.cleaning.winsorised,
@@ -320,7 +321,7 @@ async function fetchQuote(symbol, finnhubKey) {
     const low52  = metric?.metric?.["52WeekLow"]  ?? quote.l;
 
     const rawLive = generateLiveIndicators(symbol, price, prevClose);
-    const live = cleanAndRecompute(rawLive, session, { first: prevClose, last: price });
+    const live = cleanAndRecompute(rawLive, session, { last: price });
     const { closes, highs, lows, volumes, cleaning } = live;
 
     const quant = {
@@ -591,6 +592,32 @@ export default function App() {
   const [simState, setSimState] = useState({ running: false, phase: null, symbol: null, done: 0, total: 0 });
   const [simResult, setSimResult] = useState(null);
   const chatRef = useRef(null);
+  const importInputRef = useRef(null);
+
+  // Cross-device sync: trigger the hidden file picker, parse the dropped JSON,
+  // restore log + LR + NN weights, then refresh React state from localStorage
+  // so the UI immediately reflects the imported state.
+  function handleImportFile(file, mode = "merge") {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const payload = JSON.parse(reader.result);
+        const restored = importState(payload, { mode });
+        setDecisionLog(getLog());
+        setLoggedMsgIds(new Set());
+        alert(
+          `Import OK.\n` +
+          `Decision log: ${mode === "merge" ? `+${restored.log} new entries` : `${restored.log} entries restored`}\n` +
+          `LR weights: ${restored.lrWeights ? "restored" : "not present in file"}\n` +
+          `NN weights: ${restored.nnWeights ? "restored" : "not present in file"}`
+        );
+      } catch (err) {
+        alert(`Import failed: ${err.message}`);
+      }
+    };
+    reader.readAsText(file);
+  }
 
   // refreshAll MUST depend on finnhubKey — otherwise the closure captures the
   // initial (possibly empty) key and quotes stay SIMULATED forever even after
@@ -1190,6 +1217,41 @@ export default function App() {
                         fontSize:9,padding:"4px 8px",cursor:"pointer",fontFamily:"inherit",letterSpacing:1}}>
                       RESET MODEL
                     </button>
+                    <span style={{width:1,height:14,background:"#222",margin:"0 2px"}}/>
+                    <button
+                      onClick={()=>{
+                        const p = downloadExport();
+                        const lr = p.lrWeights ? "LR✓" : "LR—";
+                        const nn = p.nnWeights ? `NN✓ (${p.nnWeights.trainedOn||0} trades, ${p.nnWeights.epochs||0} epochs)` : "NN—";
+                        // No alert needed; the browser triggers the download. Keep it quiet.
+                        void lr; void nn;
+                      }}
+                      title="Download log + LR + NN weights as a JSON file. Move to another machine and IMPORT to sync."
+                      style={{background:"#0A1A0A",border:"1px solid #2A6A2A",color:"#7FD8A6",
+                        fontSize:9,padding:"4px 10px",cursor:"pointer",fontFamily:"inherit",letterSpacing:1}}>
+                      ⬇ EXPORT
+                    </button>
+                    <button
+                      onClick={()=>importInputRef.current?.click()}
+                      title="Restore log + weights from a previously-exported JSON file. By default, NEW log entries are merged in (existing entries kept)."
+                      style={{background:"#1A1500",border:"1px solid #C9A84C",color:"#C9A84C",
+                        fontSize:9,padding:"4px 10px",cursor:"pointer",fontFamily:"inherit",letterSpacing:1}}>
+                      ⬆ IMPORT
+                    </button>
+                    <input
+                      ref={importInputRef}
+                      type="file"
+                      accept="application/json,.json"
+                      style={{display:"none"}}
+                      onChange={e=>{
+                        const f = e.target.files?.[0];
+                        const mode = window.confirm(
+                          "Merge with existing decision log? (OK = merge, Cancel = replace)"
+                        ) ? "merge" : "replace";
+                        handleImportFile(f, mode);
+                        e.target.value = ""; // allow re-importing the same file
+                      }}
+                    />
                   </div>
                 </div>
 
