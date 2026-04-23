@@ -1295,6 +1295,8 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
     // Track per-symbol aggregated stats across all runs to find which
     // names are carrying vs dragging the multi-sim AUC.
     const perSymbolStats = {};  // symbol → { total: n, wins: n, pnl: sum }
+    let firstRunFetchLog = null;  // captured from run #1 — bars are cached
+                                  // after that, so run #1 shows real fetch sources
     try {
       for (let i = 0; i < N_RUNS; i++) {
         setMultiSimState({ phase: "sim", run: i + 1, total: N_RUNS });
@@ -1315,6 +1317,10 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
           universe,
           onProgress: () => {},
         });
+        // Capture the fetchLog from the FIRST run — that's where real
+        // fetch attempts happen. Later runs hit the bars cache so their
+        // fetchLog is less informative about data-source issues.
+        if (i === 0 && res.fetchLog) firstRunFetchLog = res.fetchLog;
         if (!res.trades.length) continue;
         tradeCounts.push(res.trades.length);
         setMultiSimState({ phase: "wf", run: i + 1, total: N_RUNS });
@@ -1401,6 +1407,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         meanAccuracy: mean(accs),
         meanLogLoss: mean(losses),
         symbolBreakdown,
+        fetchLog: firstRunFetchLog,
       });
     } catch (err) {
       setMultiSimResult({ error: err.message || String(err) });
@@ -2015,6 +2022,39 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                                 ⚠ {simResult.errors.length} symbol(s) failed to fetch: {simResult.errors.map(e=>e.symbol).join(", ")}
                               </div>
                             )}
+
+                            {/* Per-symbol fetch diagnostics — same as multi-sim
+                                panel. Shows source + trade count in-UI so iPad
+                                users don't need devtools to see silent drops. */}
+                            {simResult.fetchLog?.length > 0 && (
+                              <div style={{padding:"6px 10px",background:"#080808",border:"1px solid #1A1A1A",marginTop:10}}>
+                                <div style={{fontSize:8,color:"#555",letterSpacing:2,marginBottom:6}}>
+                                  🔍 FETCH DIAGNOSTICS
+                                </div>
+                                <div style={{display:"grid",gridTemplateColumns:"1.2fr 0.8fr 0.8fr 0.8fr 1.4fr",gap:4,fontSize:9}}>
+                                  <div style={{color:"#555"}}>SYMBOL</div>
+                                  <div style={{color:"#555"}}>SOURCE</div>
+                                  <div style={{color:"#555"}}>BARS</div>
+                                  <div style={{color:"#555"}}>TRADES</div>
+                                  <div style={{color:"#555"}}>STATUS</div>
+                                  {simResult.fetchLog.map(f => (
+                                    <React.Fragment key={f.symbol}>
+                                      <div style={{color:"#CCC",letterSpacing:1}}>{f.symbol}</div>
+                                      <div style={{color:f.source === "polygon" ? "#7FD8A6" : f.source === "yahoo" ? "#5AACDF" : "#E74C3C"}}>
+                                        {f.source || "—"}
+                                      </div>
+                                      <div style={{color:"#888"}}>{f.bars || 0}</div>
+                                      <div style={{color:f.trades > 0 ? "#888" : "#C9A84C"}}>{f.trades || 0}</div>
+                                      <div style={{color:f.reason === "fetch_failed" ? "#E74C3C" : f.trades === 0 ? "#C9A84C" : "#2ECC71"}}>
+                                        {f.reason === "fetch_failed" ? "FETCH FAILED"
+                                          : f.trades === 0 ? "0 trades — all skipped as neutral (train models)"
+                                          : "OK"}
+                                      </div>
+                                    </React.Fragment>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
                           </div>
                         );
                       })()}
@@ -2329,6 +2369,51 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                                 })}
                               </div>
                             </div>
+
+                            {/* FETCH DIAGNOSTICS — which data source served
+                                each symbol on the first run. Essential on
+                                iPad where devtools console isn't accessible.
+                                Shows silent drops (BNB etc) in-UI. */}
+                            {r.fetchLog?.length > 0 && (() => {
+                              const okCount = r.fetchLog.filter(f => f.source).length;
+                              const failCount = r.fetchLog.filter(f => !f.source).length;
+                              return (
+                                <div style={{padding:"6px 10px",background:"#080808",border:"1px solid #1A1A1A",marginBottom:10}}>
+                                  <div style={{fontSize:8,color:"#555",letterSpacing:2,marginBottom:6}}>
+                                    🔍 FETCH DIAGNOSTICS — {okCount} OK / {failCount} failed ({r.fetchLog.length} attempted)
+                                  </div>
+                                  <div style={{display:"grid",gridTemplateColumns:"1.2fr 0.8fr 0.8fr 0.8fr 1.4fr",gap:4,fontSize:9}}>
+                                    <div style={{color:"#555"}}>SYMBOL</div>
+                                    <div style={{color:"#555"}}>SOURCE</div>
+                                    <div style={{color:"#555"}}>BARS</div>
+                                    <div style={{color:"#555"}}>TRADES</div>
+                                    <div style={{color:"#555"}}>STATUS</div>
+                                    {r.fetchLog.map(f => (
+                                      <React.Fragment key={f.symbol}>
+                                        <div style={{color:"#CCC",letterSpacing:1}}>{f.symbol}</div>
+                                        <div style={{color:f.source === "polygon" ? "#7FD8A6" : f.source === "yahoo" ? "#5AACDF" : "#E74C3C"}}>
+                                          {f.source || "—"}
+                                        </div>
+                                        <div style={{color:"#888"}}>{f.bars || 0}</div>
+                                        <div style={{color:f.trades > 0 ? "#888" : "#C9A84C"}}>{f.trades || 0}</div>
+                                        <div style={{color:f.reason === "fetch_failed" ? "#E74C3C" : f.trades === 0 ? "#C9A84C" : "#2ECC71"}}>
+                                          {f.reason === "fetch_failed" ? "FETCH FAILED"
+                                            : f.trades === 0 ? "0 trades (all skipped as neutral)"
+                                            : "OK"}
+                                        </div>
+                                      </React.Fragment>
+                                    ))}
+                                  </div>
+                                  <div style={{fontSize:8,color:"#555",marginTop:6,lineHeight:1.5}}>
+                                    Source: <span style={{color:"#7FD8A6"}}>polygon</span> = paid tier served it ·
+                                    <span style={{color:"#5AACDF"}}> yahoo</span> = fallback ·
+                                    <span style={{color:"#E74C3C"}}> —</span> = both sources failed.
+                                    0 trades with a valid source means all entries hit the neutral-trade skip
+                                    (untrained model → no conviction → no labelled trades). Train models first.
+                                  </div>
+                                </div>
+                              );
+                            })()}
 
                             {/* Per-symbol aggregated breakdown — which names
                                 are driving the result. Useful for deciding

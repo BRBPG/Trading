@@ -273,6 +273,10 @@ export async function runBacktest(symbols, opts = {}) {
   const trades = [];
   const errors = [];
   let barsSource = null;  // "polygon" | "yahoo" | mixed — reported back to UI
+  // Per-symbol fetch outcome log — surfaced in the UI so the user can see
+  // which symbols dropped and why without needing devtools (iPad etc.).
+  // Entries: { symbol, source: "polygon"|"yahoo"|null, cached, bars, skipped }
+  const fetchLog = [];
 
   for (let s = 0; s < symbols.length; s++) {
     const symbol = symbols[s];
@@ -280,14 +284,15 @@ export async function runBacktest(symbols, opts = {}) {
 
     const fetched = await fetchHistoricalBars(symbol, daysAgo + 1, polygonKey, interval);
     if (!fetched) {
-      // Diagnostic: log to console so the user can see in devtools which
-      // symbol + source combo is failing. Previously symbols would silently
-      // drop (BNB-USD was missing from crypto multi-sim output entirely).
-      console.warn(`[backtest] fetch_failed for ${symbol} — both Polygon and Yahoo returned null. Symbol may not be covered at the current ${interval}/${daysAgo}d combination.`);
+      // Silent drops are the worst failure mode — record both in the
+      // errors array (for legacy callers) and the fetchLog (for UI).
+      console.warn(`[backtest] fetch_failed for ${symbol} — both Polygon and Yahoo returned null.`);
       errors.push({ symbol, reason: "fetch_failed", polygonKeyPresent: !!polygonKey });
+      fetchLog.push({ symbol, source: null, bars: 0, trades: 0, reason: "fetch_failed" });
       continue;
     }
     const bars = fetched.bars;
+    fetchLog.push({ symbol, source: fetched.source, bars: bars.closes.length, cached: !!fetched.cached, trades: 0 });
     // Diagnostic: log which source served each symbol on its FIRST fetch
     // (i.e. not a cache hit), so we can spot unexpected fallbacks (e.g.
     // Polygon failing silently for BNB and Yahoo picking up the slack).
@@ -317,7 +322,24 @@ export async function runBacktest(symbols, opts = {}) {
         pead,
       };
       const model = scoreSetup(q, modelCtx);
-      const verdict = parseFloat(model.compositeProb) > 50 ? "BUY" : "SELL";
+      const prob = parseFloat(model.compositeProb) / 100;
+      // SKIP NEUTRAL TRADES. When all ensemble components are untrained
+      // (typical on crypto first-run — NN/GBM untrained, tree muted, LR
+      // neutral), compositeProb resolves to exactly 0.50. The old code
+      // then did `> 50 ? BUY : SELL` which tie-broke to SELL on every
+      // single trade. In a bull crypto window that produced "SELL loses
+      // 69% of the time" per-symbol numbers (BTC 31% win-rate) that
+      // looked like a broken model but was really an artifact of forcing
+      // a one-sided verdict from no-conviction.
+      //
+      // Skip any trade where the model is within ±0.02 of neutral — no
+      // label recorded, not included in walk-forward. An untrained model
+      // contributes zero trades (which is the honest answer: it can't be
+      // measured without conviction). A trained model with real signal
+      // will produce plenty of >0.52 and <0.48 trades to populate the
+      // sim honestly.
+      if (Math.abs(prob - 0.5) < 0.02) continue;
+      const verdict = prob > 0.5 ? "BUY" : "SELL";
       const sim = simulateOutcome(bars, i, verdict, HOLD_BARS, q.atr, costBps);
       if (!sim || !sim.outcome) continue;
 
@@ -335,6 +357,9 @@ export async function runBacktest(symbols, opts = {}) {
         hitTarget: sim.hitTarget,
         ageDays,
       });
+      // Increment trade counter on the symbol's fetchLog entry.
+      const fl = fetchLog.find(f => f.symbol === symbol);
+      if (fl) fl.trades++;
     }
   }
 
@@ -343,5 +368,5 @@ export async function runBacktest(symbols, opts = {}) {
 
   onProgress({ phase: "done", trades: trades.length, wins, losses });
 
-  return { trades, wins, losses, errors, costBps, holdHours, daysAgo, barsSource, interval };
+  return { trades, wins, losses, errors, fetchLog, costBps, holdHours, daysAgo, barsSource, interval };
 }
