@@ -19,13 +19,19 @@
 import { trainNN as trainNNRaw, scoreWithWeights } from "./nn";
 
 // Convert sim trades to the {x, y, ageDays} shape expected by the NN.
-// Mirrors trainNNFromSim in model.js but does NOT touch persisted weights.
+// Mirrors trainNNFromSim in model.js — direction-based labels (labelBullish
+// with verdict/outcome fallback). Walk-forward MUST use the same labelling
+// the production trainers use, otherwise OOS metrics measure a different
+// target from what compositeProb represents.
 function toSamples(simTrades) {
   return simTrades
     .filter(d => d.outcome && d.features)
     .map(d => ({
       x: d.features,
-      y: d.outcome === "WIN" ? 1 : 0,
+      y: (d.labelBullish === 0 || d.labelBullish === 1)
+         ? d.labelBullish
+         : ((d.verdict === "BUY" && d.outcome === "WIN") ||
+            (d.verdict === "SELL" && d.outcome === "LOSS") ? 1 : 0),
       ageDays: d.ageDays || 0,
       timestamp: d.timestamp || 0,
     }));

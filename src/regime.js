@@ -61,12 +61,20 @@ export function trainRegimeModels(simTrades, universe = "equities") {
 
   const result = { high: null, low: null, counts: { high: high.length, low: low.length } };
 
+  // Direction-based label — matches what compositeProb predicts.
+  // See backtest.js labelBullish comment for why verdict/outcome alone
+  // would produce conflicting labels under random-direction bootstrap.
+  const yOf = t => (t.labelBullish === 0 || t.labelBullish === 1)
+    ? t.labelBullish
+    : ((t.verdict === "BUY" && t.outcome === "WIN") ||
+       (t.verdict === "SELL" && t.outcome === "LOSS") ? 1 : 0);
+
   if (high.length >= MIN_SAMPLES_PER_REGIME) {
-    const samples = high.map(t => ({ x: t.features, y: t.outcome === "WIN" ? 1 : 0 }));
+    const samples = high.map(t => ({ x: t.features, y: yOf(t) }));
     result.high = trainGBM(samples, { nRounds: 80, maxDepth: 4 });
   }
   if (low.length >= MIN_SAMPLES_PER_REGIME) {
-    const samples = low.map(t => ({ x: t.features, y: t.outcome === "WIN" ? 1 : 0 }));
+    const samples = low.map(t => ({ x: t.features, y: yOf(t) }));
     result.low = trainGBM(samples, { nRounds: 80, maxDepth: 4 });
   }
 

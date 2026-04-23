@@ -406,6 +406,27 @@ export async function runBacktest(symbols, opts = {}) {
       if (!sim || !sim.outcome) continue;
 
       const ageDays = (Date.now() - bars.timestamps[i] * 1000) / (24 * 3600 * 1000);
+      // DIRECTION-BASED LABEL — critical for training honesty.
+      //
+      // compositeProb represents P(bullish / price-goes-up). The training
+      // label must match that definition. The LEGACY path used
+      // y = outcome === "WIN" ? 1 : 0, which is verdict-conditional:
+      //   BUY  + WIN  → price up    → y=1 ✓ matches bullish
+      //   BUY  + LOSS → price down  → y=0 ✓ matches bullish
+      //   SELL + WIN  → price DOWN  → y=1 ✗ bullish was wrong, but y=1
+      //   SELL + LOSS → price UP    → y=0 ✗ bullish was right, but y=0
+      // With a bullish prior (equity default weights) ~70% of trades are
+      // BUY, so labels approximate direction and the NN learns something
+      // roughly right. With random-direction cold-start (crypto fresh)
+      // the SELL cases are 50% of samples and actively contradict the
+      // BUY labels, so the NN fits conflicting signals on identical
+      // feature vectors → confidently-wrong predictions → log-loss 2.7.
+      //
+      // labelBullish = "did the market go UP from entry to exit", which
+      // is exactly what compositeProb claims to predict. Trainers that
+      // see this field prefer it; older consumers fall back to outcome.
+      const labelBullish = (verdict === "BUY" && sim.outcome === "WIN") ||
+                           (verdict === "SELL" && sim.outcome === "LOSS") ? 1 : 0;
       trades.push({
         symbol,
         timestamp: bars.timestamps[i] * 1000,
@@ -415,6 +436,7 @@ export async function runBacktest(symbols, opts = {}) {
         exitPrice: sim.exitPrice,
         pnlPct: sim.pnlPct,
         outcome: sim.outcome,
+        labelBullish,
         hitStop: sim.hitStop,
         hitTarget: sim.hitTarget,
         ageDays,

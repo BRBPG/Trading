@@ -126,13 +126,17 @@ export function resetBag(universe = "equities") {
 }
 
 // Convenience for the UI — trains from sim trades with the same shape
-// trainNNFromSim expects ({ x, y, ageDays }).
+// trainNNFromSim expects ({ x, y, ageDays }). Labels via direction
+// (labelBullish) not verdict-outcome — see backtest.js for why.
 export function trainBagFromSim(simTrades, universe = "equities") {
   const samples = simTrades
     .filter(d => d.outcome && d.features)
     .map(d => ({
       x: d.features,
-      y: d.outcome === "WIN" ? 1 : 0,
+      y: (d.labelBullish === 0 || d.labelBullish === 1)
+         ? d.labelBullish
+         : ((d.verdict === "BUY" && d.outcome === "WIN") ||
+            (d.verdict === "SELL" && d.outcome === "LOSS") ? 1 : 0),
       weight: 1, // time-decay weighting could go here but keep simple for now
     }));
   if (samples.length < 10) return { error: `Need ≥10 samples, got ${samples.length}` };
