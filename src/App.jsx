@@ -111,35 +111,45 @@ You are given: live price data + a pre-trained model score (logistic regression 
 A) CONFIRM the model's call with your qualitative analysis
 B) OVERRIDE the model's call and explain exactly why (which trader's rule is being violated)
 
-YOUR OUTPUT FORMAT — follow this exactly, every time:
+The user's message will include a MODE directive and a strict OUTPUT FORMAT template. Follow it exactly. Do not add preamble. Do not add a closing paragraph. Produce the format and nothing else.
 
-📊 TAPE READING
-[2-3 sentences. What is the price action saying RIGHT NOW? Is the trend up or down? Is volume confirming? Be specific about levels. No vague language.]
-
-🤖 MODEL SIGNAL: [BUY/SELL] [confidence]% — [one line explanation]
-
-🧠 TRADER CONSENSUS
-LIVERMORE: [one specific opinion with reasoning]
-TUDOR JONES: [one specific opinion with reasoning — does price hold the 200MA?]
-DENNIS: [one specific opinion — is there a breakout? Where is the 2-ATR stop?]
-SIMONS: [one specific opinion — what do the stats say? Volume confirmation?]
-WILLIAMS: [one specific opinion — is the crowd wrong here?]
-
-⚡ FINAL VERDICT: BUY or SELL (pick one — no other options)
-Entry: $X.XX | Stop: $X.XX | Target: $X.XX | R/R: X:1
-Confidence: [HIGH/MEDIUM/LOW]
-
-⚠️ RISK: [One sentence. Position size (1-2% of account), max loss, acknowledge you can be wrong.]
-
-CRITICAL RULES — NON-NEGOTIABLE:
-- FINAL VERDICT must be BUY or SELL. No AVOID, no WAIT, no HOLD, no "no trade today." Pick a side.
-- The ONLY exception: genuine crisis conditions (ATR >4% of price AND momentum <-5% AND volume >3x). If those three are all true, you may output AVOID — otherwise BUY or SELL.
-- R/R floor: 2:1 minimum (lowered from the textbook 3:1 because active trading = more opportunities). If a 2:1 can't be constructed with the current ATR, use a 1.5 ATR stop and 3.5 ATR target.
-- When the setup is genuinely mixed, default to the direction the decision-tree model suggests, then justify it through the trader lens with the cleanest entry you can find.
-- If you say BUY or SELL, you MUST give specific dollar levels for entry, stop, and target. Entry should usually be the current price (market order) unless you want a specific limit level — say which.
-- If RSI is 40-60 and EMA is flat: do NOT say WAIT. Look at Williams %R, Stochastic, CMF, volume trend. One of them will tip the bias — use it.
+═══ INVARIANT RULES — NON-NEGOTIABLE ═══
+- FINAL verdict must be BUY or SELL. No AVOID, no WAIT, no HOLD, no "no trade today." Pick a side.
+- The ONLY exception: genuine crisis conditions (ATR >4% of price AND momentum <-5% AND volume >3x). Only then may you output AVOID.
+- R/R floor: 2:1 minimum. If a 2:1 can't be constructed with the current ATR, use a 1.5 ATR stop and 3.5 ATR target.
+- When the setup is genuinely mixed, default to the decision-tree model's direction, then justify it through the trader lens with the cleanest entry you can find.
+- Always give specific dollar levels for entry, stop and target. Entry should usually be the current price unless you want a specific limit level — say which.
+- If RSI is 40-60 and EMA is flat: do NOT say WAIT. Look at Williams %R, Stochastic, CMF, volume trend. One will tip the bias — use it.
 - Confidence calibration: HIGH = 3+ legends agree and model agrees. MEDIUM = 2 agree. LOW = mixed but you still pick a side.
 - When asked "best opportunity" across multiple stocks: rank them, pick ONE, commit to the trade.`;
+
+// ─── Output-format directives — injected into the user message per call ─────
+// Keeping these out of the system prompt so we can switch modes without
+// rebuilding the persona on every request.
+const QUICK_DIRECTIVE = `
+═══ MODE: QUICK — OUTPUT EXACTLY FOUR LINES, NOTHING ELSE ═══
+⚡ {SYMBOL} — {BUY|SELL} @ \${entry}
+SL \${stop} | TP \${target} | R/R {n}:1 | {HIGH|MED|LOW}
+🤖 Model: {BUY|SELL} {probability}%
+🧠 Consensus: {majority trader direction, one short phrase}
+
+No tape reading. No per-trader breakdown. No risk paragraph. No markdown. Four lines. End.`;
+
+const DEEP_DIRECTIVE = `
+═══ MODE: IN-DEPTH — STRUCTURED BUT COMPACT, EACH SECTION ONE LINE ═══
+📊 TAPE: {trend, volume, one key level — one line}
+🤖 MODEL: {BUY|SELL} {pct}% — {one line why}
+
+LIVERMORE: {one line}
+JONES: {one line — does price hold 200MA?}
+DENNIS: {one line — breakout? 2-ATR stop?}
+SIMONS: {one line — statistical divergence?}
+WILLIAMS: {one line — is the crowd wrong?}
+
+⚡ {BUY|SELL} @ \${entry} | SL \${stop} | TP \${target} | R/R {n}:1 | {HIGH|MED|LOW}
+⚠️ {one line — position size 1-2%, acknowledge downside}
+
+No prose padding. No "let me analyse..." preamble. No closing summary. ~10 lines total.`;
 
 
 // ─── Yahoo Finance fallback ─────────────────────────────────────────────────
@@ -463,7 +473,8 @@ The system has ranked ALL ${Object.keys(quotes).length} watchlist symbols by mod
 ${blocks}
 ${headlineBlurb}
 
-INSTRUCTION: Review all three candidates. Choose the ONE with the cleanest, highest-conviction setup right now. Use the full output format. FINAL VERDICT must be BUY or SELL with specific levels.`;
+INSTRUCTION: Review all three candidates. Choose the ONE with the cleanest, highest-conviction setup right now. State the chosen symbol on the first line as "PICK: {SYMBOL}". Then follow the IN-DEPTH format below.
+${DEEP_DIRECTIVE}`;
 }
 
 function buildContext(quotes, selected, news = []) {
@@ -534,6 +545,30 @@ ${news.length>0 ? news.slice(0,20).map(n=>`[${n.date.toLocaleDateString()}][${n.
 
 === WATCHLIST SNAPSHOT ===
 ${snapshot}`;
+}
+
+// ─── Verdict parser — tolerates both QUICK and IN-DEPTH output formats ─────
+// QUICK:  "⚡ NVDA — BUY @ $875.40"   "SL $853 | TP $942 | R/R 3:1 | HIGH"
+// DEEP:   "⚡ BUY @ $875.40 | SL $853 | TP $942 | R/R 3:1 | HIGH"
+function parseTradeData(reply, q, symbol) {
+  if (!q) return null;
+  const verdictMatch = reply.match(/[⚡]\s*(?:[A-Z.]{1,6}\s+[—–-]\s+)?(BUY|SELL|AVOID)\b/i)
+                    || reply.match(/FINAL VERDICT:\s*(BUY|SELL|AVOID)/i)
+                    || reply.match(/\b(BUY|SELL|AVOID)\b\s+@\s*\$/i);
+  if (!verdictMatch) return null;
+  const model = scoreSetup(q);
+  const stop   = parseFloat(reply.match(/(?:Stop|SL):\s*\$?([\d.]+)/i)?.[1]) || null;
+  const target = parseFloat(reply.match(/(?:Target|TP):\s*\$?([\d.]+)/i)?.[1]) || null;
+  const rr     = parseFloat(reply.match(/R\/R:?\s*([\d.]+)/i)?.[1]) || null;
+  const confidence = reply.match(/\b(HIGH|MEDIUM|MED|LOW)\b/i)?.[1]?.toUpperCase() || null;
+  return {
+    symbol, entryPrice: q.price,
+    verdict: verdictMatch[1].toUpperCase(),
+    stop, target, rr,
+    confidence: confidence === "MED" ? "MEDIUM" : confidence,
+    modelScore: { direction: model.direction, confidence: model.confidence, treeSignal: model.treeSignal },
+    features: model.features,
+  };
 }
 
 export default function App() {
@@ -618,10 +653,11 @@ export default function App() {
     if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight;
   }, [messages, thinking]);
 
-  async function sendToAI(userText) {
+  async function sendToAI(userText, mode = "deep") {
     setThinking(true);
     const context = buildContext(quotes, selected, news);
-    const fullContent = `${context}\n\nUSER: ${userText}`;
+    const directive = mode === "quick" ? QUICK_DIRECTIVE : DEEP_DIRECTIVE;
+    const fullContent = `${context}\n${directive}\n\nUSER: ${userText}`;
     const newHistory = [...chatHistory, { role:"user", content:fullContent }];
     setChatHistory(newHistory);
     setMessages(prev=>[...prev, { type:"user", text:userText }]);
@@ -636,7 +672,7 @@ export default function App() {
         },
         body: JSON.stringify({
           model: "claude-opus-4-5",
-          max_tokens: 4096,
+          max_tokens: mode === "quick" ? 400 : 1800,
           system: SYSTEM_PROMPT,
           messages: newHistory,
         }),
@@ -648,23 +684,8 @@ export default function App() {
       }
       const reply = data.content?.filter(b=>b.type==="text").map(b=>b.text).join("\n")||"No response.";
       setChatHistory(prev=>[...prev,{role:"assistant",content:reply}]);
-      // Parse any trade verdict from the reply and attach to message so user can manually log
       const q = quotes[selected];
-      const verdictMatch = reply.match(/FINAL VERDICT:\s*(BUY|SELL|AVOID)/i);
-      let tradeData = null;
-      if (q && verdictMatch) {
-        const model = scoreSetup(q);
-        tradeData = {
-          symbol: selected, entryPrice: q.price,
-          verdict:    verdictMatch[1].toUpperCase(),
-          stop:       parseFloat(reply.match(/Stop:\s*\$?([\d.]+)/i)?.[1]) || null,
-          target:     parseFloat(reply.match(/Target:\s*\$?([\d.]+)/i)?.[1]) || null,
-          rr:         parseFloat(reply.match(/R\/R:\s*([\d.]+)/i)?.[1]) || null,
-          confidence: reply.match(/Confidence:\s*(HIGH|MEDIUM|LOW)/i)?.[1] || null,
-          modelScore: { direction: model.direction, confidence: model.confidence, treeSignal: model.treeSignal },
-          features: model.features,
-        };
-      }
+      const tradeData = parseTradeData(reply, q, selected);
       const msgId = Date.now();
       setMessages(prev=>[...prev,{id: msgId, type:"bot", text:reply, tradeData}]);
     } catch(err) {
@@ -710,27 +731,15 @@ export default function App() {
       const reply = data.content?.filter(b=>b.type==="text").map(b=>b.text).join("\n")||"No response.";
       setChatHistory(prev=>[...prev,{role:"assistant",content:reply}]);
       setMessages(prev=>[...prev,{type:"bot",text:reply}]);
-      // Detect which symbol was picked and log it
-      const symMatch = reply.match(/(?:FINAL VERDICT.*?|picking|chosen?|trade on|go with)\s+([A-Z]{2,6})/i);
+      // Detect which symbol was picked (new "PICK: SYM" format, or fall back to
+      // matching any watchlist symbol appearing early in the reply)
+      const pickMatch = reply.match(/PICK:\s*([A-Z.]{2,6})/i);
+      const symMatch = pickMatch || reply.match(/(?:picking|chosen?|trade on|go with)\s+([A-Z.]{2,6})/i);
       const pickedSym = symMatch ? WATCHLIST.find(s => s === symMatch[1].toUpperCase()) : null;
       const logSym = pickedSym || selected;
       const q = quotes[logSym];
-      const verdictMatch = reply.match(/FINAL VERDICT:\s*(BUY|SELL|AVOID)/i);
-      let tradeData = null;
-      if (q && verdictMatch) {
-        const model = scoreSetup(q);
-        tradeData = {
-          symbol: logSym, entryPrice: q.price,
-          verdict:    verdictMatch[1].toUpperCase(),
-          stop:       parseFloat(reply.match(/Stop:\s*\$?([\d.]+)/i)?.[1]) || null,
-          target:     parseFloat(reply.match(/Target:\s*\$?([\d.]+)/i)?.[1]) || null,
-          rr:         parseFloat(reply.match(/R\/R:\s*([\d.]+)/i)?.[1]) || null,
-          confidence: reply.match(/Confidence:\s*(HIGH|MEDIUM|LOW)/i)?.[1] || null,
-          modelScore: { direction:model.direction, confidence:model.confidence, treeSignal:model.treeSignal },
-          features: model.features,
-        };
-        if (pickedSym) setSelected(pickedSym);
-      }
+      const tradeData = parseTradeData(reply, q, logSym);
+      if (tradeData && pickedSym) setSelected(pickedSym);
       const msgId = Date.now();
       setMessages(prev=>[...prev,{id: msgId, type:"bot", text:reply, tradeData}]);
     } catch(err) {
@@ -763,7 +772,7 @@ export default function App() {
         },
         body: JSON.stringify({
           model: "claude-opus-4-5",
-          max_tokens: 3000,
+          max_tokens: 500,
           system: BUFFETT_SYSTEM_PROMPT,
           // Intentionally NOT using chatHistory — Buffett runs in his own
           // conversation so his framework doesn't bleed into the trader chat.
@@ -910,20 +919,29 @@ export default function App() {
                   </div>
                 ))}
               </div>
-              <div style={{marginLeft:"auto",display:"flex",gap:8}}>
-                <button onClick={()=>{setTab("chat");sendToAI(`Give me your full trading assessment on ${selected} right now.`);}}
-                  disabled={thinking} style={{
+              <div style={{marginLeft:"auto",display:"flex",gap:6}}>
+                <button onClick={()=>{setTab("chat");sendToAI(`Quick call on ${selected}.`, "quick");}}
+                  disabled={thinking} title="4-line answer: price, verdict, stop/target, confidence"
+                  style={{
                     background:thinking?"#1A1A1A":"#C9A84C",color:thinking?"#444":"#000",
                     border:"none",fontFamily:"'Courier New',monospace",fontWeight:900,
-                    fontSize:11,letterSpacing:2,padding:"7px 14px",cursor:thinking?"not-allowed":"pointer"}}>
-                  ⚡ ANALYZE NOW
+                    fontSize:11,letterSpacing:2,padding:"7px 12px",cursor:thinking?"not-allowed":"pointer"}}>
+                  ⚡ QUICK
+                </button>
+                <button onClick={()=>{setTab("chat");sendToAI(`Full assessment on ${selected}.`, "deep");}}
+                  disabled={thinking} title="Compact structured analysis: tape, model, 5 traders, verdict"
+                  style={{
+                    background:thinking?"#1A1A1A":"#1A1500",color:thinking?"#444":"#C9A84C",
+                    border:"1px solid #C9A84C",fontFamily:"'Courier New',monospace",fontWeight:900,
+                    fontSize:11,letterSpacing:2,padding:"7px 12px",cursor:thinking?"not-allowed":"pointer"}}>
+                  📊 IN-DEPTH
                 </button>
                 <button onClick={()=>sendToBuffett("")} disabled={thinking} title="Warren Buffett's separate, long-horizon take — NOT part of the BUY/SELL verdict"
                   style={{
                     background:thinking?"#1A1A1A":"#0D2A1F",color:thinking?"#444":"#7FD8A6",
                     border:"1px solid #2A7A4F",fontFamily:"'Courier New',monospace",fontWeight:900,
-                    fontSize:11,letterSpacing:2,padding:"7px 14px",cursor:thinking?"not-allowed":"pointer"}}>
-                  🏛 BUFFETT TAKE
+                    fontSize:11,letterSpacing:2,padding:"7px 12px",cursor:thinking?"not-allowed":"pointer"}}>
+                  🏛 BUFFETT
                 </button>
               </div>
             </div>
@@ -1319,9 +1337,16 @@ export default function App() {
         @keyframes ticker{from{transform:translateX(0)}to{transform:translateX(-50%)}}
         @keyframes pulse{0%,100%{opacity:.4}50%{opacity:1}}
         @keyframes dots{0%,100%{opacity:.2;transform:scale(.8)}50%{opacity:1;transform:scale(1.2)}}
-        ::-webkit-scrollbar{width:3px;height:3px}
-        ::-webkit-scrollbar-track{background:#080808}
-        ::-webkit-scrollbar-thumb{background:#2A2A2A}
+
+        /* Visible, click-and-drag friendly scrollbar. Replaces the near-invisible
+           3px default. Firefox gets scrollbar-color; webkit browsers get the
+           explicit track/thumb rules below. */
+        * { scrollbar-width: auto; scrollbar-color: #4A4A4A #0F0F0F; }
+        ::-webkit-scrollbar { width: 12px; height: 12px; }
+        ::-webkit-scrollbar-track { background: #0F0F0F; border-left: 1px solid #1A1A1A; }
+        ::-webkit-scrollbar-thumb { background: #3A3A3A; border: 2px solid #0F0F0F; border-radius: 6px; }
+        ::-webkit-scrollbar-thumb:hover { background: #C9A84C; }
+        ::-webkit-scrollbar-corner { background: #0F0F0F; }
       `}</style>
     </div>
   );
