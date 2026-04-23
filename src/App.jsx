@@ -210,6 +210,55 @@ function shouldUseYahoo(symbol) {
   return /\.[A-Z]{1,3}$/.test(symbol.toUpperCase());
 }
 
+// ─── Real intraday bar cache for US tickers ────────────────────────────────
+// The indicator pipeline (RSI, MACD, EMA, BB, ATR, VWAP, ADX, Williams %R,
+// Stochastic, CMF, etc.) needs a bar SERIES, not just a last price. Finnhub's
+// free tier doesn't include the /stock/candle endpoint, so until this commit
+// the US path was falling back to a Math.random() walker — meaning every
+// "live" indicator was being computed on simulated bars. Fix: pull real
+// intraday bars from Yahoo (which has them free for US names too), cache
+// them for 3 minutes per symbol, and override the last close with Finnhub's
+// real-time price each refresh so the endpoint stays current.
+const barsCache = new Map();               // symbol → { bars, fetchedAt }
+const BARS_CACHE_MS = 3 * 60 * 1000;        // 3 minutes
+
+async function fetchIntradayBars(symbol) {
+  const now = Date.now();
+  const cached = barsCache.get(symbol);
+  if (cached && now - cached.fetchedAt < BARS_CACHE_MS) return cached.bars;
+
+  // 5-min bars over 1 day = ~78 bars; enough for all indicators
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=5m&range=1d`;
+  for (const proxy of YAHOO_PROXIES) {
+    try {
+      const res = await fetch(proxy(url), { signal: AbortSignal.timeout(8000) });
+      if (!res.ok) continue;
+      const data = await res.json();
+      const r = data?.chart?.result?.[0];
+      if (!r) continue;
+      const q = r.indicators?.quote?.[0] || {};
+      const closes = [], highs = [], lows = [], volumes = [];
+      const len = r.timestamp?.length || 0;
+      for (let i = 0; i < len; i++) {
+        // Skip nulls (halted minutes, pre-open, post-close gaps)
+        if (q.close?.[i] == null || q.high?.[i] == null || q.low?.[i] == null) continue;
+        closes.push(q.close[i]);
+        highs.push(q.high[i]);
+        lows.push(q.low[i]);
+        volumes.push(q.volume?.[i] ?? 0);
+      }
+      if (closes.length < 30) continue; // need enough for EMA50, RSI14, BB20
+
+      const bars = { closes, highs, lows, volumes };
+      barsCache.set(symbol, { bars, fetchedAt: now });
+      return bars;
+    } catch { /* try next proxy */ }
+  }
+  // If the fetch failed BUT we still have a cached copy (even if expired),
+  // return the stale copy — better than falling back to synthetic data.
+  return cached?.bars || null;
+}
+
 // Run the raw candle series through the cleaning pipeline, then recompute
 // indicators on the CLEANED bars so RSI/MACD/ATR/EMA reflect validated data.
 function cleanAndRecompute(live, session, anchors) {
@@ -321,7 +370,18 @@ async function fetchQuote(symbol, finnhubKey) {
     const high52 = metric?.metric?.["52WeekHigh"] ?? quote.h;
     const low52  = metric?.metric?.["52WeekLow"]  ?? quote.l;
 
-    const rawLive = generateLiveIndicators(symbol, price, prevClose);
+    // Fetch REAL intraday 5m bars from Yahoo (cached 3min per symbol). If that
+    // succeeds, indicators are computed on actual market bars. If it fails
+    // for any reason (CORS proxy down, rate-limited, etc.), fall back to the
+    // synthetic walker and mark the resulting quote quality as "suspect" so
+    // the user knows they're back on simulated bar data.
+    const realBars = await fetchIntradayBars(symbol);
+    const usedRealBars = realBars != null;
+    const rawLive = usedRealBars
+      ? realBars
+      : generateLiveIndicators(symbol, price, prevClose);
+    // Anchor last close to Finnhub's real-time price regardless of source —
+    // Yahoo's final 5m bar can lag by up to 60 seconds.
     const live = cleanAndRecompute(rawLive, session, { last: price });
     const { closes, highs, lows, volumes, cleaning } = live;
 
@@ -342,13 +402,17 @@ async function fetchQuote(symbol, finnhubKey) {
     // so we still have something meaningful when the bell isn't ringing.
     const extendedMove = session !== "OPEN" ? { price, changePct, change } : null;
 
-    const quality = assessQuality({
+    const baseQuality = assessQuality({
       flagged: cleaning.hampelFlagged,
       capped: cleaning.winsorised,
       zeroVolFilled: cleaning.zeroVolFilled,
       lastFetched: Date.now(),
       session,
     });
+    // Force "suspect" when we fell back to synthetic bars — the price is
+    // real but the indicators are computed on Math.random() bars, and the
+    // user deserves to see that flagged.
+    const quality = usedRealBars ? baseQuality : "suspect";
 
     return {
       symbol, price, change, changePct, prevClose,
@@ -359,6 +423,7 @@ async function fetchQuote(symbol, finnhubKey) {
       ...live, quant,
       session, extendedMove,
       quality, cleaning,
+      barsSource: usedRealBars ? "yahoo-5m" : "synthetic",
       marketState: "LIVE", lastFetched: Date.now(), isMock: false,
       source: "FINNHUB",
     };
@@ -596,6 +661,11 @@ export default function App() {
   // on the first bar that touches them — this only governs how long the trade
   // is held when NEITHER stop nor target has been hit.
   const [maxHoldHours, setMaxHoldHours] = useState(3);
+  // Round-trip transaction cost applied to every simulated trade's P&L.
+  // 15 bps = 0.15% round-trip — realistic for liquid US equities at a
+  // retail broker (0 commission + ~5 bps spread + ~10 bps slippage).
+  // Set to 0 for gross (pre-cost) backtest; raise for illiquid names.
+  const [costBps, setCostBps] = useState(15);
   const [trainResult, setTrainResult] = useState(null);
   const [training, setTraining] = useState(false);
   const chatRef = useRef(null);
@@ -845,10 +915,11 @@ export default function App() {
         daysAgo: 7,
         holdHours: maxHoldHours,    // max-hold = timeout; stop/target still exit early
         samplesPerSymbol: 10,
+        costBps,                    // round-trip costs baked in
         onProgress: (p) => setSimState(prev => ({ ...prev, ...p, running: true })),
       });
       const metrics = computeSimMetrics(res.trades);
-      setSimResult({ ...res, metrics, holdHours: maxHoldHours });
+      setSimResult({ ...res, metrics, holdHours: maxHoldHours, costBps });
     } catch (err) {
       setSimResult({ error: err.message || String(err) });
     }
@@ -977,6 +1048,17 @@ export default function App() {
                   const title = cleaningSummary(selQ.cleaning, qc);
                   return <span title={title} style={{fontSize:9,color:qColor,marginLeft:6,letterSpacing:1,
                     padding:"2px 6px",border:`1px solid ${qColor}44`,cursor:"help"}}>◆ {qc.toUpperCase()}</span>;
+                })()}
+                {(()=>{ const bs = selQ.barsSource;
+                  if (!bs) return null;
+                  const isReal = bs === "yahoo-5m" || bs === "yahoo-1m";
+                  const color = isReal ? "#7FD8A6" : "#E74C3C";
+                  const label = isReal ? "REAL BARS" : "SYNTHETIC BARS";
+                  const tip = isReal
+                    ? "Indicators computed on real 5-min bars from Yahoo (cached 3min, last close anchored to Finnhub real-time price)."
+                    : "Bar fetch failed — indicators are being computed on a random-walk synthetic series. Trade decisions on this symbol are NOT backed by real intraday history.";
+                  return <span title={tip} style={{fontSize:9,color,marginLeft:6,letterSpacing:1,
+                    padding:"2px 6px",border:`1px solid ${color}44`,cursor:"help"}}>◈ {label}</span>;
                 })()}
                 {selQ.extendedMove && (selQ.session==="PREMARKET"||selQ.session==="AFTERHOURS") && (
                   <span style={{fontSize:10,color:"#888",marginLeft:8,letterSpacing:1}}>
@@ -1130,16 +1212,30 @@ export default function App() {
                     <div style={{background:"#0A0F14",border:"1px solid #2A6A9A",padding:12}}>
                       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8,flexWrap:"wrap",gap:6}}>
                         <div style={{fontSize:9,color:"#5AACDF",letterSpacing:2}}>🎲 SIMULATE (real candles → labelled trades)</div>
-                        <div style={{display:"flex",alignItems:"center",gap:6}}>
-                          <span style={{fontSize:8,color:"#666",letterSpacing:1}}>MAX HOLD (timeout)</span>
-                          <select value={maxHoldHours} onChange={e=>setMaxHoldHours(Number(e.target.value))}
-                            disabled={simState.running}
-                            style={{background:"#080808",border:"1px solid #2A2A2A",color:"#5AACDF",fontFamily:"inherit",fontSize:9,padding:"2px 6px"}}>
-                            <option value={1}>1h</option>
-                            <option value={3}>3h (default)</option>
-                            <option value={6}>6h</option>
-                            <option value={24}>1d</option>
-                          </select>
+                        <div style={{display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+                          <div style={{display:"flex",alignItems:"center",gap:6}}>
+                            <span style={{fontSize:8,color:"#666",letterSpacing:1}}>MAX HOLD (timeout)</span>
+                            <select value={maxHoldHours} onChange={e=>setMaxHoldHours(Number(e.target.value))}
+                              disabled={simState.running}
+                              style={{background:"#080808",border:"1px solid #2A2A2A",color:"#5AACDF",fontFamily:"inherit",fontSize:9,padding:"2px 6px"}}>
+                              <option value={1}>1h</option>
+                              <option value={3}>3h (default)</option>
+                              <option value={6}>6h</option>
+                              <option value={24}>1d</option>
+                            </select>
+                          </div>
+                          <div style={{display:"flex",alignItems:"center",gap:6}} title="Round-trip cost: commission + spread + slippage, deducted from every trade's P&L before outcome labelling. 15 bps = 0.15% (realistic retail default on liquid US equities). 0 bps = gross / pre-cost.">
+                            <span style={{fontSize:8,color:"#666",letterSpacing:1,cursor:"help"}}>COST MODEL</span>
+                            <select value={costBps} onChange={e=>setCostBps(Number(e.target.value))}
+                              disabled={simState.running}
+                              style={{background:"#080808",border:"1px solid #2A2A2A",color:"#5AACDF",fontFamily:"inherit",fontSize:9,padding:"2px 6px"}}>
+                              <option value={0}>0 bps (gross)</option>
+                              <option value={5}>5 bps (best case)</option>
+                              <option value={15}>15 bps (default)</option>
+                              <option value={30}>30 bps (illiquid)</option>
+                              <option value={50}>50 bps (worst)</option>
+                            </select>
+                          </div>
                         </div>
                       </div>
                       <div style={{fontSize:10,color:"#888",lineHeight:1.6,marginBottom:10}}>
@@ -1147,7 +1243,9 @@ export default function App() {
                         samples ~10 random entries per symbol, runs the current model verdict at each, then walks
                         forward bar-by-bar. <b style={{color:"#5AACDF"}}>Stop or target exits the trade IMMEDIATELY</b> on
                         the first bar that touches them — the max-hold above is only the <i>timeout</i> for trades that
-                        hit neither.
+                        hit neither. Round-trip transaction cost (commission + spread + slippage) is deducted from
+                        every trade's P&amp;L <b style={{color:"#C9A84C"}}>before</b> outcome labelling, so the win rate
+                        and edge shown are <b>net of costs</b>.
                       </div>
                       <button onClick={runSimulation} disabled={simState.running}
                         style={{background:simState.running?"#111":"#0A1A2A",
@@ -1172,10 +1270,13 @@ export default function App() {
                           <div style={{marginTop:12}}>
                             {/* Edge headline */}
                             <div style={{padding:"8px 10px",background:"#080808",border:`1px solid ${edge.color}55`,borderLeft:`3px solid ${edge.color}`,marginBottom:10}}>
-                              <div style={{fontSize:9,color:"#555",letterSpacing:2}}>EDGE</div>
+                              <div style={{fontSize:9,color:"#555",letterSpacing:2}}>EDGE — NET OF COSTS</div>
                               <div style={{fontSize:13,color:edge.color,fontWeight:900,marginTop:2}}>{edge.label}</div>
                               <div style={{fontSize:9,color:"#666",marginTop:2}}>
-                                {M.n} trades · {(M.winRate*100).toFixed(0)}% wins · max-hold {simResult.holdHours}h
+                                {M.n} trades · {(M.winRate*100).toFixed(0)}% wins · max-hold {simResult.holdHours}h ·
+                                <span style={{color:simResult.costBps>0?"#C9A84C":"#666"}}>
+                                  {" "}costs {simResult.costBps ?? 0} bps/round-trip
+                                </span>
                               </div>
                             </div>
 

@@ -85,9 +85,14 @@ function buildQuoteAt(symbol, bars, i) {
   };
 }
 
-// Simulate one trade: entry at bar i, hold for holdBars bars.
+// Simulate one trade: entry at bar i, max-hold = holdBars.
 // Uses a 1.5-ATR stop and 3-ATR target to match the model's suggested levels.
-function simulateOutcome(bars, i, verdict, holdBars, atr) {
+// costBps: round-trip transaction cost in basis points (1 bp = 0.01%).
+//   Default 15 bps ≈ commission + spread + typical slippage on liquid US
+//   equities at a retail broker. Set to 0 to see gross P&L.
+//   Applied to EVERY trade regardless of exit reason — covers the reality that
+//   getting filled at stop or target also costs spread/slippage.
+function simulateOutcome(bars, i, verdict, holdBars, atr, costBps = 15) {
   if (!atr || atr <= 0) return null;
   const entry = bars.closes[i];
   const stopDist = 1.5 * atr;
@@ -111,17 +116,34 @@ function simulateOutcome(bars, i, verdict, holdBars, atr) {
                   : hitTarget ? (verdict === "BUY" ? entry + tgtDist  : entry - tgtDist)
                   : bars.closes[endIdx];
 
-  const pnl = verdict === "BUY"
+  const pnlGross = verdict === "BUY"
     ? (exitPrice - entry) / entry * 100
     : (entry - exitPrice) / entry * 100;
 
+  // Deduct round-trip costs BEFORE outcome labelling, otherwise marginally-
+  // winning timeout trades flip from LOSS to WIN under real-world conditions.
+  const pnlNet = pnlGross - costBps / 100;
+
+  // Outcome classification:
+  //   - If the target was touched, it's a WIN regardless of costs (you got
+  //     the target price; costs happened at entry/exit but the labelling
+  //     reflects which rail was hit first).
+  //   - Same for stops.
+  //   - For timeout trades, classify by NET P&L with a small deadband so
+  //     trades near zero aren't counted either way.
   const outcome = hitTarget ? "WIN"
                 : hitStop   ? "LOSS"
-                : pnl > 0.3 ? "WIN"
-                : pnl < -0.3 ? "LOSS"
+                : pnlNet > 0.3 ? "WIN"
+                : pnlNet < -0.3 ? "LOSS"
                 : null;  // neutral — drop it
 
-  return { entry, exitPrice, pnlPct: pnl, outcome, hitStop, hitTarget };
+  return {
+    entry, exitPrice,
+    pnlPct: pnlNet,           // NET of costs — this is what metrics consume
+    pnlPctGross: pnlGross,    // available for debugging / gross-vs-net UI
+    costBps,
+    outcome, hitStop, hitTarget,
+  };
 }
 
 // Pick N random entry indices that leave room for the forward window
@@ -142,6 +164,7 @@ export async function runBacktest(symbols, opts = {}) {
     daysAgo = 7,
     holdHours = 3,
     samplesPerSymbol = 10,
+    costBps = 15,  // round-trip in basis points; realistic retail default
     onProgress = () => {},
   } = opts;
 
@@ -169,7 +192,7 @@ export async function runBacktest(symbols, opts = {}) {
       if (!q) continue;
       const model = scoreSetup(q);
       const verdict = parseFloat(model.compositeProb) > 50 ? "BUY" : "SELL";
-      const sim = simulateOutcome(bars, i, verdict, HOLD_BARS, q.atr);
+      const sim = simulateOutcome(bars, i, verdict, HOLD_BARS, q.atr, costBps);
       if (!sim || !sim.outcome) continue;
 
       const ageDays = (Date.now() - bars.timestamps[i] * 1000) / (24 * 3600 * 1000);
@@ -194,5 +217,5 @@ export async function runBacktest(symbols, opts = {}) {
 
   onProgress({ phase: "done", trades: trades.length, wins, losses });
 
-  return { trades, wins, losses, errors };
+  return { trades, wins, losses, errors, costBps, holdHours };
 }
