@@ -884,7 +884,16 @@ export default function App() {
     };
     const context = buildContext(quotes, selected, news, modelCtx);
     const directive = mode === "quick" ? QUICK_DIRECTIVE : DEEP_DIRECTIVE;
-    const fullContent = `${context}\n${directive}\n\nUSER: ${userText}`;
+    // Horizon preamble tells Claude the intended hold period and which
+    // SUGGESTED LEVELS row applies. Without this the model has been giving
+    // intraday-calibrated entries/stops even when user is trading 1-5d.
+    const isSwing = simInterval === "1d";
+    const selQForPreamble = quotes[selected];
+    const dailyAtrEstimate = selQForPreamble?.atr ? selQForPreamble.atr * Math.sqrt(78) : null;
+    const horizonPreamble = isSwing
+      ? `\n═══ INTENDED HORIZON: SWING (1-5 DAYS) ═══\nUse the SWING level set from SUGGESTED LEVELS (2× daily-ATR stop, 6× daily-ATR target${dailyAtrEstimate ? ` — roughly $${(dailyAtrEstimate * 2).toFixed(2)} away for stop` : ""}). Tape reading should focus on DAILY structure — 50-day MA, recent daily swings, multi-day setups — not 5-minute chop. Entry timing can still be intraday ("wait for a pullback to VWAP this session") but the trade itself is multi-day. Do NOT quote intraday levels as the primary SL/TP.\n`
+      : `\n═══ INTENDED HORIZON: INTRADAY (1-3 HOURS) ═══\nUse the INTRADAY level set from SUGGESTED LEVELS (1.5× 5-min ATR stop). Tape reading focuses on this session's structure — VWAP, day's range, opening auction, volume bursts. The trade closes before the bell.\n`;
+    const fullContent = `${context}${horizonPreamble}\n${directive}\n\nUSER: ${userText}`;
     const newHistory = [...chatHistory, { role:"user", content:fullContent }];
     setChatHistory(newHistory);
     setMessages(prev=>[...prev, { type:"user", text:userText }]);
@@ -932,8 +941,15 @@ export default function App() {
     setTab("chat");
     const modelCtx = { macro, calendar: calendarFeatures(), earningsMap };
     const context = buildBestOpportunityContext(quotes, news, modelCtx);
+    // Horizon preamble — same as sendToAI. Best-opportunity scans are more
+    // likely to get horizon-wrong because the user isn't picking a specific
+    // symbol themselves, so being explicit matters even more here.
+    const isSwing = simInterval === "1d";
+    const horizonPreamble = isSwing
+      ? `\n═══ INTENDED HORIZON: SWING (1-5 DAYS) ═══\nRank and pick for a 1-5 day hold. Use SWING levels (2× daily-ATR stop, 6× daily-ATR target) for the FINAL VERDICT's SL/TP. Reject setups whose best edge is intraday-only. Favour setups with clear daily-chart structure and multi-day catalyst potential.\n`
+      : `\n═══ INTENDED HORIZON: INTRADAY (1-3 HOURS) ═══\nRank and pick for a 1-3 hour hold. Use INTRADAY levels (1.5× 5-min ATR stop) for SL/TP. Trade closes before bell. Favour setups with clear session-scale structure and concrete intraday catalysts.\n`;
     setMessages(prev=>[...prev,{type:"user",text:"⚡ BEST OPPORTUNITY SCAN — rank all stocks and pick ONE trade now."}]);
-    const newHistory = [...chatHistory, { role:"user", content:context }];
+    const newHistory = [...chatHistory, { role:"user", content: context + horizonPreamble }];
     setChatHistory(newHistory);
     try {
       const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -1230,7 +1246,20 @@ export default function App() {
       <div style={{background:"#0F0F0F",borderBottom:"1px solid #1E1E1E",padding:"8px 14px",
         display:"flex",alignItems:"center",gap:12,flexShrink:0}}>
         <div style={{fontSize:18,fontWeight:900,color:"#C9A84C",letterSpacing:4}}>◈ THE TRADER</div>
-        <div style={{flex:1,fontSize:9,color:"#555",letterSpacing:2}}>Livermore · Tudor Jones · Dennis · Simons · Williams</div>
+        {/* Global horizon indicator — set by the HORIZON dropdown in the SIM
+            card, but drives MORE than just sim behaviour: the suggested
+            levels card highlights the matching row, the AI analysis adapts
+            its reasoning, and the position sizing uses the matching stop
+            distance. One knob, everything aligned. */}
+        <button onClick={()=>setSimInterval(simInterval === "1d" ? "5m" : "1d")}
+          title="Global horizon — switches the entire app between intraday (tight stops, short holds) and swing (wider stops, multi-day holds). Set here or in the SIM card's HORIZON dropdown; they share state."
+          style={{background:simInterval === "1d" ? "#0F1F18" : "#0A0F14",
+            border:`1px solid ${simInterval === "1d" ? "#2A6A4F" : "#2A6A9A"}`,
+            color:simInterval === "1d" ? "#7FD8A6" : "#5AACDF",
+            fontFamily:"inherit",fontSize:9,padding:"3px 10px",cursor:"pointer",letterSpacing:2,fontWeight:700}}>
+          HORIZON: {simInterval === "1d" ? "SWING (1-5d)" : "INTRADAY (1-3h)"}
+        </button>
+        <div style={{flex:1,fontSize:9,color:"#555",letterSpacing:2,marginLeft:12}}>Livermore · Tudor Jones · Dennis · Simons · Williams</div>
         <div style={{display:"flex",alignItems:"center",gap:8}}>
           {mockCount>0&&<span style={{fontSize:9,color:"#C9A84C",letterSpacing:1}}>SIM {mockCount}/{loadedCount}</span>}
           <div style={{width:6,height:6,borderRadius:"50%",
@@ -1955,53 +1984,69 @@ export default function App() {
                       })()}
                     </div>
 
-                    {/* ═══ SUGGESTED LEVELS — two horizons side by side ═══ */}
-                    {/* Intraday levels: 1.5× 5-min ATR stop, 4.5× target. For 1-3 HOUR holds.
-                        At swing timeframes these are laughably tight — stop gets hit in
-                        5 minutes of normal market noise. DO NOT use for 1-3 day trades.
-                        Swing levels: 2× daily-equivalent ATR (√78 × 5-min ATR), 6× target.
-                        For 1-5 DAY holds. Wider to respect daily noise envelope. */}
-                    <div style={{background:"#111",border:"1px solid #1E1E1E",padding:12}}>
-                      <div style={{fontSize:9,color:"#C9A84C",letterSpacing:2,marginBottom:10}}>SUGGESTED LEVELS — PICK THE ROW THAT MATCHES YOUR INTENDED HOLD</div>
+                    {/* ═══ SUGGESTED LEVELS — horizon-aware, two rows visible ═══ */}
+                    {/* Active row (matching global HORIZON) is bright and bordered; the
+                        other row is dimmed for reference. Still shown because sometimes
+                        you want to sanity-check both (e.g. "if I got stopped at the
+                        intraday level I'd still be OK on the swing target"). */}
+                    {(() => {
+                      const isSwing = simInterval === "1d";
+                      return (
+                        <div style={{background:"#111",border:"1px solid #1E1E1E",padding:12}}>
+                          <div style={{fontSize:9,color:"#C9A84C",letterSpacing:2,marginBottom:10}}>
+                            SUGGESTED LEVELS — active row matches current HORIZON (<span style={{color:isSwing?"#7FD8A6":"#5AACDF"}}>{isSwing?"swing":"intraday"}</span>)
+                          </div>
 
-                      {/* Intraday row */}
-                      <div style={{padding:"8px 10px",background:"#0A0A0A",border:"1px solid #1E1E1E",borderLeft:"3px solid #5AACDF",marginBottom:8}}>
-                        <div style={{fontSize:9,color:"#5AACDF",letterSpacing:2,marginBottom:6}}>INTRADAY (1-3h hold) — 1.5×ATR stop, 4.5×ATR target — 3:1 R/R</div>
-                        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6,fontSize:10}}>
-                          {[["LONG entry",`$${q.price?.toFixed(2)}`],["stop",`$${m.stopLong||"?"}`],["target",`$${m.tgt3Long||"?"}`],
-                            ["SHORT entry",`$${q.price?.toFixed(2)}`],["stop",`$${m.stopShort||"?"}`],["target",`$${m.tgt3Short||"?"}`],
-                          ].map(([l,v],i)=>(
-                            <div key={i}>
-                              <div style={{fontSize:8,color:"#444",letterSpacing:1,textTransform:"uppercase"}}>{l}</div>
-                              <div style={{fontSize:11,color:"#C9A84C",fontWeight:700}}>{v}</div>
+                          {/* Intraday row */}
+                          <div style={{padding:"8px 10px",background:"#0A0A0A",
+                            border:!isSwing?"1px solid #5AACDF":"1px solid #1A1A1A",
+                            borderLeft:`3px solid ${!isSwing?"#5AACDF":"#2A3A4A"}`,
+                            marginBottom:8,opacity:isSwing?0.45:1}}>
+                            <div style={{fontSize:9,color:"#5AACDF",letterSpacing:2,marginBottom:6}}>
+                              INTRADAY (1-3h hold) — 1.5×ATR stop, 4.5×ATR target — 3:1 R/R
+                              {!isSwing && <span style={{marginLeft:6,color:"#7FD8A6"}}>◀ ACTIVE</span>}
                             </div>
-                          ))}
-                        </div>
-                      </div>
+                            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6,fontSize:10}}>
+                              {[["LONG entry",`$${q.price?.toFixed(2)}`],["stop",`$${m.stopLong||"?"}`],["target",`$${m.tgt3Long||"?"}`],
+                                ["SHORT entry",`$${q.price?.toFixed(2)}`],["stop",`$${m.stopShort||"?"}`],["target",`$${m.tgt3Short||"?"}`],
+                              ].map(([l,v],i)=>(
+                                <div key={i}>
+                                  <div style={{fontSize:8,color:"#444",letterSpacing:1,textTransform:"uppercase"}}>{l}</div>
+                                  <div style={{fontSize:11,color:"#C9A84C",fontWeight:700}}>{v}</div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
 
-                      {/* Swing row — wider, for 1-5d holds */}
-                      <div style={{padding:"8px 10px",background:"#0A0A0A",border:"1px solid #1E1E1E",borderLeft:"3px solid #7FD8A6"}}>
-                        <div style={{fontSize:9,color:"#7FD8A6",letterSpacing:2,marginBottom:6}}>SWING (1-5d hold) — 2×daily-ATR stop, 6×daily-ATR target — 3:1 R/R
-                          {m.dailyAtrEst > 0 && <span style={{color:"#666"}}> · daily-ATR est ${m.dailyAtrEst.toFixed(2)}</span>}
-                        </div>
-                        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6,fontSize:10}}>
-                          {[["LONG entry",`$${q.price?.toFixed(2)}`],["stop",`$${m.swingStopLong||"?"}`],["target",`$${m.swingTargetLong||"?"}`],
-                            ["SHORT entry",`$${q.price?.toFixed(2)}`],["stop",`$${m.swingStopShort||"?"}`],["target",`$${m.swingTargetShort||"?"}`],
-                          ].map(([l,v],i)=>(
-                            <div key={i}>
-                              <div style={{fontSize:8,color:"#444",letterSpacing:1,textTransform:"uppercase"}}>{l}</div>
-                              <div style={{fontSize:11,color:"#7FD8A6",fontWeight:700}}>{v}</div>
+                          {/* Swing row */}
+                          <div style={{padding:"8px 10px",background:"#0A0A0A",
+                            border:isSwing?"1px solid #7FD8A6":"1px solid #1A1A1A",
+                            borderLeft:`3px solid ${isSwing?"#7FD8A6":"#2A4A3A"}`,
+                            opacity:!isSwing?0.45:1}}>
+                            <div style={{fontSize:9,color:"#7FD8A6",letterSpacing:2,marginBottom:6}}>
+                              SWING (1-5d hold) — 2×daily-ATR stop, 6×daily-ATR target — 3:1 R/R
+                              {m.dailyAtrEst > 0 && <span style={{color:"#666"}}> · daily-ATR est ${m.dailyAtrEst.toFixed(2)}</span>}
+                              {isSwing && <span style={{marginLeft:6,color:"#C9A84C"}}>◀ ACTIVE</span>}
                             </div>
-                          ))}
+                            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6,fontSize:10}}>
+                              {[["LONG entry",`$${q.price?.toFixed(2)}`],["stop",`$${m.swingStopLong||"?"}`],["target",`$${m.swingTargetLong||"?"}`],
+                                ["SHORT entry",`$${q.price?.toFixed(2)}`],["stop",`$${m.swingStopShort||"?"}`],["target",`$${m.swingTargetShort||"?"}`],
+                              ].map(([l,v],i)=>(
+                                <div key={i}>
+                                  <div style={{fontSize:8,color:"#444",letterSpacing:1,textTransform:"uppercase"}}>{l}</div>
+                                  <div style={{fontSize:11,color:"#7FD8A6",fontWeight:700}}>{v}</div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                          <div style={{fontSize:9,color:"#555",marginTop:8,lineHeight:1.5}}>
+                            Change horizon with the HORIZON toggle at the top of the app. Active row
+                            is the one Claude uses when you ask for analysis, and the one position
+                            sizing is calibrated against.
+                          </div>
                         </div>
-                      </div>
-                      <div style={{fontSize:9,color:"#555",marginTop:8,lineHeight:1.5}}>
-                        Intraday stop uses 5-min ATR (tight — within normal daily noise).
-                        Swing stop uses √78 × 5-min ATR (daily-equivalent, respects daily range).
-                        Using the wrong set for your hold period is the most common source of
-                        premature stop-outs on swing trades.
-                      </div>
-                    </div>
+                      );
+                    })()}
 
                     {/* ═══ POSITION SIZING ═══ */}
                     {(() => {
