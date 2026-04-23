@@ -23,6 +23,7 @@ import { fetchPolygonBars, hasPolygonKey } from "./polygon";
 import { fetchMacroHistorical } from "./macro";
 import { calendarFeaturesAt } from "./calendar";
 import { computePeadFeatures } from "./earnings";
+import { timeSeriesMomentumAt, approximateDominanceZFromBTCReturns } from "./crypto";
 
 const YAHOO_PROXIES = [
   u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
@@ -270,6 +271,16 @@ export async function runBacktest(symbols, opts = {}) {
   onProgress({ phase: "fetching_macro", done: 0, total: symbols.length });
   const macroHist = await fetchMacroHistorical(daysAgo + 2).catch(() => null);
 
+  // For crypto, pre-fetch BTC bars to compute the BTC-dominance proxy at
+  // each entry's timestamp (CoinGecko doesn't give historical dominance
+  // on free tier; we approximate via BTC's own 14d return sign/magnitude).
+  // Cached via the same bars-cache so runs 2..N reuse it.
+  let btcHistBars = null;
+  if (universe === "crypto" && symbols.includes("BTC-USD")) {
+    const btcFetch = await fetchHistoricalBars("BTC-USD", daysAgo + 2, polygonKey, interval);
+    btcHistBars = btcFetch?.bars || null;
+  }
+
   const trades = [];
   const errors = [];
   let barsSource = null;  // "polygon" | "yahoo" | mixed — reported back to UI
@@ -315,9 +326,20 @@ export async function runBacktest(symbols, opts = {}) {
       const pead = earningsMap[symbol]
         ? computePeadFeatures(earningsMap[symbol], barTsMs)
         : null;
+      // Crypto context for this entry: dominance proxy (from BTC's own
+      // 14d return at the entry time) + this symbol's time-series momentum.
+      // Both point-in-time from cached bars — no network I/O per entry.
+      // XS momentum rank left for a future commit (needs cross-symbol
+      // coordination which the current loop shape doesn't expose).
+      const cryptoContext = universe === "crypto" ? {
+        dominanceZ: btcHistBars ? approximateDominanceZFromBTCReturns(btcHistBars, bars.timestamps[i]) : 0,
+        tsMom:      timeSeriesMomentumAt(bars, i, 14, 30),
+        xsMomRank:  0,  // TODO Phase 3d: compute across all symbols at timestamp i
+      } : null;
+      const baseMacro = macroHist?.at(bars.timestamps[i]) || null;
       const modelCtx = {
         universe,
-        macro: macroHist?.at(bars.timestamps[i]) || null,
+        macro: baseMacro || cryptoContext ? { ...(baseMacro || {}), cryptoContext } : null,
         calendar: calendarFeaturesAt(bars.timestamps[i]),
         pead,
       };

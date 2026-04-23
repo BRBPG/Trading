@@ -33,7 +33,7 @@ const VOL_PROFILES = {
   "AVAX-USD":  { vol: 0.050 },
   "LINK-USD":  { vol: 0.040 },
   "DOGE-USD":  { vol: 0.055 },
-  "MATIC-USD": { vol: 0.045 },
+  "POL-USD":   { vol: 0.045 },  // formerly MATIC; Polygon ecosystem rebrand Sep 2024
 };
 
 // Synthetic-fallback starting prices. Rough ballpark — doesn't need to match
@@ -59,7 +59,7 @@ const FALLBACK_PRICES = {
   "AVAX-USD":  40,
   "LINK-USD":  18,
   "DOGE-USD":  0.38,
-  "MATIC-USD": 0.85,
+  "POL-USD":   0.55,  // POL (formerly MATIC)
 };
 
 function mulberry32(seed) {

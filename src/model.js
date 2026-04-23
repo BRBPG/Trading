@@ -23,7 +23,7 @@ const DEFAULT_BIAS_CRYPTO = 0.0;  // no directional prior
 
 function weightsKeyFor(universe) {
   return universe === "crypto"
-    ? "trader_lr_weights_v3_crypto"
+    ? "trader_lr_weights_v4_crypto"
     : "trader_lr_weights_v3";       // leave equities key unchanged for back-compat
 }
 
@@ -122,27 +122,38 @@ function extractFeatures(q, macro = null, calendar = null, pead = null, universe
   // their own (near-zero) weights on those slots and ignore them.
   const isCrypto = universe === "crypto";
 
-  // Equity macro — zero for crypto
-  const vix_z    = isCrypto ? 0 : (macro?.vixZ != null ? clip1(macro.vixZ / 2) : 0);
-  const vix_term = isCrypto ? 0 : (macro?.vixTerm != null ? clip1((macro.vixTerm - 1) * 5) : 0);
-  // Cross-asset: DXY has some crypto relevance per literature (Pyo & Lee,
-  // Liu-Tsyvinski) but TNX/Oil/Gold are equity-centric. For Phase 3b the
-  // pragmatic move is zero them all for crypto and let Phase 3c add
-  // crypto-native cross-asset (BTC dominance, ETH/BTC, stablecoin supply).
-  const dxy_mom  = isCrypto ? 0 : clip1((macro?.dxyMom5  || 0) * 100);
+  // ── Slot semantics differ by universe ─────────────────────────────
+  // Same 16-dim vector, different meaning per universe. Storage keys are
+  // already universe-gated so trained weights never cross-contaminate.
+  //
+  //   slot  equity meaning          crypto meaning
+  //   ----  ----------------------  ------------------------------
+  //   [7]   VIX z-score             BTC dominance z-score
+  //   [8]   VIX term structure      time-series 14d momentum z
+  //   [9]   DXY momentum            cross-sectional mom rank (Liu-Tsyvinski)
+  //   [10]  TNX momentum            (reserved — funding rate z Phase 3d)
+  //   [11]  Oil momentum            (reserved — DVOL-RV spread Phase 3d)
+  //   [12]  Gold momentum           0
+  //   [13]  TOD edge                0
+  //   [14]  PEAD daysSinceEarnings  0
+  //   [15]  PEAD surpriseDecayed    0
+  //
+  // crypto context arrives via macro.cryptoContext (set upstream by the
+  // live loop or the backtest loop) containing dominanceZ, tsMom, xsMomRank.
+  const vix_z    = isCrypto
+    ? clip1(macro?.cryptoContext?.dominanceZ ?? 0)
+    : (macro?.vixZ != null ? clip1(macro.vixZ / 2) : 0);
+  const vix_term = isCrypto
+    ? clip1(macro?.cryptoContext?.tsMom ?? 0)
+    : (macro?.vixTerm != null ? clip1((macro.vixTerm - 1) * 5) : 0);
+  const dxy_mom  = isCrypto
+    ? clip1(macro?.cryptoContext?.xsMomRank ?? 0)
+    : clip1((macro?.dxyMom5  || 0) * 100);
+  // Slots 10-15: all zeroed in crypto mode (reserved for future phases).
   const tnx_mom  = isCrypto ? 0 : clip1((macro?.tnxMom5  || 0) * 100);
   const oil_mom  = isCrypto ? 0 : clip1((macro?.oilMom5  || 0) * 100);
   const gold_mom = isCrypto ? 0 : clip1((macro?.goldMom5 || 0) * 100);
-
-  // Calendar — time-of-day edge is equity U-shape (open/close spikes).
-  // Crypto has a different Asia/EU/US overlap profile (Eross et al. 2019);
-  // leaving the equity-calibrated TOD slot at 0.5 would bias mid-session
-  // predictions. Zero it for crypto until Phase 3c adds a crypto-native
-  // session-position feature.
   const tod_edge = isCrypto ? 0 : clip0to1(calendar?.todEdge ?? 0.5);
-
-  // PEAD — no earnings concept on crypto. pead is already null in crypto
-  // mode (gated upstream) so the ?? 0 fallback fires, but be explicit.
   const pead_days = isCrypto ? 0 : clip1(pead?.daysSinceEarnings ?? 0);
   const pead_surp = isCrypto ? 0 : clip1(pead?.surpriseDecayed ?? 0);
 
@@ -156,12 +167,21 @@ function extractFeatures(q, macro = null, calendar = null, pead = null, universe
 }
 
 export const FEATURE_DIM = 16;
+// Feature names for equity universe (LR weights display). Crypto reuses the
+// same 16 slots with different meanings — see extractFeatures comment.
 export const FEATURE_NAMES = [
   "RSI", "MACD", "Mom", "BB", "EMA9/20", "EMA20/50", "Vol",
   "VIX_z", "VIX_term",
   "DXY_m", "TNX_m", "Oil_m", "Gold_m",
   "TOD_edge",
   "PEAD_days", "PEAD_surp",
+];
+export const FEATURE_NAMES_CRYPTO = [
+  "RSI", "MACD", "Mom", "BB", "EMA9/20", "EMA20/50", "Vol",
+  "BTC_dom_z", "TS_mom_z",
+  "XS_mom_rank", "—", "—", "—",
+  "—",
+  "—", "—",
 ];
 
 function logisticScoreFromFeatures(f, universe = "equities") {

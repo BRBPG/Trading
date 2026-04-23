@@ -20,7 +20,7 @@
 import { trainGBM, predictGBM } from "./gbm";
 
 function regimeKeyFor(universe = "equities") {
-  return universe === "crypto" ? "trader_regime_v1_crypto" : "trader_regime_v1";
+  return universe === "crypto" ? "trader_regime_v2_crypto" : "trader_regime_v1";
 }
 const MIN_SAMPLES_PER_REGIME = 30;
 

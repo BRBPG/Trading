@@ -11,6 +11,7 @@ import { BUFFETT_SYSTEM_PROMPT, buildBuffettContext } from "./buffett";
 import { cleanBars, assessQuality, cleaningSummary } from "./cleaning";
 import { downloadExport, importState } from "./persistence";
 import { fetchMacroSnapshot } from "./macro";
+import { fetchBTCDominance, timeSeriesMomentum } from "./crypto";
 import { calendarFeatures } from "./calendar";
 import { getEarningsBatch, computePeadFeatures } from "./earnings";
 import { recommendSize } from "./sizing";
@@ -41,7 +42,11 @@ const EQUITY_WATCHLIST = ["SPY","QQQ","AAPL","MSFT","AMZN","NVDA","AMD","TSM","T
 // supports these as "BTC-USD" etc natively — no new data adapter needed for
 // Phase 3a (Phase 3b will add Binance REST for funding/OI and Deribit for
 // DVOL which is the real feature upgrade).
-const CRYPTO_WATCHLIST = ["BTC-USD","ETH-USD","SOL-USD","BNB-USD","XRP-USD","ADA-USD","AVAX-USD","LINK-USD","DOGE-USD","MATIC-USD"];
+// MATIC was rebranded to POL in September 2024 when the Polygon ecosystem
+// migrated the native token. Polygon.io's ticker is now X:POLUSD and Yahoo
+// has migrated to POL-USD. MATIC-USD still exists on both sources but with
+// stale/no recent data. Using POL-USD gives clean forward history.
+const CRYPTO_WATCHLIST = ["BTC-USD","ETH-USD","SOL-USD","BNB-USD","XRP-USD","ADA-USD","AVAX-USD","LINK-USD","DOGE-USD","POL-USD"];
 
 // Keep the legacy WATCHLIST symbol exported for anywhere that needs a
 // compile-time default — defaults to equities, will be overridden by the
@@ -901,10 +906,13 @@ export default function App() {
   const refreshAll = useCallback(async (silent=false) => {
     if (!silent) setRefreshing(true);
     // Fan out quotes + macro in parallel. Macro has its own 2-min cache so
-    // this call is nearly free after the first refresh.
-    const [results, macroSnap] = await Promise.all([
+    // this call is nearly free after the first refresh. When universe is
+    // crypto, also fetch BTC dominance in parallel — feeds the dominanceZ
+    // feature slot via macro.cryptoContext downstream.
+    const [results, macroSnap, btcDom] = await Promise.all([
       Promise.all(activeWatchlist.map(s=>fetchQuote(s, finnhubKey))),
       fetchMacroSnapshot().catch(() => null),
+      universe === "crypto" ? fetchBTCDominance().catch(() => null) : Promise.resolve(null),
     ]);
     setQuotes(prev => {
       const map = { ...prev };
@@ -921,7 +929,19 @@ export default function App() {
       });
       return map;
     });
-    if (macroSnap) setMacro(macroSnap);
+    // Attach crypto context to macro when relevant. The cryptoContext field
+    // is consumed by extractFeatures in crypto mode (slots 7-9) and ignored
+    // in equity mode. tsMom is per-symbol so it's computed downstream in
+    // sendToAI / rankOpportunities from each quote's own closes.
+    const mergedMacro = macroSnap || btcDom ? {
+      ...(macroSnap || {}),
+      cryptoContext: btcDom ? {
+        dominanceZ: btcDom.dominanceZ,
+        dominance:  btcDom.dominance,
+        // tsMom + xsMomRank filled in per-symbol at scoreSetup time
+      } : undefined,
+    } : null;
+    if (mergedMacro) setMacro(mergedMacro);
     setLastRefresh(Date.now());
     if (!silent) setRefreshing(false);
     // universe must be a dep: switching it changes activeWatchlist, and
@@ -986,8 +1006,16 @@ export default function App() {
 
   async function sendToAI(userText, mode = "deep") {
     setThinking(true);
+    // For crypto, augment macro with this symbol's time-series momentum —
+    // computed from its own bars with no external API. Feeds the TS_mom_z
+    // feature slot (which equity mode uses for VIX_term).
+    const selectedQuote = quotes[selected];
+    const cryptoCtx = (universe === "crypto" && selectedQuote?.closes) ? {
+      ...(macro?.cryptoContext || {}),
+      tsMom: timeSeriesMomentum(selectedQuote.closes),
+    } : macro?.cryptoContext;
     const modelCtx = {
-      macro,
+      macro: macro ? { ...macro, cryptoContext: cryptoCtx } : null,
       calendar: calendarFeatures(),
       pead: universe === "crypto" ? null : computePeadFeatures(earningsMap[selected]),
       universe,
@@ -1700,8 +1728,13 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
 
           {tab==="model"&&(()=>{
             const q = quotes[selected];
+            // Crypto: augment with per-symbol TS momentum before scoring
+            const cryptoCtx = (universe === "crypto" && q?.closes) ? {
+              ...(macro?.cryptoContext || {}),
+              tsMom: timeSeriesMomentum(q.closes),
+            } : macro?.cryptoContext;
             const m = q ? scoreSetup(q, {
-              macro,
+              macro: macro ? { ...macro, cryptoContext: cryptoCtx } : null,
               calendar: calendarFeatures(),
               pead: universe === "crypto" ? null : computePeadFeatures(earningsMap[selected]),
               universe,

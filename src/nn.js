@@ -31,7 +31,7 @@
 // only the trained weights diverge.
 function nnKeyFor(universe = "equities") {
   return universe === "crypto"
-    ? "trader_nn_weights_v3_crypto"
+    ? "trader_nn_weights_v4_crypto"
     : "trader_nn_weights_v3";
 }
 const NN_INPUT_DIM = 16;
