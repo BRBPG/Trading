@@ -47,6 +47,36 @@ const YAHOO_PROXIES = [
 const barsCache = new Map();  // key → { bars, source, fetchedAt }
 const BARS_CACHE_TTL_MS = 10 * 60 * 1000;
 
+// ─── Unbiased coin flip via OS-level entropy ───────────────────────────────
+// Math.random() is a deterministic PRNG (xorshift/LCG variant per engine).
+// For short sequences inside tight loops it can exhibit non-obvious bias,
+// and critically its output is correlated with whatever seeded it — often
+// time-based, which can accidentally correlate with bar-timestamp order in
+// a sim. Crypto.getRandomValues uses OS-level entropy pools (thermal noise,
+// hardware jitter, timing sources, mouse/keyboard jitter) which are the
+// same class of physical-process entropy as atmospheric-noise services
+// like random.org but without the network round-trip. Industry-standard
+// for anywhere correlation with program state could contaminate a
+// statistical test. Used here for the cold-start direction tie-break so
+// the bootstrap labels are provably unbiased.
+//
+// Pull a block of bytes at a time and consume them — calling
+// getRandomValues per trade is fine but block-sampling is cheaper and
+// gives identical entropy.
+let entropyBuf = null;
+let entropyIdx = 0;
+function secureCoinFlip() {
+  if (!entropyBuf || entropyIdx >= entropyBuf.length) {
+    entropyBuf = new Uint8Array(256);
+    crypto.getRandomValues(entropyBuf);
+    entropyIdx = 0;
+  }
+  // Discard bytes in [128, 255] if you want perfectly unbiased — with 256
+  // outcomes, 128/256 = exactly 50% for < 128, so no rejection sampling
+  // needed. Use the MSB directly.
+  return (entropyBuf[entropyIdx++] & 1) === 1;
+}
+
 function cacheKey(symbol, interval, daysAgo, hasPolygon) {
   return `${symbol}|${interval}|${daysAgo}|${hasPolygon ? "poly" : "yh"}`;
 }
@@ -345,23 +375,33 @@ export async function runBacktest(symbols, opts = {}) {
       };
       const model = scoreSetup(q, modelCtx);
       const prob = parseFloat(model.compositeProb) / 100;
-      // SKIP NEUTRAL TRADES. When all ensemble components are untrained
-      // (typical on crypto first-run — NN/GBM untrained, tree muted, LR
-      // neutral), compositeProb resolves to exactly 0.50. The old code
-      // then did `> 50 ? BUY : SELL` which tie-broke to SELL on every
-      // single trade. In a bull crypto window that produced "SELL loses
-      // 69% of the time" per-symbol numbers (BTC 31% win-rate) that
-      // looked like a broken model but was really an artifact of forcing
-      // a one-sided verdict from no-conviction.
+      // SKIP NEUTRAL TRADES — with a COLD-START EXCEPTION.
       //
-      // Skip any trade where the model is within ±0.02 of neutral — no
-      // label recorded, not included in walk-forward. An untrained model
-      // contributes zero trades (which is the honest answer: it can't be
-      // measured without conviction). A trained model with real signal
-      // will produce plenty of >0.52 and <0.48 trades to populate the
-      // sim honestly.
-      if (Math.abs(prob - 0.5) < 0.02) continue;
-      const verdict = prob > 0.5 ? "BUY" : "SELL";
+      // Normal case: when a trained model has low conviction (|prob-0.5|
+      // < 0.02) we skip the trade so a one-sided tie-break doesn't
+      // pollute the walk-forward with phantom signal. A trained model
+      // with real signal produces plenty of >0.52 / <0.48 entries to
+      // populate the sim honestly.
+      //
+      // Cold-start case: when EVERY ensemble component is untrained
+      // (LR at default zeros, NN/GBM not ready, tree muted in crypto),
+      // compositeProb resolves to EXACTLY 0.500. Skipping there produced
+      // a deadlock on fresh crypto installs — 0 labelled trades means
+      // nothing to train on, which means the models stay untrained, which
+      // means 0 labelled trades forever. We detect that exact-0.5 state
+      // and pick direction randomly so the user gets a balanced labelled
+      // dataset to bootstrap training from. Outcomes are ground truth
+      // regardless of the random verdict, so the resulting trades are
+      // honest training data. After ONE train pass the LR drifts off
+      // 0.5 and the normal skip-neutral gate resumes.
+      const isColdStart = prob === 0.5;
+      if (!isColdStart && Math.abs(prob - 0.5) < 0.02) continue;
+      // Cold-start picks direction from OS entropy (crypto.getRandomValues)
+      // not Math.random — see secureCoinFlip comment. Keeps the bootstrap
+      // labels statistically independent of program state.
+      const verdict = isColdStart
+        ? (secureCoinFlip() ? "BUY" : "SELL")
+        : (prob > 0.5 ? "BUY" : "SELL");
       const sim = simulateOutcome(bars, i, verdict, HOLD_BARS, q.atr, costBps);
       if (!sim || !sim.outcome) continue;
 
