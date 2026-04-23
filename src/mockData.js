@@ -20,6 +20,20 @@ const VOL_PROFILES = {
   USO:  { vol: 0.020 }, BNO:  { vol: 0.022 }, GLD:  { vol: 0.009 },
   // LSE
   "TW.L": { vol: 0.018 },
+  // Crypto — ~3-5× equity vol. Daily ranges frequently 3-6% on majors,
+  // 5-10% on small-caps. Per-bar vol estimates here are for the random-walk
+  // fallback only (real data comes from Yahoo/Polygon). Ordered roughly by
+  // market cap / historical volatility.
+  "BTC-USD":   { vol: 0.025 },
+  "ETH-USD":   { vol: 0.032 },
+  "SOL-USD":   { vol: 0.045 },
+  "BNB-USD":   { vol: 0.028 },
+  "XRP-USD":   { vol: 0.038 },
+  "ADA-USD":   { vol: 0.042 },
+  "AVAX-USD":  { vol: 0.050 },
+  "LINK-USD":  { vol: 0.040 },
+  "DOGE-USD":  { vol: 0.055 },
+  "MATIC-USD": { vol: 0.045 },
 };
 
 // Synthetic-fallback starting prices. Rough ballpark — doesn't need to match
@@ -35,6 +49,17 @@ const FALLBACK_PRICES = {
   UAL: 68,
   USO: 78, BNO: 20, GLD: 224,
   "TW.L": 112,
+  // Crypto (Apr 2026 ballpark). Off-market fallback only, real data via Yahoo.
+  "BTC-USD":   95000,
+  "ETH-USD":   3300,
+  "SOL-USD":   175,
+  "BNB-USD":   620,
+  "XRP-USD":   2.20,
+  "ADA-USD":   0.85,
+  "AVAX-USD":  40,
+  "LINK-USD":  18,
+  "DOGE-USD":  0.38,
+  "MATIC-USD": 0.85,
 };
 
 function mulberry32(seed) {

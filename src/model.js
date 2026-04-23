@@ -333,9 +333,15 @@ function findClosestCrisis(q) {
 // Weights always normalise to 1.0 so the output stays a probability.
 // Agreement between models boosts confidence; disagreement reduces it.
 export function scoreSetup(q, context = {}) {
-  const { macro = null, calendar = null, pead = null } = context;
+  const { macro = null, calendar = null, pead = null, universe = "equities" } = context;
   const features  = extractFeatures(q, macro, calendar, pead);
   const lrProb    = logisticScoreFromFeatures(features);
+  // Crisis analogue is a curated library of 55 EQUITY regimes (1929, 2008,
+  // 2020 COVID, etc.). Matching BTC to "2008 Financial Crisis" produces
+  // nonsense — different asset class, different dynamics. Suppress for
+  // crypto until Phase 3b adds a crypto-specific regime library (2017
+  // mania, 2018 bear, 2022 LUNA/FTX, etc.).
+  const isCrypto = universe === "crypto";
   const tree      = decisionTree(q);
   const crisis    = findClosestCrisis(q);
   const atr       = q.atr ?? 0;
@@ -386,8 +392,11 @@ export function scoreSetup(q, context = {}) {
                     + nnW * (nnProb ?? 0.5)
                     + gbmW * (gbmProb ?? 0.5);
 
-  // Crisis bias: nearest analogue's bias pushes +/- 5%
-  const crisisBias = crisis?.regime === "melt_up" || crisis?.regime === "recovery" ?  0.05
+  // Crisis bias: nearest analogue's bias pushes +/- 5%. Suppressed in
+  // crypto mode — the crisis library is equity-only (1929, 2008, COVID)
+  // and would apply nonsense biases to BTC/ETH/alts.
+  const crisisBias = isCrypto ? 0
+                   : crisis?.regime === "melt_up" || crisis?.regime === "recovery" ?  0.05
                   : crisis?.regime === "crash"    || crisis?.regime === "slow_bleed" ? -0.05
                   : crisis?.regime === "euphoria" ? -0.03   // top-like conditions lean bearish
                   : crisis?.regime === "bank_crisis" || crisis?.regime === "macro_shock" ? -0.04

@@ -29,7 +29,55 @@ const FH_METRIC = (sym, key) => `https://finnhub.io/api/v1/stock/metric?symbol=$
 //   - Airline (UAL) — left in for consumer-discretionary / travel exposure
 //   - Commodities (USO = WTI oil ETF, BNO = Brent oil ETF, GLD = gold ETF)
 //   - LSE (TW.L = Taylor Wimpey, UK housebuilder) — routed through Yahoo
-const WATCHLIST = ["SPY","QQQ","AAPL","MSFT","AMZN","NVDA","AMD","TSM","TSLA","IONQ","RGTI","UAL","USO","BNO","GLD","TW.L"];
+// ─── Universe: equities vs crypto ──────────────────────────────────────────
+// Two parallel asset universes share the infrastructure (backtest, walk-
+// forward, multi-sim, ensemble models) but have different watchlists,
+// session behaviour, cost defaults, and eventually feature vectors.
+// Universe is a runtime-switchable state — see universe selector in the
+// top-bar toggle.
+const EQUITY_WATCHLIST = ["SPY","QQQ","AAPL","MSFT","AMZN","NVDA","AMD","TSM","TSLA","IONQ","RGTI","UAL","USO","BNO","GLD","TW.L"];
+
+// Crypto top-10 by liquidity, Binance + Coinbase intersect. Yahoo chart API
+// supports these as "BTC-USD" etc natively — no new data adapter needed for
+// Phase 3a (Phase 3b will add Binance REST for funding/OI and Deribit for
+// DVOL which is the real feature upgrade).
+const CRYPTO_WATCHLIST = ["BTC-USD","ETH-USD","SOL-USD","BNB-USD","XRP-USD","ADA-USD","AVAX-USD","LINK-USD","DOGE-USD","MATIC-USD"];
+
+// Keep the legacy WATCHLIST symbol exported for anywhere that needs a
+// compile-time default — defaults to equities, will be overridden by the
+// React state when the user switches universe.
+const WATCHLIST = EQUITY_WATCHLIST;
+
+function isCryptoSymbol(sym) {
+  // Yahoo crypto pairs end in -USD or -USDT. Distinguishes from LSE dot-
+  // suffix and plain US tickers.
+  return /-USD(T)?$/.test(sym);
+}
+
+function watchlistFor(universe) {
+  return universe === "crypto" ? CRYPTO_WATCHLIST : EQUITY_WATCHLIST;
+}
+
+function backtestSymbolsFor(universe) {
+  // Equities: drop dot-suffix (non-US session-misaligned).
+  // Crypto: use all — 24/7 markets, no session mismatch.
+  const list = watchlistFor(universe);
+  return universe === "crypto"
+    ? [...list]
+    : list.filter(s => !s.includes("."));
+}
+
+// Per-universe default cost model. Crypto costs are dominated by spread
+// + taker fees, much higher than US equities.
+//   Equities: 15 bps round-trip (retail on liquid US equities)
+//   Crypto:   30 bps default; BTC/ETH are lower (~20), alts higher (~40-60).
+//             Phase 3b will add per-asset cost table; for 3a a flat 30 is
+//             an honest middle estimate. Used by the universe-switch side
+//             effect to reset costBps when the user flips universe.
+// eslint-disable-next-line no-unused-vars
+function defaultCostBpsFor(universe) {
+  return universe === "crypto" ? 30 : 15;
+}
 
 // Subset of the watchlist fed into the backtest / sim / training pipeline.
 // Non-US listings (anything with a dot-suffix, currently just TW.L) are
@@ -46,17 +94,33 @@ const WATCHLIST = ["SPY","QQQ","AAPL","MSFT","AMZN","NVDA","AMD","TSM","TSLA","I
 // The live dashboard still fetches, displays, and allows manual ANALYZE
 // on TW.L via the regular WATCHLIST iteration — only the backtest loop
 // skips it.
-const BACKTEST_SYMBOLS = WATCHLIST.filter(s => !s.includes("."));
+// Legacy compile-time defaults — runtime code paths call backtestSymbolsFor
+// and high-vol list is looked up per-universe via highVolSymbolsFor.
+const BACKTEST_SYMBOLS = backtestSymbolsFor("equities");
 // Symbols whose per-bar vol is high enough to materially destabilise sims:
 // quantum names introduce ±5-6% per-bar moves that dominate the variance
 // across multi-sim runs. Excluding them via the diagnostic toggle isolates
 // whether the apparent edge is robust or a quantum-name-day artefact.
-const HIGH_VOL_SYMBOLS = ["IONQ", "RGTI"];
+// High-vol speculative names per universe. Equity: small-cap quantum.
+// Crypto: meme coins + highly speculative alts whose swings dominate
+// multi-sim variance the way IONQ/RGTI did for equities.
+const HIGH_VOL_EQUITIES = ["IONQ", "RGTI"];
+const HIGH_VOL_CRYPTO   = ["DOGE-USD", "AVAX-USD"];  // tune with experience
+function highVolSymbolsFor(universe) {
+  return universe === "crypto" ? HIGH_VOL_CRYPTO : HIGH_VOL_EQUITIES;
+}
+const HIGH_VOL_SYMBOLS = HIGH_VOL_EQUITIES;  // back-compat default
 
 // ─── Market-session detection (pure, client-side) ───────────────────────────
 // US stocks:   premarket 04:00-09:30 ET, open 09:30-16:00 ET, after 16:00-20:00 ET
 // LSE (.L):    premarket 07:00-08:00 UK, open 08:00-16:30 UK, after 16:30-17:15 UK
 function getMarketSession(symbol = "") {
+  // Crypto markets are 24/7 with no session distinction. Applying US-hours
+  // logic to BTC-USD would produce "CLOSED" during overnight hours when
+  // crypto is in fact trading normally — which would then corrupt quality
+  // tagging, stop extended-hours-move detection from working, and misalign
+  // macro point-in-time lookups.
+  if (isCryptoSymbol(symbol)) return "OPEN";
   const isUK = symbol.toUpperCase().endsWith(".L");
   const tz = isUK ? "Europe/London" : "America/New_York";
   const parts = Object.fromEntries(
@@ -243,8 +307,13 @@ async function fetchYahoo(symbol) {
 }
 
 function shouldUseYahoo(symbol) {
-  // Route by symbol suffix. Anything with a dot-suffix that isn't a US index
-  // is a non-US exchange that Finnhub free won't cover.
+  // Route by symbol suffix:
+  //   - Dot-suffix (TW.L, SAP.DE) = non-US exchange → Yahoo (Finnhub free
+  //     doesn't cover)
+  //   - Dash-USD suffix (BTC-USD, ETH-USD) = crypto → Yahoo (Finnhub doesn't
+  //     do crypto spot; Yahoo chart endpoint covers majors natively)
+  //   - Everything else → Finnhub (real-time US equities)
+  if (isCryptoSymbol(symbol)) return true;
   return /\.[A-Z]{1,3}$/.test(symbol.toUpperCase());
 }
 
@@ -761,6 +830,17 @@ export default function App() {
   // effects like PEAD and factor momentum live; intraday is mostly noise
   // net of costs. Changing this resets maxHoldHours to a sensible default.
   const [simInterval, setSimInterval] = useState("5m");
+  // Universe: "equities" (default, the existing US stocks + UK pipeline) or
+  // "crypto" (BTC/ETH/alts via Yahoo). Switches the watchlist, session
+  // handling, cost defaults, and which model guards fire (e.g. PEAD
+  // disabled on crypto since there's no earnings concept).
+  const [universe, setUniverse] = useState("equities");
+  // Runtime-resolved watchlists. Use these throughout the live loop +
+  // sim dispatch rather than the compile-time WATCHLIST constant, so that
+  // switching universe actually changes which symbols are fetched.
+  const activeWatchlist = watchlistFor(universe);
+  const activeBacktestSymbols = backtestSymbolsFor(universe);
+  const activeHighVolSymbols = highVolSymbolsFor(universe);
   // Diagnostic: temporarily exclude high-vol speculative names (IONQ, RGTI)
   // from the sim. Their 5-6% per-bar vol dominates run-to-run variance.
   // Toggle on to test whether the underlying signal is stable once the
@@ -819,14 +899,14 @@ export default function App() {
     // Fan out quotes + macro in parallel. Macro has its own 2-min cache so
     // this call is nearly free after the first refresh.
     const [results, macroSnap] = await Promise.all([
-      Promise.all(WATCHLIST.map(s=>fetchQuote(s, finnhubKey))),
+      Promise.all(activeWatchlist.map(s=>fetchQuote(s, finnhubKey))),
       fetchMacroSnapshot().catch(() => null),
     ]);
     setQuotes(prev => {
       const map = { ...prev };
       results.forEach((r, i) => {
         if (!r) return;
-        const sym = WATCHLIST[i];
+        const sym = activeWatchlist[i];
         const existing = map[sym];
         if (r.isMock && existing && !existing.isMock) {
           // Preserve prior live quote, downgrade quality tag
@@ -840,7 +920,12 @@ export default function App() {
     if (macroSnap) setMacro(macroSnap);
     setLastRefresh(Date.now());
     if (!silent) setRefreshing(false);
-  }, [finnhubKey]);
+    // universe must be a dep: switching it changes activeWatchlist, and
+    // without the dep refreshAll would keep fetching the previous universe's
+    // tickers. activeWatchlist itself is derived from universe (always a new
+    // array ref per render) so adding it directly would rebind every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [finnhubKey, universe]);
 
   // Re-run (and reset the interval) whenever refreshAll changes, i.e. when the
   // finnhub key changes. Also re-fetch when the tab becomes visible again after
@@ -878,8 +963,18 @@ export default function App() {
   // feature just contributes zero — safe degradation.
   useEffect(() => {
     if (!finnhubKey) return;
-    getEarningsBatch(BACKTEST_SYMBOLS, finnhubKey).then(setEarningsMap).catch(() => {});
-  }, [finnhubKey]);
+    // Crypto has no earnings concept — don't waste 10 Finnhub calls per
+    // session on BTC-USD etc (they'd fail silently anyway). When universe
+    // is crypto, PEAD features stay at zero.
+    if (universe === "crypto") {
+      setEarningsMap({});
+      return;
+    }
+    getEarningsBatch(activeBacktestSymbols, finnhubKey).then(setEarningsMap).catch(() => {});
+    // Only refetch when finnhubKey or universe actually change — not on
+    // every render (activeBacktestSymbols is a new array reference each time).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [finnhubKey, universe]);
 
   useEffect(() => {
     if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight;
@@ -890,7 +985,8 @@ export default function App() {
     const modelCtx = {
       macro,
       calendar: calendarFeatures(),
-      pead: computePeadFeatures(earningsMap[selected]),
+      pead: universe === "crypto" ? null : computePeadFeatures(earningsMap[selected]),
+      universe,
     };
     const context = buildContext(quotes, selected, news, modelCtx);
     const directive = mode === "quick" ? QUICK_DIRECTIVE : DEEP_DIRECTIVE;
@@ -904,6 +1000,13 @@ export default function App() {
     const isSwing = simInterval === "1d";
     const selQForPreamble = quotes[selected];
     const dailyAtrEstimate = selQForPreamble?.atr ? selQForPreamble.atr * Math.sqrt(78) : null;
+    // Universe prefix tells Claude whether this is US equity analysis or
+    // crypto — the persona weighting downstream still uses the same five
+    // traders, but they should adapt their framing (e.g. 200MA concept
+    // works on both but "earnings" / "FOMC" don't apply to BTC).
+    const universePreamble = universe === "crypto"
+      ? `\n═══ ASSET UNIVERSE: CRYPTO ═══\n${selected} is a cryptocurrency traded 24/7. There is no earnings concept, no crisis-analogue library, no FOMC drift. The five-trader personas should apply their pattern-recognition frameworks (Livermore pivots, Jones macro, Dennis trend-following, Simons stat-divergences, Williams sentiment) but adapt them to crypto reality: the "200-day MA" IS the line of demarcation for BTC as it is for SPX; funding rates ARE the contemporary equivalent of COT positioning; whale accumulation on-chain IS analogous to smart-money commitment. Do NOT reference earnings, do NOT reference the equity VIX, do NOT cite corporate actions. DO reference: BTC dominance regime, funding rate extremes if visible, halving cycle context, and recent major on-chain moves if known.\n`
+      : "";
     const horizonPreamble = isSwing
       ? `\n═══ INTENDED HORIZON: SWING (1-5 DAYS) ═══
 Use the SWING level set from SUGGESTED LEVELS (2× daily-ATR stop, 6× daily-ATR target${dailyAtrEstimate ? ` — roughly $${(dailyAtrEstimate * 2).toFixed(2)} away for stop` : ""}). Tape reading focuses on DAILY structure — 50-day MA, recent daily swings, multi-day setups — NOT 5-minute chop. Entry timing can still be intraday ("wait for a pullback to VWAP this session") but the trade is multi-day. Do NOT quote intraday levels as the primary SL/TP.
@@ -925,7 +1028,7 @@ PERSONA WEIGHTING AT THIS HORIZON:
   TUDOR JONES — SECONDARY. Note the macro backdrop (Fed, dollar) but don't pretend this is his natural horizon — he'd hold multi-day. One line of macro context.
   DENNIS — SECONDARY. Turtles don't day-trade. If his rule applies it's because the daily breakout happens to coincide with today's session; otherwise note he'd pass.
 `;
-    const fullContent = `${context}${horizonPreamble}\n${directive}\n\nUSER: ${userText}`;
+    const fullContent = `${context}${universePreamble}${horizonPreamble}\n${directive}\n\nUSER: ${userText}`;
     const newHistory = [...chatHistory, { role:"user", content:fullContent }];
     setChatHistory(newHistory);
     setMessages(prev=>[...prev, { type:"user", text:userText }]);
@@ -971,7 +1074,7 @@ PERSONA WEIGHTING AT THIS HORIZON:
     if (thinking || Object.keys(quotes).length < 3) return;
     setThinking(true);
     setTab("chat");
-    const modelCtx = { macro, calendar: calendarFeatures(), earningsMap };
+    const modelCtx = { macro, calendar: calendarFeatures(), earningsMap, universe };
     const context = buildBestOpportunityContext(quotes, news, modelCtx);
     // Horizon preamble — same shape as sendToAI including persona weighting.
     // Best-opportunity scans are most at risk of getting horizon-wrong
@@ -1017,7 +1120,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
       // matching any watchlist symbol appearing early in the reply)
       const pickMatch = reply.match(/PICK:\s*([A-Z.]{2,6})/i);
       const symMatch = pickMatch || reply.match(/(?:picking|chosen?|trade on|go with)\s+([A-Z.]{2,6})/i);
-      const pickedSym = symMatch ? WATCHLIST.find(s => s === symMatch[1].toUpperCase()) : null;
+      const pickedSym = symMatch ? activeWatchlist.find(s => s === symMatch[1].toUpperCase()) : null;
       const logSym = pickedSym || selected;
       const q = quotes[logSym];
       const tradeData = parseTradeData(reply, q, logSym, modelCtx);
@@ -1085,8 +1188,8 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
   async function runSimulation() {
     if (simState.running) return;
     const expectedSyms = excludeHighVol
-      ? BACKTEST_SYMBOLS.filter(s => !HIGH_VOL_SYMBOLS.includes(s))
-      : BACKTEST_SYMBOLS;
+      ? activeBacktestSymbols.filter(s => !activeHighVolSymbols.includes(s))
+      : activeBacktestSymbols;
     setSimState({ running: true, phase: "starting", symbol: null, done: 0, total: expectedSyms.length });
     setSimResult(null);
     setTrainResult(null);
@@ -1106,8 +1209,8 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         ? Math.min(30, Math.max(5, Math.floor(simDaysAgo / 10)))
         : (simDaysAgo <= 7 ? 10 : simDaysAgo <= 30 ? 20 : 40);
       const symsForRun = excludeHighVol
-        ? BACKTEST_SYMBOLS.filter(s => !HIGH_VOL_SYMBOLS.includes(s))
-        : BACKTEST_SYMBOLS;
+        ? activeBacktestSymbols.filter(s => !activeHighVolSymbols.includes(s))
+        : activeBacktestSymbols;
       const res = await runBacktest(symsForRun, {
         interval: simInterval,
         daysAgo: simDaysAgo,
@@ -1126,8 +1229,8 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
       // range; second-most is all symbols failing to fetch.
       if (!res.trades.length) {
         const symbolsFetched = res.barsSource != null ? "yes" : "no";
-        const reason = res.errors?.length === BACKTEST_SYMBOLS.length
-          ? `All ${BACKTEST_SYMBOLS.length} symbols failed to fetch. Check Polygon rate limit or Yahoo proxy availability.`
+        const reason = res.errors?.length === activeBacktestSymbols.length
+          ? `All ${activeBacktestSymbols.length} symbols failed to fetch. Check rate limits / proxy availability.`
           : symbolsFetched === "no"
             ? "No bars were fetched. Check network / API keys."
             : `0 trades generated despite bars fetched OK. Likely the sample count (${samples}/symbol) doesn't fit the available entry range at ${simDaysAgo}d × ${maxHoldHours}${isDaily?"d":"h"} hold. Try a longer DAYS AGO or shorter MAX HOLD.`;
@@ -1185,8 +1288,8 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
           ? Math.min(30, Math.max(5, Math.floor(simDaysAgo / 10)))
           : (simDaysAgo <= 7 ? 10 : simDaysAgo <= 30 ? 20 : 40);
         const symsForRun = excludeHighVol
-        ? BACKTEST_SYMBOLS.filter(s => !HIGH_VOL_SYMBOLS.includes(s))
-        : BACKTEST_SYMBOLS;
+        ? activeBacktestSymbols.filter(s => !activeHighVolSymbols.includes(s))
+        : activeBacktestSymbols;
       const res = await runBacktest(symsForRun, {
           interval: simInterval,
           daysAgo: simDaysAgo,
@@ -1300,6 +1403,39 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
             levels card highlights the matching row, the AI analysis adapts
             its reasoning, and the position sizing uses the matching stop
             distance. One knob, everything aligned. */}
+        {/* Universe toggle — swaps the entire asset class. Switching auto-
+            adjusts the horizon default (crypto → daily) and the cost model
+            (crypto → 30bps), resets the selected symbol to the first of the
+            new watchlist, and disables equity-only features (PEAD, crisis
+            analogue, Buffett persona) for crypto. One knob propagates. */}
+        <button onClick={()=>{
+          const nextU = universe === "crypto" ? "equities" : "crypto";
+          setUniverse(nextU);
+          // Auto-select first symbol in new universe — otherwise the
+          // previously-selected ticker stays on-screen even when it's no
+          // longer in the live fetch loop.
+          const newList = watchlistFor(nextU);
+          if (!newList.includes(selected)) setSelected(newList[0]);
+          // Research-recommended defaults per universe:
+          //   crypto → daily horizon, 30 bps cost (research Tier A evidence)
+          //   equities → 5-min horizon, 15 bps cost (already-tuned default)
+          if (nextU === "crypto") {
+            setSimInterval("1d");
+            setCostBps(30);
+            if (simDaysAgo < 90) setSimDaysAgo(polygonKey ? 180 : 7);
+            if (maxHoldHours < 24) setMaxHoldHours(5);
+          } else {
+            setSimInterval("5m");
+            setCostBps(15);
+          }
+        }}
+          title="Swap asset universe. Crypto uses 24/7 markets, higher cost defaults (30 bps), daily horizon, and disables equity-only features (earnings drift, crisis analogue, Buffett). Equities: US+UK stocks + ETFs."
+          style={{background:universe === "crypto" ? "#1A140F" : "#0F1A0F",
+            border:`1px solid ${universe === "crypto" ? "#C97A2A" : "#2A6A4A"}`,
+            color:universe === "crypto" ? "#FFB07A" : "#7FD8A6",
+            fontFamily:"inherit",fontSize:9,padding:"3px 10px",cursor:"pointer",letterSpacing:2,fontWeight:700,marginRight:6}}>
+          UNIVERSE: {universe === "crypto" ? "CRYPTO" : "EQUITIES"}
+        </button>
         <button onClick={()=>setSimInterval(simInterval === "1d" ? "5m" : "1d")}
           title="Global horizon — switches the entire app between intraday (tight stops, short holds) and swing (wider stops, multi-day holds). Set here or in the SIM card's HORIZON dropdown; they share state."
           style={{background:simInterval === "1d" ? "#0F1F18" : "#0A0F14",
@@ -1314,7 +1450,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
           <div style={{width:6,height:6,borderRadius:"50%",
             background:refreshing?"#C9A84C":loadedCount>0?"#2ECC71":"#555",animation:"pulse 2s infinite"}}/>
           <span style={{fontSize:9,color:"#555",letterSpacing:1}}>
-            {lastRefresh?`${loadedCount}/${WATCHLIST.length} · ${new Date(lastRefresh).toLocaleTimeString()}`:"CONNECTING..."}
+            {lastRefresh?`${loadedCount}/${activeWatchlist.length} · ${new Date(lastRefresh).toLocaleTimeString()}`:"CONNECTING..."}
           </span>
           <button onClick={sendBestOpportunity} disabled={thinking||loadedCount<3}
             style={{background:thinking||loadedCount<3?"#1A1500":"#C9A84C",
@@ -1338,7 +1474,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
       <div style={{background:"#0C0C0C",borderBottom:"1px solid #1E1E1E",overflow:"hidden",height:24,flexShrink:0}}>
         <div style={{display:"flex",whiteSpace:"nowrap",height:"100%",alignItems:"center",
           animation:"ticker 35s linear infinite",fontSize:10,letterSpacing:"0.05em"}}>
-          {[...WATCHLIST,...WATCHLIST].map((sym,i)=>{
+          {[...activeWatchlist,...activeWatchlist].map((sym,i)=>{
             const q=quotes[sym]; const up=q?q.changePct>=0:true;
             return <span key={i} style={{marginRight:32,color:up?"#2ECC71":"#E74C3C",fontWeight:600}}>
               {up?"▲":"▼"} {sym} {q?`$${q.price?.toFixed(2)} (${q.changePct>=0?"+":""}${q.changePct?.toFixed(2)}%)`:"..."}
@@ -1351,9 +1487,9 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         {/* Watchlist */}
         <div style={{width:200,background:"#0C0C0C",borderRight:"1px solid #1A1A1A",overflowY:"auto",flexShrink:0}}>
           <div style={{padding:"8px 10px",fontSize:8,color:"#444",letterSpacing:2,borderBottom:"1px solid #1A1A1A"}}>
-            WATCHLIST · {loadedCount}/{WATCHLIST.length}
+            {universe === "crypto" ? "CRYPTO" : "EQUITIES"} · {loadedCount}/{activeWatchlist.length}
           </div>
-          {WATCHLIST.map(sym=>{
+          {activeWatchlist.map(sym=>{
             const q=quotes[sym]; const up=q?q.changePct>=0:null; const isSel=sym===selected;
             return (
               <div key={sym} onClick={()=>setSelected(sym)} style={{padding:"8px 10px",cursor:"pointer",
@@ -1448,13 +1584,21 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                     fontSize:11,letterSpacing:2,padding:"7px 12px",cursor:thinking?"not-allowed":"pointer"}}>
                   📊 IN-DEPTH
                 </button>
-                <button onClick={()=>sendToBuffett("")} disabled={thinking} title="Warren Buffett's separate, long-horizon take — NOT part of the BUY/SELL verdict"
-                  style={{
-                    background:thinking?"#1A1A1A":"#0D2A1F",color:thinking?"#444":"#7FD8A6",
-                    border:"1px solid #2A7A4F",fontFamily:"'Courier New',monospace",fontWeight:900,
-                    fontSize:11,letterSpacing:2,padding:"7px 12px",cursor:thinking?"not-allowed":"pointer"}}>
-                  🏛 BUFFETT
-                </button>
+                {/* Buffett called crypto "rat poison squared" and has never
+                    bought any. Rather than force-generate a fake valuation
+                    persona on crypto that would be incoherent with his public
+                    record, hide the button entirely in crypto mode. Phase 3b
+                    could replace with a value-investor-on-crypto persona if
+                    there's appetite. */}
+                {universe !== "crypto" && (
+                  <button onClick={()=>sendToBuffett("")} disabled={thinking} title="Warren Buffett's separate, long-horizon take — NOT part of the BUY/SELL verdict"
+                    style={{
+                      background:thinking?"#1A1A1A":"#0D2A1F",color:thinking?"#444":"#7FD8A6",
+                      border:"1px solid #2A7A4F",fontFamily:"'Courier New',monospace",fontWeight:900,
+                      fontSize:11,letterSpacing:2,padding:"7px 12px",cursor:thinking?"not-allowed":"pointer"}}>
+                    🏛 BUFFETT
+                  </button>
+                )}
               </div>
             </div>
           )}
@@ -1485,7 +1629,8 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
             const m = q ? scoreSetup(q, {
               macro,
               calendar: calendarFeatures(),
-              pead: computePeadFeatures(earningsMap[selected]),
+              pead: universe === "crypto" ? null : computePeadFeatures(earningsMap[selected]),
+              universe,
             }) : null;
             return (
               <div style={{flex:1,overflowY:"auto",padding:14,fontSize:11,color:"#888"}}>
@@ -1690,13 +1835,13 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                               onChange={e=>setExcludeHighVol(e.target.checked)}
                               style={{accentColor:"#E74C3C"}}/>
                             <span style={{fontSize:8,color:excludeHighVol?"#E74C3C":"#666",letterSpacing:1}}>
-                              EXCLUDE HIGH-VOL ({HIGH_VOL_SYMBOLS.join("/")})
+                              EXCLUDE HIGH-VOL ({activeHighVolSymbols.join("/")})
                             </span>
                           </label>
                         </div>
                       </div>
                       <div style={{fontSize:10,color:"#888",lineHeight:1.6,marginBottom:10}}>
-                        Fetches real {simInterval === "1d" ? "daily" : "5-min"} candles for {BACKTEST_SYMBOLS.length} US-session symbols (non-US skipped),
+                        Fetches real {simInterval === "1d" ? "daily" : "5-min"} candles for {activeBacktestSymbols.length} {universe === "crypto" ? "crypto pairs (24/7 markets)" : "US-session symbols (non-US skipped)"},
                         samples random entries per symbol, runs the current model verdict at each, then walks
                         forward bar-by-bar. <b style={{color:"#5AACDF"}}>Stop or target exits the trade IMMEDIATELY</b> on
                         the first bar that touches them — max-hold is only the <i>timeout</i> for trades that
