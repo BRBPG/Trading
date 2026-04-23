@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { generateMockQuote, generateLiveIndicators, computeIndicators } from "./mockData";
-import { scoreSetup, logDecision, reviewDecision, getPerformanceStats, getLog, adaptWeights, resetWeights, getCurrentWeights } from "./model";
+import { scoreSetup, logDecision, reviewDecision, getPerformanceStats, getLog, adaptWeights, resetWeights, getCurrentWeights, trainNN, resetNN, getNNInfo } from "./model";
+import { runBacktest } from "./backtest";
 import { calcADX, calcWilliamsR, calcStochastic, calcROC, calcZScore,
          calcCMF, calcMaxDrawdown, calcSharpe, calcBeta, engineerFeatures,
          fetchAllNews } from "./quant";
@@ -587,6 +588,8 @@ export default function App() {
   const [loggedMsgIds, setLoggedMsgIds] = useState(new Set());
   const [news, setNews] = useState([]);
   const [newsLoading, setNewsLoading] = useState(false);
+  const [simState, setSimState] = useState({ running: false, phase: null, symbol: null, done: 0, total: 0 });
+  const [simResult, setSimResult] = useState(null);
   const chatRef = useRef(null);
 
   // refreshAll MUST depend on finnhubKey — otherwise the closure captures the
@@ -792,6 +795,29 @@ export default function App() {
     setThinking(false);
   }
 
+  // ─── Simulate & train — runs the backtest, feeds NN training ───────────
+  async function runSimulation() {
+    if (simState.running) return;
+    setSimState({ running: true, phase: "starting", symbol: null, done: 0, total: WATCHLIST.length });
+    setSimResult(null);
+    try {
+      const res = await runBacktest(WATCHLIST, {
+        daysAgo: 7, holdHours: 3, samplesPerSymbol: 10,
+        onProgress: (p) => setSimState(prev => ({ ...prev, ...p, running: true })),
+      });
+      if (res.trades.length < 8) {
+        setSimResult({ error: `Only ${res.trades.length} labelled trades generated — need ≥8. Retry or reduce daysAgo.`, ...res });
+        setSimState({ running: false, phase: "done", done: 0, total: 0 });
+        return;
+      }
+      const training = trainNN(res.trades);
+      setSimResult({ ...res, training });
+    } catch (err) {
+      setSimResult({ error: err.message || String(err) });
+    }
+    setSimState({ running: false, phase: "done", done: 0, total: 0 });
+  }
+
   const selQ = quotes[selected];
   const marketUp = selQ ? selQ.changePct>=0 : true;
   const loadedCount = Object.keys(quotes).length;
@@ -976,34 +1002,138 @@ export default function App() {
                 {!m ? <div>No data</div> : (
                   <div style={{display:"flex",flexDirection:"column",gap:12}}>
                     <div style={{color:"#C9A84C",fontSize:13,fontWeight:900,letterSpacing:2}}>{selected} — MODEL READOUT</div>
-                    <div style={{background:"#111",border:"1px solid #1E1E1E",padding:12}}>
-                      <div style={{fontSize:9,color:"#555",letterSpacing:2,marginBottom:8}}>LOGISTIC REGRESSION</div>
-                      <div style={{fontSize:18,fontWeight:900,color:m.lrProb>58?"#2ECC71":m.lrProb<42?"#E74C3C":"#C9A84C"}}>
-                        {m.direction} — {m.lrProb}% bullish probability
+
+                    {/* ═══ COMPOSITE ═══ */}
+                    <div style={{background:"#0E1512",border:"1px solid #2A7A4F",padding:12}}>
+                      <div style={{fontSize:9,color:"#7FD8A6",letterSpacing:2,marginBottom:8}}>◆ COMPOSITE ENSEMBLE</div>
+                      <div style={{fontSize:20,fontWeight:900,color:m.compositeProb>58?"#2ECC71":m.compositeProb<42?"#E74C3C":"#C9A84C"}}>
+                        {m.direction} — {m.compositeProb}% bullish
                       </div>
-                      <div style={{marginTop:8,fontSize:10,color:"#666"}}>Confidence: {m.confidence}%</div>
+                      <div style={{marginTop:6,fontSize:10,color:"#888"}}>
+                        Confidence: <b style={{color:"#FFF"}}>{m.confidence}%</b>
+                        &nbsp;·&nbsp; Agreement: <b style={{color:m.agreement.count>=3?"#2ECC71":m.agreement.count===2?"#C9A84C":"#E74C3C"}}>{m.agreement.count}/3 models</b>
+                        &nbsp;·&nbsp; Weights: LR {(m.weights.lr*100).toFixed(0)}% · NN {(m.weights.nn*100).toFixed(0)}% · Tree {(m.weights.tree*100).toFixed(0)}%
+                      </div>
+                      <div style={{marginTop:8,width:"100%",height:8,background:"#0A0A0A",borderRadius:4,overflow:"hidden"}}>
+                        <div style={{width:`${m.compositeProb}%`,height:"100%",background:m.compositeProb>58?"#2ECC71":m.compositeProb<42?"#E74C3C":"#C9A84C"}}/>
+                      </div>
+                    </div>
+
+                    {/* ═══ LR ═══ */}
+                    <div style={{background:"#111",border:"1px solid #1E1E1E",padding:12}}>
+                      <div style={{fontSize:9,color:"#555",letterSpacing:2,marginBottom:8}}>LOGISTIC REGRESSION (1-layer)</div>
+                      <div style={{fontSize:18,fontWeight:900,color:m.lrProb>58?"#2ECC71":m.lrProb<42?"#E74C3C":"#C9A84C"}}>
+                        {m.lrProb}% bullish
+                      </div>
                       <div style={{marginTop:4,width:"100%",height:6,background:"#222",borderRadius:3}}>
                         <div style={{width:`${m.lrProb}%`,height:"100%",background:m.lrProb>58?"#2ECC71":m.lrProb<42?"#E74C3C":"#C9A84C",borderRadius:3}}/>
                       </div>
                     </div>
+
+                    {/* ═══ NN ═══ */}
                     <div style={{background:"#111",border:"1px solid #1E1E1E",padding:12}}>
-                      <div style={{fontSize:9,color:"#555",letterSpacing:2,marginBottom:8}}>DECISION TREE</div>
+                      <div style={{fontSize:9,color:"#555",letterSpacing:2,marginBottom:8}}>NEURAL NET (7→8→4→1, backprop)</div>
+                      {m.nnProb == null ? (
+                        <div style={{fontSize:11,color:"#666"}}>Untrained — run SIMULATE & TRAIN or 🧠 LEARN with ≥8 reviewed trades.</div>
+                      ) : (
+                        <>
+                          <div style={{fontSize:18,fontWeight:900,color:m.nnProb>58?"#2ECC71":m.nnProb<42?"#E74C3C":"#C9A84C"}}>
+                            {m.nnProb}% bullish
+                          </div>
+                          <div style={{marginTop:4,width:"100%",height:6,background:"#222",borderRadius:3}}>
+                            <div style={{width:`${m.nnProb}%`,height:"100%",background:m.nnProb>58?"#2ECC71":m.nnProb<42?"#E74C3C":"#C9A84C",borderRadius:3}}/>
+                          </div>
+                          <div style={{marginTop:6,fontSize:9,color:"#666"}}>
+                            Trained on {m.nnInfo.trainedOn} samples · {m.nnInfo.epochs} epochs total · final loss {m.nnInfo.finalLoss?.toFixed(4) ?? "?"}
+                          </div>
+                        </>
+                      )}
+                    </div>
+                    <div style={{background:"#111",border:"1px solid #1E1E1E",padding:12}}>
+                      <div style={{fontSize:9,color:"#555",letterSpacing:2,marginBottom:8}}>DECISION TREE (rule-based, 7-factor scan)</div>
                       <div style={{fontSize:14,fontWeight:700,color:
                         m.treeSignal==="STRONG_BUY"?"#2ECC71":
                         m.treeSignal==="BUY"?"#2ECC71":
                         m.treeSignal==="STRONG_SELL"?"#E74C3C":
                         m.treeSignal==="SELL"?"#E74C3C":"#C9A84C"
-                      }}>{m.treeSignal}</div>
+                      }}>{m.treeSignal} <span style={{fontSize:10,color:"#666",marginLeft:6}}>strength {((m.treeStrength||0)*100).toFixed(0)}%</span></div>
                       <div style={{fontSize:10,color:"#666",marginTop:4}}>{m.treeReason}</div>
                     </div>
                     <div style={{background:"#111",border:"1px solid #1E1E1E",padding:12}}>
-                      <div style={{fontSize:9,color:"#555",letterSpacing:2,marginBottom:8}}>NEAREST HISTORICAL CRISIS ANALOGUE</div>
-                      <div style={{fontSize:13,fontWeight:700,color:"#C9A84C"}}>{m.crisis?.name}</div>
+                      <div style={{fontSize:9,color:"#555",letterSpacing:2,marginBottom:8}}>NEAREST HISTORICAL ANALOGUE (of 55 regimes)</div>
+                      <div style={{fontSize:13,fontWeight:700,color:"#C9A84C"}}>{m.crisis?.name}
+                        {m.crisis?.regime && <span style={{fontSize:9,color:"#666",marginLeft:8,textTransform:"uppercase",letterSpacing:1}}>[{m.crisis.regime}]</span>}
+                      </div>
                       <div style={{fontSize:10,color:"#888",marginTop:4}}>{m.crisis?.note}</div>
                       <div style={{marginTop:8,fontSize:10,color:"#555"}}>Similarity: {m.crisis?(m.crisis.similarity*100).toFixed(0):0}%</div>
                       <div style={{marginTop:4,width:"100%",height:4,background:"#222",borderRadius:2}}>
                         <div style={{width:`${m.crisis?(m.crisis.similarity*100):0}%`,height:"100%",background:"#C9A84C",borderRadius:2}}/>
                       </div>
+                    </div>
+
+                    {/* ═══ SIMULATE & TRAIN ═══ */}
+                    <div style={{background:"#0A0F14",border:"1px solid #2A6A9A",padding:12}}>
+                      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                        <div style={{fontSize:9,color:"#5AACDF",letterSpacing:2}}>🎲 SIMULATE & TRAIN (backprop on synthetic trades)</div>
+                        {(() => { const info = getNNInfo(); return info.trainedOn > 0 && (
+                          <button onClick={()=>{resetNN();setSimResult(null);}}
+                            style={{background:"#1A0808",border:"1px solid #4A1A1A",color:"#E74C3C",fontSize:8,padding:"3px 8px",cursor:"pointer",fontFamily:"inherit",letterSpacing:1}}>
+                            RESET NN
+                          </button>
+                        ); })()}
+                      </div>
+                      <div style={{fontSize:10,color:"#888",lineHeight:1.6,marginBottom:10}}>
+                        Fetches real 5-minute candles for all {WATCHLIST.length} watchlist symbols over the past 7 days,
+                        samples ~10 random entry points per symbol, runs the current model's verdict at each,
+                        looks forward 3 hours of actual bars to label WIN/LOSS, then backprops the NN on the
+                        labelled set (L2 regularisation, time-decay weighting, early stopping).
+                      </div>
+                      <button onClick={runSimulation} disabled={simState.running}
+                        style={{background:simState.running?"#111":"#0A1A2A",
+                          border:`1px solid ${simState.running?"#2A2A2A":"#2A6A9A"}`,
+                          color:simState.running?"#666":"#5AACDF",
+                          fontSize:11,padding:"8px 14px",cursor:simState.running?"not-allowed":"pointer",
+                          fontFamily:"inherit",letterSpacing:2,fontWeight:700,width:"100%"}}>
+                        {simState.running
+                          ? `${simState.phase || "running"}... ${simState.symbol ? `[${simState.symbol}]` : ""} ${simState.total ? `${simState.done}/${simState.total}` : ""}`
+                          : "▶ RUN SIMULATION & BACKPROP"}
+                      </button>
+
+                      {simResult && !simResult.error && (
+                        <div style={{marginTop:10,fontSize:10,color:"#888",lineHeight:1.7}}>
+                          <div>✓ Generated <b style={{color:"#FFF"}}>{simResult.trades.length}</b> labelled trades
+                            ({simResult.wins}W / {simResult.losses}L = <b style={{color:simResult.wins>simResult.losses?"#2ECC71":"#E74C3C"}}>
+                            {(simResult.wins/(simResult.trades.length||1)*100).toFixed(0)}%</b> sim win rate)</div>
+                          {simResult.training && (
+                            <>
+                              <div>✓ NN trained for <b style={{color:"#FFF"}}>{simResult.training.epochs}</b> epochs
+                                (final loss <b style={{color:"#FFF"}}>{simResult.training.loss?.toFixed(4)}</b>).
+                                Stopped: {simResult.training.reason}</div>
+                              {simResult.training.history?.length > 0 && (
+                                <svg width="100%" height="40" style={{marginTop:6,background:"#080808"}} viewBox="0 0 200 40" preserveAspectRatio="none">
+                                  <polyline
+                                    points={simResult.training.history.map((l,i,a) => {
+                                      const maxL = Math.max(...a);
+                                      const minL = Math.min(...a);
+                                      const x = (i/(a.length-1))*200;
+                                      const y = 40 - ((l-minL)/((maxL-minL)||1))*40;
+                                      return `${x},${y}`;
+                                    }).join(" ")}
+                                    fill="none" stroke="#5AACDF" strokeWidth="1" />
+                                </svg>
+                              )}
+                            </>
+                          )}
+                          {simResult.errors?.length > 0 && (
+                            <div style={{color:"#C9A84C",marginTop:4}}>
+                              ⚠ {simResult.errors.length} symbol(s) failed to fetch: {simResult.errors.map(e=>e.symbol).join(", ")}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      {simResult?.error && (
+                        <div style={{marginTop:10,fontSize:10,color:"#E74C3C"}}>⚠ {simResult.error}</div>
+                      )}
                     </div>
                     <div style={{background:"#111",border:"1px solid #1E1E1E",padding:12}}>
                       <div style={{fontSize:9,color:"#555",letterSpacing:2,marginBottom:8}}>SUGGESTED LEVELS (1.5 ATR stop, 3:1 R/R)</div>
