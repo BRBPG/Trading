@@ -884,15 +884,37 @@ export default function App() {
     };
     const context = buildContext(quotes, selected, news, modelCtx);
     const directive = mode === "quick" ? QUICK_DIRECTIVE : DEEP_DIRECTIVE;
-    // Horizon preamble tells Claude the intended hold period and which
-    // SUGGESTED LEVELS row applies. Without this the model has been giving
-    // intraday-calibrated entries/stops even when user is trading 1-5d.
+    // Horizon preamble tells Claude the intended hold period, which
+    // SUGGESTED LEVELS row applies, AND which of the five traders are
+    // most historically relevant to this horizon. Without this the model
+    // was forcing every persona into intraday scalping, which misuses
+    // Livermore/Jones/Dennis (all primarily swing/position traders in
+    // their actual careers) and makes Williams (a daytrader) the de-facto
+    // voice. Horizon-aware weighting fixes this.
     const isSwing = simInterval === "1d";
     const selQForPreamble = quotes[selected];
     const dailyAtrEstimate = selQForPreamble?.atr ? selQForPreamble.atr * Math.sqrt(78) : null;
     const horizonPreamble = isSwing
-      ? `\n═══ INTENDED HORIZON: SWING (1-5 DAYS) ═══\nUse the SWING level set from SUGGESTED LEVELS (2× daily-ATR stop, 6× daily-ATR target${dailyAtrEstimate ? ` — roughly $${(dailyAtrEstimate * 2).toFixed(2)} away for stop` : ""}). Tape reading should focus on DAILY structure — 50-day MA, recent daily swings, multi-day setups — not 5-minute chop. Entry timing can still be intraday ("wait for a pullback to VWAP this session") but the trade itself is multi-day. Do NOT quote intraday levels as the primary SL/TP.\n`
-      : `\n═══ INTENDED HORIZON: INTRADAY (1-3 HOURS) ═══\nUse the INTRADAY level set from SUGGESTED LEVELS (1.5× 5-min ATR stop). Tape reading focuses on this session's structure — VWAP, day's range, opening auction, volume bursts. The trade closes before the bell.\n`;
+      ? `\n═══ INTENDED HORIZON: SWING (1-5 DAYS) ═══
+Use the SWING level set from SUGGESTED LEVELS (2× daily-ATR stop, 6× daily-ATR target${dailyAtrEstimate ? ` — roughly $${(dailyAtrEstimate * 2).toFixed(2)} away for stop` : ""}). Tape reading focuses on DAILY structure — 50-day MA, recent daily swings, multi-day setups — NOT 5-minute chop. Entry timing can still be intraday ("wait for a pullback to VWAP this session") but the trade is multi-day. Do NOT quote intraday levels as the primary SL/TP.
+
+PERSONA WEIGHTING AT THIS HORIZON:
+  LIVERMORE — DOMINANT. He held shorts for weeks in 1929 ("It was never my thinking, it was my sitting"). Speak to his real style: pivot points on daily charts, position building into confirmed breakouts, riding trends.
+  TUDOR JONES — DOMINANT. Macro swing trader. 200-day MA is his daily-chart line of demarcation. 5:1 R/R works on multi-day holds. Speak to daily structure + macro.
+  DENNIS — DOMINANT. Turtles were 20-day breakout traders holding weeks-to-months. Swing is his native horizon. Speak to daily breakouts, ATR-based sizing, pyramiding.
+  SIMONS — SECONDARY. Adaptable. Speak to statistical divergences at the daily scale.
+  WILLIAMS — SECONDARY. A daytrader by specialty. Compress his short-term ideas to "is the crowd wrong at this daily inflection?"
+`
+      : `\n═══ INTENDED HORIZON: INTRADAY (1-3 HOURS) ═══
+Use the INTRADAY level set from SUGGESTED LEVELS (1.5× 5-min ATR stop). Tape reading focuses on this session's structure — VWAP, day's range, opening auction, volume bursts. The trade closes before the bell.
+
+PERSONA WEIGHTING AT THIS HORIZON:
+  WILLIAMS — DOMINANT. World Cup daytrader. His %R, volume exhaustion, and COT signals are intraday-native. Speak confidently.
+  SIMONS — DOMINANT. Short-horizon statistical arbitrage. Speak to divergences inside this session.
+  LIVERMORE — SECONDARY. His pivot-point concept works intraday but compress to session levels, not multi-week. Don't pretend he's a scalper.
+  TUDOR JONES — SECONDARY. Note the macro backdrop (Fed, dollar) but don't pretend this is his natural horizon — he'd hold multi-day. One line of macro context.
+  DENNIS — SECONDARY. Turtles don't day-trade. If his rule applies it's because the daily breakout happens to coincide with today's session; otherwise note he'd pass.
+`;
     const fullContent = `${context}${horizonPreamble}\n${directive}\n\nUSER: ${userText}`;
     const newHistory = [...chatHistory, { role:"user", content:fullContent }];
     setChatHistory(newHistory);
@@ -941,13 +963,20 @@ export default function App() {
     setTab("chat");
     const modelCtx = { macro, calendar: calendarFeatures(), earningsMap };
     const context = buildBestOpportunityContext(quotes, news, modelCtx);
-    // Horizon preamble — same as sendToAI. Best-opportunity scans are more
-    // likely to get horizon-wrong because the user isn't picking a specific
-    // symbol themselves, so being explicit matters even more here.
+    // Horizon preamble — same shape as sendToAI including persona weighting.
+    // Best-opportunity scans are most at risk of getting horizon-wrong
+    // because the user isn't picking the symbol, so explicit guidance
+    // matters even more.
     const isSwing = simInterval === "1d";
     const horizonPreamble = isSwing
-      ? `\n═══ INTENDED HORIZON: SWING (1-5 DAYS) ═══\nRank and pick for a 1-5 day hold. Use SWING levels (2× daily-ATR stop, 6× daily-ATR target) for the FINAL VERDICT's SL/TP. Reject setups whose best edge is intraday-only. Favour setups with clear daily-chart structure and multi-day catalyst potential.\n`
-      : `\n═══ INTENDED HORIZON: INTRADAY (1-3 HOURS) ═══\nRank and pick for a 1-3 hour hold. Use INTRADAY levels (1.5× 5-min ATR stop) for SL/TP. Trade closes before bell. Favour setups with clear session-scale structure and concrete intraday catalysts.\n`;
+      ? `\n═══ INTENDED HORIZON: SWING (1-5 DAYS) ═══
+Rank and pick for a 1-5 day hold. Use SWING levels (2× daily-ATR stop, 6× daily-ATR target) for the FINAL VERDICT's SL/TP. Reject setups whose best edge is intraday-only.
+Persona weighting: LIVERMORE / TUDOR JONES / DENNIS are DOMINANT (all historically swing/position traders). SIMONS / WILLIAMS are SECONDARY. Do NOT pretend Dennis day-trades or Williams holds for weeks.
+`
+      : `\n═══ INTENDED HORIZON: INTRADAY (1-3 HOURS) ═══
+Rank and pick for a 1-3 hour hold. Use INTRADAY levels (1.5× 5-min ATR stop). Trade closes before bell.
+Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE / TUDOR JONES / DENNIS are SECONDARY — compress their multi-day thinking to session-scale observations, don't force them into scalp framings.
+`;
     setMessages(prev=>[...prev,{type:"user",text:"⚡ BEST OPPORTUNITY SCAN — rank all stocks and pick ONE trade now."}]);
     const newHistory = [...chatHistory, { role:"user", content: context + horizonPreamble }];
     setChatHistory(newHistory);
