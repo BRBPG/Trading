@@ -30,6 +30,23 @@ const FH_METRIC = (sym, key) => `https://finnhub.io/api/v1/stock/metric?symbol=$
 //   - LSE (TW.L = Taylor Wimpey, UK housebuilder) — routed through Yahoo
 const WATCHLIST = ["SPY","QQQ","AAPL","MSFT","AMZN","NVDA","AMD","TSM","TSLA","IONQ","RGTI","UAL","USO","GLD","TW.L"];
 
+// Subset of the watchlist fed into the backtest / sim / training pipeline.
+// Non-US listings (anything with a dot-suffix, currently just TW.L) are
+// deliberately excluded because:
+//   1. Their session hours don't align with US-session macro features.
+//     VIX, SPY, TNX, DXY all publish US-hours timestamps; TW.L trades
+//     8am-4:30pm GMT. The macro.at(t) lookup for a TW.L bar timestamp
+//     would return VIX from 3am-11:30am ET (pre-open for most of it),
+//     producing spurious cross-asset inputs.
+//   2. Currency mismatch — TW.L is quoted in GBX (pence), the cost model
+//     assumes USD-like scale for the 15bps round-trip default.
+//   3. The user explicitly added TW.L for live reference viewing (their
+//     father's interest), not for systematic trading.
+// The live dashboard still fetches, displays, and allows manual ANALYZE
+// on TW.L via the regular WATCHLIST iteration — only the backtest loop
+// skips it.
+const BACKTEST_SYMBOLS = WATCHLIST.filter(s => !s.includes("."));
+
 // ─── Market-session detection (pure, client-side) ───────────────────────────
 // US stocks:   premarket 04:00-09:30 ET, open 09:30-16:00 ET, after 16:00-20:00 ET
 // LSE (.L):    premarket 07:00-08:00 UK, open 08:00-16:30 UK, after 16:30-17:15 UK
@@ -973,11 +990,11 @@ export default function App() {
   // (c) train repeatedly on the same simulated set if you like.
   async function runSimulation() {
     if (simState.running) return;
-    setSimState({ running: true, phase: "starting", symbol: null, done: 0, total: WATCHLIST.length });
+    setSimState({ running: true, phase: "starting", symbol: null, done: 0, total: BACKTEST_SYMBOLS.length });
     setSimResult(null);
     setTrainResult(null);
     try {
-      const res = await runBacktest(WATCHLIST, {
+      const res = await runBacktest(BACKTEST_SYMBOLS, {
         daysAgo: simDaysAgo,
         holdHours: maxHoldHours,    // max-hold = timeout; stop/target still exit early
         samplesPerSymbol: simDaysAgo <= 7 ? 10 : simDaysAgo <= 30 ? 20 : 40,
@@ -1365,7 +1382,7 @@ export default function App() {
                         </div>
                       </div>
                       <div style={{fontSize:10,color:"#888",lineHeight:1.6,marginBottom:10}}>
-                        Fetches real 5-min candles for all {WATCHLIST.length} watchlist symbols over the past 7 days,
+                        Fetches real 5-min candles for {BACKTEST_SYMBOLS.length} US-session watchlist symbols (non-US listings like TW.L skipped — session hours don't align with US macro features),
                         samples ~10 random entries per symbol, runs the current model verdict at each, then walks
                         forward bar-by-bar. <b style={{color:"#5AACDF"}}>Stop or target exits the trade IMMEDIATELY</b> on
                         the first bar that touches them — the max-hold above is only the <i>timeout</i> for trades that
