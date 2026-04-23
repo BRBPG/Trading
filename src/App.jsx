@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { generateMockQuote, generateLiveIndicators, computeIndicators } from "./mockData";
-import { scoreSetup, logDecision, reviewDecision, getPerformanceStats, getLog, adaptWeights, resetWeights, getCurrentWeights, trainNN, resetNN, getNNInfo } from "./model";
+import { scoreSetup, logDecision, reviewDecision, getPerformanceStats, getLog, adaptWeights, resetWeights, getCurrentWeights, trainNNFromLog, trainNNFromSim, resetNN, getNNInfo } from "./model";
+import { computeSimMetrics, summariseEdge } from "./simMetrics";
 import { runBacktest } from "./backtest";
 import { calcADX, calcWilliamsR, calcStochastic, calcROC, calcZScore,
          calcCMF, calcMaxDrawdown, calcSharpe, calcBeta, engineerFeatures,
@@ -591,6 +592,12 @@ export default function App() {
   const [newsLoading, setNewsLoading] = useState(false);
   const [simState, setSimState] = useState({ running: false, phase: null, symbol: null, done: 0, total: 0 });
   const [simResult, setSimResult] = useState(null);
+  // Max-hold (timeout) for the simulator. Stop and target still exit early
+  // on the first bar that touches them — this only governs how long the trade
+  // is held when NEITHER stop nor target has been hit.
+  const [maxHoldHours, setMaxHoldHours] = useState(3);
+  const [trainResult, setTrainResult] = useState(null);
+  const [training, setTraining] = useState(false);
   const chatRef = useRef(null);
   const importInputRef = useRef(null);
 
@@ -823,26 +830,47 @@ export default function App() {
   }
 
   // ─── Simulate & train — runs the backtest, feeds NN training ───────────
+  // ─── Simulate ONLY — produce labelled trades + metrics, no training ───────
+  // Splitting this from training (per the user's diagnosis) means you can
+  // (a) inspect P&L / profit factor / equity curve before deciding to train,
+  // (b) re-run sims at different timeouts without retraining each time,
+  // (c) train repeatedly on the same simulated set if you like.
   async function runSimulation() {
     if (simState.running) return;
     setSimState({ running: true, phase: "starting", symbol: null, done: 0, total: WATCHLIST.length });
     setSimResult(null);
+    setTrainResult(null);
     try {
       const res = await runBacktest(WATCHLIST, {
-        daysAgo: 7, holdHours: 3, samplesPerSymbol: 10,
+        daysAgo: 7,
+        holdHours: maxHoldHours,    // max-hold = timeout; stop/target still exit early
+        samplesPerSymbol: 10,
         onProgress: (p) => setSimState(prev => ({ ...prev, ...p, running: true })),
       });
-      if (res.trades.length < 8) {
-        setSimResult({ error: `Only ${res.trades.length} labelled trades generated — need ≥8. Retry or reduce daysAgo.`, ...res });
-        setSimState({ running: false, phase: "done", done: 0, total: 0 });
-        return;
-      }
-      const training = trainNN(res.trades);
-      setSimResult({ ...res, training });
+      const metrics = computeSimMetrics(res.trades);
+      setSimResult({ ...res, metrics, holdHours: maxHoldHours });
     } catch (err) {
       setSimResult({ error: err.message || String(err) });
     }
     setSimState({ running: false, phase: "done", done: 0, total: 0 });
+  }
+
+  // ─── Train NN on the most recent sim batch ────────────────────────────────
+  function trainOnSim() {
+    if (training || !simResult?.trades?.length) return;
+    setTraining(true);
+    setTrainResult(null);
+    // Defer to next tick so the "training..." UI state can paint first —
+    // trainNNFromSim runs synchronously and would otherwise lock the UI.
+    setTimeout(() => {
+      try {
+        const out = trainNNFromSim(simResult.trades);
+        setTrainResult(out);
+      } catch (err) {
+        setTrainResult({ error: err.message || String(err) });
+      }
+      setTraining(false);
+    }, 50);
   }
 
   const selQ = quotes[selected];
@@ -1098,22 +1126,28 @@ export default function App() {
                       </div>
                     </div>
 
-                    {/* ═══ SIMULATE & TRAIN ═══ */}
+                    {/* ═══ SIMULATE ═══ (data + metrics, no training) */}
                     <div style={{background:"#0A0F14",border:"1px solid #2A6A9A",padding:12}}>
-                      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
-                        <div style={{fontSize:9,color:"#5AACDF",letterSpacing:2}}>🎲 SIMULATE & TRAIN (backprop on synthetic trades)</div>
-                        {(() => { const info = getNNInfo(); return info.trainedOn > 0 && (
-                          <button onClick={()=>{resetNN();setSimResult(null);}}
-                            style={{background:"#1A0808",border:"1px solid #4A1A1A",color:"#E74C3C",fontSize:8,padding:"3px 8px",cursor:"pointer",fontFamily:"inherit",letterSpacing:1}}>
-                            RESET NN
-                          </button>
-                        ); })()}
+                      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8,flexWrap:"wrap",gap:6}}>
+                        <div style={{fontSize:9,color:"#5AACDF",letterSpacing:2}}>🎲 SIMULATE (real candles → labelled trades)</div>
+                        <div style={{display:"flex",alignItems:"center",gap:6}}>
+                          <span style={{fontSize:8,color:"#666",letterSpacing:1}}>MAX HOLD (timeout)</span>
+                          <select value={maxHoldHours} onChange={e=>setMaxHoldHours(Number(e.target.value))}
+                            disabled={simState.running}
+                            style={{background:"#080808",border:"1px solid #2A2A2A",color:"#5AACDF",fontFamily:"inherit",fontSize:9,padding:"2px 6px"}}>
+                            <option value={1}>1h</option>
+                            <option value={3}>3h (default)</option>
+                            <option value={6}>6h</option>
+                            <option value={24}>1d</option>
+                          </select>
+                        </div>
                       </div>
                       <div style={{fontSize:10,color:"#888",lineHeight:1.6,marginBottom:10}}>
-                        Fetches real 5-minute candles for all {WATCHLIST.length} watchlist symbols over the past 7 days,
-                        samples ~10 random entry points per symbol, runs the current model's verdict at each,
-                        looks forward 3 hours of actual bars to label WIN/LOSS, then backprops the NN on the
-                        labelled set (L2 regularisation, time-decay weighting, early stopping).
+                        Fetches real 5-min candles for all {WATCHLIST.length} watchlist symbols over the past 7 days,
+                        samples ~10 random entries per symbol, runs the current model verdict at each, then walks
+                        forward bar-by-bar. <b style={{color:"#5AACDF"}}>Stop or target exits the trade IMMEDIATELY</b> on
+                        the first bar that touches them — the max-hold above is only the <i>timeout</i> for trades that
+                        hit neither.
                       </div>
                       <button onClick={runSimulation} disabled={simState.running}
                         style={{background:simState.running?"#111":"#0A1A2A",
@@ -1123,43 +1157,161 @@ export default function App() {
                           fontFamily:"inherit",letterSpacing:2,fontWeight:700,width:"100%"}}>
                         {simState.running
                           ? `${simState.phase || "running"}... ${simState.symbol ? `[${simState.symbol}]` : ""} ${simState.total ? `${simState.done}/${simState.total}` : ""}`
-                          : "▶ RUN SIMULATION & BACKPROP"}
+                          : "▶ RUN SIMULATION"}
                       </button>
 
-                      {simResult && !simResult.error && (
-                        <div style={{marginTop:10,fontSize:10,color:"#888",lineHeight:1.7}}>
-                          <div>✓ Generated <b style={{color:"#FFF"}}>{simResult.trades.length}</b> labelled trades
-                            ({simResult.wins}W / {simResult.losses}L = <b style={{color:simResult.wins>simResult.losses?"#2ECC71":"#E74C3C"}}>
-                            {(simResult.wins/(simResult.trades.length||1)*100).toFixed(0)}%</b> sim win rate)</div>
-                          {simResult.training && (
-                            <>
-                              <div>✓ NN trained for <b style={{color:"#FFF"}}>{simResult.training.epochs}</b> epochs
-                                (final loss <b style={{color:"#FFF"}}>{simResult.training.loss?.toFixed(4)}</b>).
-                                Stopped: {simResult.training.reason}</div>
-                              {simResult.training.history?.length > 0 && (
-                                <svg width="100%" height="40" style={{marginTop:6,background:"#080808"}} viewBox="0 0 200 40" preserveAspectRatio="none">
-                                  <polyline
-                                    points={simResult.training.history.map((l,i,a) => {
-                                      const maxL = Math.max(...a);
-                                      const minL = Math.min(...a);
-                                      const x = (i/(a.length-1))*200;
-                                      const y = 40 - ((l-minL)/((maxL-minL)||1))*40;
-                                      return `${x},${y}`;
-                                    }).join(" ")}
-                                    fill="none" stroke="#5AACDF" strokeWidth="1" />
-                                </svg>
-                              )}
-                            </>
-                          )}
-                          {simResult.errors?.length > 0 && (
-                            <div style={{color:"#C9A84C",marginTop:4}}>
-                              ⚠ {simResult.errors.length} symbol(s) failed to fetch: {simResult.errors.map(e=>e.symbol).join(", ")}
+                      {simResult?.error && (
+                        <div style={{marginTop:10,fontSize:10,color:"#E74C3C"}}>⚠ {simResult.error}</div>
+                      )}
+
+                      {simResult && !simResult.error && simResult.metrics && (() => {
+                        const M = simResult.metrics;
+                        const edge = summariseEdge(M);
+                        const exitTotal = M.exitReasons.stopHits + M.exitReasons.targetHits + M.exitReasons.timedOut;
+                        return (
+                          <div style={{marginTop:12}}>
+                            {/* Edge headline */}
+                            <div style={{padding:"8px 10px",background:"#080808",border:`1px solid ${edge.color}55`,borderLeft:`3px solid ${edge.color}`,marginBottom:10}}>
+                              <div style={{fontSize:9,color:"#555",letterSpacing:2}}>EDGE</div>
+                              <div style={{fontSize:13,color:edge.color,fontWeight:900,marginTop:2}}>{edge.label}</div>
+                              <div style={{fontSize:9,color:"#666",marginTop:2}}>
+                                {M.n} trades · {(M.winRate*100).toFixed(0)}% wins · max-hold {simResult.holdHours}h
+                              </div>
                             </div>
+
+                            {/* P&L grid */}
+                            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6,marginBottom:10}}>
+                              {[
+                                ["TOTAL P&L",     `${M.totalPnl>=0?"+":""}${M.totalPnl.toFixed(2)}%`, M.totalPnl>=0?"#2ECC71":"#E74C3C"],
+                                ["PROFIT FACTOR", isFinite(M.profitFactor)?M.profitFactor.toFixed(2):"∞",  M.profitFactor>=1.5?"#2ECC71":M.profitFactor>=1?"#C9A84C":"#E74C3C"],
+                                ["EXPECTANCY",    `${M.expectancy>=0?"+":""}${M.expectancy.toFixed(3)}%/trade`, M.expectancy>=0?"#2ECC71":"#E74C3C"],
+                                ["AVG WIN",       `+${M.avgWin.toFixed(2)}%`, "#2ECC71"],
+                                ["AVG LOSS",      `−${M.avgLoss.toFixed(2)}%`, "#E74C3C"],
+                                ["REALISED R:R",  `${M.realisedRR.toFixed(2)}:1`, M.realisedRR>=2?"#2ECC71":M.realisedRR>=1?"#C9A84C":"#E74C3C"],
+                                ["SHARPE (per-trade)", M.sharpe.toFixed(2), M.sharpe>=0.3?"#2ECC71":M.sharpe>=0?"#C9A84C":"#E74C3C"],
+                                ["MAX DRAWDOWN",  `−${M.maxDD.toFixed(2)}%`, M.maxDD<5?"#2ECC71":M.maxDD<15?"#C9A84C":"#E74C3C"],
+                                ["MAX CONSEC LOSSES", `${M.maxConsLoss}`, M.maxConsLoss<=4?"#888":M.maxConsLoss<=8?"#C9A84C":"#E74C3C"],
+                              ].map(([k,v,c])=>(
+                                <div key={k} style={{padding:"6px 8px",background:"#080808",border:"1px solid #1A1A1A"}}>
+                                  <div style={{fontSize:8,color:"#555",letterSpacing:1}}>{k}</div>
+                                  <div style={{fontSize:12,color:c,fontWeight:700,marginTop:2}}>{v}</div>
+                                </div>
+                              ))}
+                            </div>
+
+                            {/* Equity curve */}
+                            {M.equity.length > 1 && (
+                              <div style={{padding:"8px 10px",background:"#080808",border:"1px solid #1A1A1A",marginBottom:10}}>
+                                <div style={{fontSize:9,color:"#555",letterSpacing:2,marginBottom:4}}>EQUITY CURVE (cumulative %, in trade order)</div>
+                                <svg width="100%" height="50" viewBox="0 0 200 50" preserveAspectRatio="none">
+                                  {(() => {
+                                    const a = M.equity;
+                                    const min = Math.min(...a, 0);
+                                    const max = Math.max(...a, 0);
+                                    const rng = (max-min)||1;
+                                    const pts = a.map((v,i)=>`${(i/(a.length-1))*200},${50-((v-min)/rng)*50}`).join(" ");
+                                    const zeroY = 50-((0-min)/rng)*50;
+                                    return <>
+                                      <line x1="0" y1={zeroY} x2="200" y2={zeroY} stroke="#333" strokeDasharray="2,2"/>
+                                      <polyline points={pts} fill="none"
+                                        stroke={a[a.length-1]>=0?"#2ECC71":"#E74C3C"} strokeWidth="1.2"/>
+                                    </>;
+                                  })()}
+                                </svg>
+                              </div>
+                            )}
+
+                            {/* Exit reason breakdown */}
+                            <div style={{padding:"8px 10px",background:"#080808",border:"1px solid #1A1A1A",marginBottom:10,fontSize:10,color:"#888"}}>
+                              <div style={{fontSize:9,color:"#555",letterSpacing:2,marginBottom:4}}>EXIT REASONS</div>
+                              <div style={{display:"flex",gap:14,flexWrap:"wrap"}}>
+                                <span>🎯 Target: <b style={{color:"#2ECC71"}}>{M.exitReasons.targetHits}</b> ({((M.exitReasons.targetHits/exitTotal)*100).toFixed(0)}%)</span>
+                                <span>🛑 Stop: <b style={{color:"#E74C3C"}}>{M.exitReasons.stopHits}</b> ({((M.exitReasons.stopHits/exitTotal)*100).toFixed(0)}%)</span>
+                                <span>⏱ Timed out: <b style={{color:"#C9A84C"}}>{M.exitReasons.timedOut}</b> ({((M.exitReasons.timedOut/exitTotal)*100).toFixed(0)}%)</span>
+                              </div>
+                            </div>
+
+                            {/* Per-symbol breakdown — top 3 best, top 3 worst */}
+                            {M.symbolRows.length > 0 && (
+                              <div style={{padding:"8px 10px",background:"#080808",border:"1px solid #1A1A1A",marginBottom:10}}>
+                                <div style={{fontSize:9,color:"#555",letterSpacing:2,marginBottom:6}}>PER-SYMBOL P&L (best → worst)</div>
+                                {M.symbolRows.map(s=>(
+                                  <div key={s.symbol} style={{display:"flex",justifyContent:"space-between",fontSize:10,padding:"2px 0",borderBottom:"1px solid #111"}}>
+                                    <span style={{color:"#CCC",letterSpacing:1,minWidth:60}}>{s.symbol}</span>
+                                    <span style={{color:"#666"}}>{s.n} trades</span>
+                                    <span style={{color:"#888"}}>{(s.winRate*100).toFixed(0)}% wins</span>
+                                    <span style={{color:s.pnl>=0?"#2ECC71":"#E74C3C",fontWeight:700,minWidth:60,textAlign:"right"}}>
+                                      {s.pnl>=0?"+":""}{s.pnl.toFixed(2)}%
+                                    </span>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+
+                            {simResult.errors?.length > 0 && (
+                              <div style={{color:"#C9A84C",fontSize:9,marginTop:4}}>
+                                ⚠ {simResult.errors.length} symbol(s) failed to fetch: {simResult.errors.map(e=>e.symbol).join(", ")}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })()}
+                    </div>
+
+                    {/* ═══ TRAIN NN ON SIM ═══ (separate, sim-only training) */}
+                    <div style={{background:"#0A140E",border:"1px solid #2A6A4F",padding:12}}>
+                      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                        <div style={{fontSize:9,color:"#7FD8A6",letterSpacing:2}}>🧠 TRAIN NN ON SIMULATED TRADES</div>
+                        {(() => { const info = getNNInfo(); return info.trainedOn > 0 && (
+                          <button onClick={()=>{resetNN();setTrainResult(null);}}
+                            style={{background:"#1A0808",border:"1px solid #4A1A1A",color:"#E74C3C",fontSize:8,padding:"3px 8px",cursor:"pointer",fontFamily:"inherit",letterSpacing:1}}>
+                            RESET NN
+                          </button>
+                        ); })()}
+                      </div>
+                      <div style={{fontSize:10,color:"#888",lineHeight:1.6,marginBottom:10}}>
+                        Backprops the neural network on the {simResult?.trades?.length || 0} sim-labelled trades above
+                        (L2 regularisation, time-decay weighting, early stopping). Run a sim first, then train.
+                        Training is independent of the user-reviewed log — that's a separate training source.
+                      </div>
+                      <button onClick={trainOnSim} disabled={training || !simResult?.trades?.length || simResult?.trades?.length < 8}
+                        style={{background:training||!simResult?.trades?.length?"#111":"#0A1A14",
+                          border:`1px solid ${training||!simResult?.trades?.length?"#2A2A2A":"#2A6A4F"}`,
+                          color:training||!simResult?.trades?.length?"#666":"#7FD8A6",
+                          fontSize:11,padding:"8px 14px",cursor:training||!simResult?.trades?.length?"not-allowed":"pointer",
+                          fontFamily:"inherit",letterSpacing:2,fontWeight:700,width:"100%"}}>
+                        {training
+                          ? "training..."
+                          : !simResult?.trades?.length
+                            ? "▷ TRAIN NN ON SIM (run a simulation first)"
+                            : simResult.trades.length < 8
+                              ? `▷ TRAIN NN ON SIM (need ≥8 trades, have ${simResult.trades.length})`
+                              : `▶ TRAIN NN ON ${simResult.trades.length} SIM TRADES`}
+                      </button>
+
+                      {trainResult && !trainResult.error && (
+                        <div style={{marginTop:10,fontSize:10,color:"#888",lineHeight:1.7}}>
+                          <div>✓ NN trained on <b style={{color:"#FFF"}}>{trainResult.trained}</b> samples
+                            for <b style={{color:"#FFF"}}>{trainResult.epochs}</b> epochs
+                            {trainResult.loss != null && <> (final loss <b style={{color:"#FFF"}}>{trainResult.loss.toFixed(4)}</b>)</>}.
+                            Stopped: {trainResult.reason}</div>
+                          {trainResult.history?.length > 0 && (
+                            <svg width="100%" height="40" style={{marginTop:6,background:"#080808"}} viewBox="0 0 200 40" preserveAspectRatio="none">
+                              <polyline
+                                points={trainResult.history.map((l,i,a) => {
+                                  const maxL = Math.max(...a);
+                                  const minL = Math.min(...a);
+                                  const x = (i/(a.length-1))*200;
+                                  const y = 40 - ((l-minL)/((maxL-minL)||1))*40;
+                                  return `${x},${y}`;
+                                }).join(" ")}
+                                fill="none" stroke="#7FD8A6" strokeWidth="1.2" />
+                            </svg>
                           )}
                         </div>
                       )}
-                      {simResult?.error && (
-                        <div style={{marginTop:10,fontSize:10,color:"#E74C3C"}}>⚠ {simResult.error}</div>
+                      {trainResult?.error && (
+                        <div style={{marginTop:10,fontSize:10,color:"#E74C3C"}}>⚠ {trainResult.error}</div>
                       )}
                     </div>
                     <div style={{background:"#111",border:"1px solid #1E1E1E",padding:12}}>
@@ -1201,8 +1353,18 @@ export default function App() {
                     <button
                       disabled={reviewed.length < 2}
                       onClick={()=>{
-                        const res = adaptWeights(decisionLog.filter(d=>d.reviewed));
-                        alert(`Model updated from ${res.trained} reviewed trades.\nWeights adapted via gradient descent (${40} epochs).`);
+                        const reviewedSet = decisionLog.filter(d=>d.reviewed);
+                        const lrRes = adaptWeights(reviewedSet);
+                        // NN needs ≥8 samples to train (vs LR's ≥2). Only train if eligible.
+                        const nnRes = reviewedSet.length >= 8 ? trainNNFromLog(reviewedSet) : null;
+                        alert(
+                          `LR (logistic regression):\n` +
+                          `  Updated from ${lrRes.trained} reviewed trades (40 epochs).\n\n` +
+                          `NN (neural network):\n` +
+                          (nnRes
+                            ? `  Trained on ${nnRes.trained} samples for ${nnRes.epochs} epochs.\n  Stopped: ${nnRes.reason}`
+                            : `  Skipped — needs ≥8 reviewed trades, have ${reviewedSet.length}.`)
+                        );
                       }}
                       style={{background:reviewed.length>=2?"#0A1A2A":"#111",
                         border:`1px solid ${reviewed.length>=2?"#2A6A9A":"#2A2A2A"}`,

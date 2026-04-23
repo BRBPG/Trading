@@ -332,7 +332,19 @@ export function scoreSetup(q) {
 }
 
 // ─── Delegating wrappers so App.jsx doesn't need to import nn.js directly ──
-export function trainNN(reviewedLog) {
+//
+// Two distinct training sources:
+//   • LOG  — real trades the user manually reviewed in the Decision Log.
+//            Shape: { reviewed:true, outcome:"WIN"|"LOSS", features, timestamp:ISO }
+//   • SIM  — synthetic trades produced by the backtester from real candles.
+//            Shape: { outcome:"WIN"|"LOSS", features, timestamp:ms, ageDays, ... }
+//            (no `reviewed` flag — they were never user-reviewed)
+//
+// They were previously sharing one wrapper that hard-required `reviewed:true`,
+// which silently dropped every sim trade and produced "Need at least 8 samples"
+// even when the backtester returned 100+ trades.
+
+export function trainNNFromLog(reviewedLog) {
   const samples = reviewedLog
     .filter(d => d.reviewed && d.outcome && d.features)
     .map(d => ({
@@ -342,6 +354,21 @@ export function trainNN(reviewedLog) {
     }));
   return trainNNRaw(samples);
 }
+
+export function trainNNFromSim(simTrades) {
+  const samples = simTrades
+    .filter(d => d.outcome && d.features)
+    .map(d => ({
+      x: d.features,
+      y: d.outcome === "WIN" ? 1 : 0,
+      ageDays: d.ageDays || 0,
+    }));
+  return trainNNRaw(samples);
+}
+
+// Back-compat alias — older imports of trainNN keep working (= log training).
+export const trainNN = trainNNFromLog;
+
 export function resetNN() { resetNNRaw(); }
 export { getNNInfo };
 
