@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
 import { generateMockQuote, generateLiveIndicators, computeIndicators } from "./mockData";
-import { scoreSetup, logDecision, reviewDecision, getPerformanceStats, getLog, adaptWeights, resetWeights, getCurrentWeights, trainNNFromLog, trainNNFromSim, resetNN, getNNInfo, trainGBMFromSim, trainGBMFromLog, FEATURE_NAMES } from "./model";
+import { scoreSetup, logDecision, reviewDecision, getPerformanceStats, getLog, adaptWeights, resetWeights, getCurrentWeights, trainNNFromLog, trainNNFromSim, resetNN, getNNInfo, trainGBMFromSim, trainGBMFromLog, trainRegimeFromSim, FEATURE_NAMES } from "./model";
 import { computeSimMetrics, summariseEdge } from "./simMetrics";
 import { runWalkForward, interpretWF } from "./walkForward";
 import { runBacktest } from "./backtest";
@@ -763,6 +763,9 @@ export default function App() {
   const [simDaysAgo, setSimDaysAgo] = useState(7);
   const [wfResult, setWfResult] = useState(null);
   const [wfRunning, setWfRunning] = useState(false);
+  const [multiSimResult, setMultiSimResult] = useState(null);
+  const [multiSimRunning, setMultiSimRunning] = useState(false);
+  const [multiSimState, setMultiSimState] = useState({ phase: null, run: 0, total: 0 });
   const [trainResult, setTrainResult] = useState(null);
   const [training, setTraining] = useState(false);
   const chatRef = useRef(null);
@@ -1098,6 +1101,87 @@ export default function App() {
     }, 50);
   }
 
+  // ─── Multi-sim averaging ──────────────────────────────────────────────────
+  // Runs N independent simulations + walk-forward each, then computes a
+  // trimmed-mean AUC (drop the highest and lowest, average the middle).
+  // This is the right defence against multiple-testing self-deception:
+  // ONE sim can hit AUC 0.62 by luck; the trimmed mean of 5 sims is much
+  // more honest. Useful for deciding whether to actually train.
+  async function runMultiSim() {
+    if (multiSimRunning) return;
+    setMultiSimRunning(true);
+    setMultiSimResult(null);
+    const N_RUNS = 5;
+    const aucs = [];
+    const accs = [];
+    const losses = [];
+    const tradeCounts = [];
+    try {
+      for (let i = 0; i < N_RUNS; i++) {
+        setMultiSimState({ phase: "sim", run: i + 1, total: N_RUNS });
+        const samples = simInterval === "1d"
+          ? Math.min(30, Math.max(5, Math.floor(simDaysAgo / 10)))
+          : (simDaysAgo <= 7 ? 10 : simDaysAgo <= 30 ? 20 : 40);
+        const res = await runBacktest(BACKTEST_SYMBOLS, {
+          interval: simInterval,
+          daysAgo: simDaysAgo,
+          holdHours: maxHoldHours,
+          samplesPerSymbol: samples,
+          costBps,
+          polygonKey: polygonKey || null,
+          earningsMap,
+          onProgress: () => {},
+        });
+        if (!res.trades.length) continue;
+        tradeCounts.push(res.trades.length);
+        setMultiSimState({ phase: "wf", run: i + 1, total: N_RUNS });
+        // Brief yield so UI repaints between heavy WF runs.
+        await new Promise(r => setTimeout(r, 30));
+        const wf = runWalkForward(res.trades, { folds: 5, epochs: 60 });
+        if (wf.overall?.oosAUC != null) {
+          aucs.push(wf.overall.oosAUC);
+          accs.push(wf.overall.oosAccuracy);
+          losses.push(wf.overall.oosLogLoss);
+        }
+      }
+
+      if (aucs.length < 3) {
+        setMultiSimResult({ error: `Only ${aucs.length}/${N_RUNS} runs produced valid OOS results. Try a longer DAYS AGO or different settings.` });
+        setMultiSimRunning(false);
+        return;
+      }
+
+      // Trimmed mean: drop min and max, average the rest. Removes one
+      // unlucky tail and one lucky tail.
+      const sortedAUC = [...aucs].sort((a, b) => a - b);
+      const trimmed = sortedAUC.slice(1, -1);
+      const mean = arr => arr.reduce((a, b) => a + b, 0) / arr.length;
+      const std  = arr => {
+        const m = mean(arr);
+        return Math.sqrt(arr.reduce((s, v) => s + (v - m) ** 2, 0) / arr.length);
+      };
+
+      setMultiSimResult({
+        runs: aucs.length,
+        aucs,
+        accs,
+        losses,
+        tradeCounts,
+        meanAUC: mean(aucs),
+        trimmedMeanAUC: mean(trimmed),
+        stdAUC: std(aucs),
+        minAUC: Math.min(...aucs),
+        maxAUC: Math.max(...aucs),
+        meanAccuracy: mean(accs),
+        meanLogLoss: mean(losses),
+      });
+    } catch (err) {
+      setMultiSimResult({ error: err.message || String(err) });
+    }
+    setMultiSimRunning(false);
+    setMultiSimState({ phase: null, run: 0, total: 0 });
+  }
+
   // ─── Train NN on the most recent sim batch ────────────────────────────────
   function trainOnSim() {
     if (training || !simResult?.trades?.length) return;
@@ -1116,10 +1200,14 @@ export default function App() {
         //   - LR Bag: 30 bootstrap LRs, gives ensemble uncertainty
         // The composite ensemble in scoreSetup picks them up automatically
         // on the next refresh (each is loaded from localStorage).
-        const nnOut  = trainNNFromSim(simResult.trades);
-        const gbmOut = trainGBMFromSim(simResult.trades);
-        const bagOut = trainBagFromSim(simResult.trades);
-        setTrainResult({ ...nnOut, gbm: gbmOut, bag: bagOut });
+        const nnOut     = trainNNFromSim(simResult.trades);
+        const gbmOut    = trainGBMFromSim(simResult.trades);
+        const bagOut    = trainBagFromSim(simResult.trades);
+        // Regime-conditional GBMs need ≥60 trades (30 each side); skip
+        // silently with a status if there aren't enough samples on each
+        // side of the VIX-z midpoint.
+        const regimeOut = trainRegimeFromSim(simResult.trades);
+        setTrainResult({ ...nnOut, gbm: gbmOut, bag: bagOut, regime: regimeOut });
       } catch (err) {
         setTrainResult({ error: err.message || String(err) });
       }
@@ -1337,6 +1425,9 @@ export default function App() {
                         Confidence: <b style={{color:"#FFF"}}>{m.confidence}%</b>
                         &nbsp;·&nbsp; Agreement: <b style={{color:m.agreement.count>=m.agreement.total?"#2ECC71":m.agreement.count>=(m.agreement.total-1)?"#C9A84C":"#E74C3C"}}>{m.agreement.count}/{m.agreement.total} {m.agreement.total===1?"(NN untrained)":"models"}</b>
                         &nbsp;·&nbsp; Weights: LR {(m.weights.lr*100).toFixed(0)}% · NN {(m.weights.nn*100).toFixed(0)}% · GBM {((m.weights.gbm||0)*100).toFixed(0)}% · Tree {(m.weights.tree*100).toFixed(0)}%
+                        {m.gbmSource && m.gbmSource !== "universal" && (
+                          <> &nbsp;·&nbsp; <span style={{color:"#D87FD8"}}>GBM regime: <b>{m.gbmSource.toUpperCase()}</b></span></>
+                        )}
                       </div>
                       <div style={{marginTop:8,width:"100%",height:8,background:"#0A0A0A",borderRadius:4,overflow:"hidden"}}>
                         <div style={{width:`${m.compositeProb}%`,height:"100%",background:m.compositeProb>58?"#2ECC71":m.compositeProb<42?"#E74C3C":"#C9A84C"}}/>
@@ -1679,6 +1770,16 @@ export default function App() {
                           {trainResult.bag?.ok && (
                             <div>✓ LR bag (<b style={{color:"#FFF"}}>{trainResult.bag.nBags}</b> bootstrap models) trained on <b style={{color:"#FFF"}}>{trainResult.bag.trainedOn}</b> samples — ensemble ready for uncertainty-aware predictions.</div>
                           )}
+                          {trainResult.regime?.ok && (
+                            <div>✓ Regime-switching GBMs:
+                              {trainResult.regime.highTrained && <> high-VIX trained on <b style={{color:"#FFF"}}>{trainResult.regime.counts.high}</b> samples ({trainResult.regime.highRounds} rounds);</>}
+                              {trainResult.regime.lowTrained && <> low-VIX trained on <b style={{color:"#FFF"}}>{trainResult.regime.counts.low}</b> samples ({trainResult.regime.lowRounds} rounds).</>}
+                              {(!trainResult.regime.highTrained || !trainResult.regime.lowTrained) && <> The other regime had too few samples — falls back to universal GBM in that regime.</>}
+                            </div>
+                          )}
+                          {trainResult.regime?.error && (
+                            <div style={{color:"#888"}}>· Regime models: {trainResult.regime.error} (universal GBM still active)</div>
+                          )}
                           {trainResult.bag?.error && (
                             <div style={{color:"#C9A84C"}}>⚠ LR bag: {trainResult.bag.error}</div>
                           )}
@@ -1785,6 +1886,69 @@ export default function App() {
                                   </React.Fragment>
                                 ))}
                               </div>
+                            </div>
+                          </div>
+                        );
+                      })()}
+                    </div>
+
+                    {/* ═══ MULTI-SIM AVERAGING ═══ */}
+                    <div style={{background:"#0A140F",border:"1px solid #2A6A4F",padding:12}}>
+                      <div style={{fontSize:9,color:"#7FD8A6",letterSpacing:2,marginBottom:8}}>📊 MULTI-SIM AVERAGING (defends against multiple-testing self-deception)</div>
+                      <div style={{fontSize:10,color:"#888",lineHeight:1.6,marginBottom:10}}>
+                        Runs <b>5 independent</b> sims + walk-forwards back-to-back, then computes the
+                        <b style={{color:"#7FD8A6"}}> trimmed mean AUC</b> (drops the highest and lowest, averages
+                        the middle three). One sim hitting AUC 0.62 by luck is statistically meaningless;
+                        the trimmed mean of 5 sims is honest. Use this <b>before</b> deciding to train.
+                        <br/>Takes ~3-10 minutes depending on horizon and Polygon rate limits.
+                      </div>
+                      <button onClick={runMultiSim} disabled={multiSimRunning}
+                        style={{background:multiSimRunning?"#111":"#0F1F18",
+                          border:`1px solid ${multiSimRunning?"#2A2A2A":"#2A6A4F"}`,
+                          color:multiSimRunning?"#666":"#7FD8A6",
+                          fontSize:11,padding:"8px 14px",cursor:multiSimRunning?"not-allowed":"pointer",
+                          fontFamily:"inherit",letterSpacing:2,fontWeight:700,width:"100%"}}>
+                        {multiSimRunning
+                          ? `${multiSimState.phase || "starting"}... run ${multiSimState.run}/${multiSimState.total}`
+                          : "▶ RUN 5-SIM AVERAGE"}
+                      </button>
+                      {multiSimResult?.error && (
+                        <div style={{marginTop:10,fontSize:10,color:"#E74C3C"}}>⚠ {multiSimResult.error}</div>
+                      )}
+                      {multiSimResult && !multiSimResult.error && (() => {
+                        const r = multiSimResult;
+                        const verdict = r.trimmedMeanAUC >= 0.55 ? { label: "Genuine signal — train it", color: "#2ECC71" }
+                                      : r.trimmedMeanAUC >= 0.52 ? { label: "Marginal — borderline", color: "#C9A84C" }
+                                      : { label: "Coin flip — don't train", color: "#E74C3C" };
+                        return (
+                          <div style={{marginTop:12}}>
+                            <div style={{padding:"8px 10px",background:"#080808",border:`1px solid ${verdict.color}55`,borderLeft:`3px solid ${verdict.color}`,marginBottom:10}}>
+                              <div style={{fontSize:9,color:"#555",letterSpacing:2}}>VERDICT — {r.runs}-RUN TRIMMED MEAN</div>
+                              <div style={{fontSize:13,color:verdict.color,fontWeight:900,marginTop:2}}>{verdict.label}</div>
+                            </div>
+                            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:10}}>
+                              {[
+                                ["TRIMMED MEAN AUC", r.trimmedMeanAUC.toFixed(3), r.trimmedMeanAUC>=0.55?"#2ECC71":r.trimmedMeanAUC>=0.52?"#C9A84C":"#E74C3C"],
+                                ["RAW MEAN AUC",     r.meanAUC.toFixed(3), "#888"],
+                                ["AUC STD DEV",      r.stdAUC.toFixed(3), r.stdAUC<0.03?"#2ECC71":r.stdAUC<0.06?"#C9A84C":"#E74C3C"],
+                                ["RANGE",            `${r.minAUC.toFixed(3)} – ${r.maxAUC.toFixed(3)}`, "#888"],
+                                ["MEAN OOS ACC",     `${(r.meanAccuracy*100).toFixed(1)}%`, "#888"],
+                                ["MEAN LOG-LOSS",    r.meanLogLoss.toFixed(4), "#888"],
+                              ].map(([k,v,c])=>(
+                                <div key={k} style={{padding:"6px 8px",background:"#080808",border:"1px solid #1A1A1A"}}>
+                                  <div style={{fontSize:8,color:"#555",letterSpacing:1}}>{k}</div>
+                                  <div style={{fontSize:12,color:c,fontWeight:700,marginTop:2}}>{v}</div>
+                                </div>
+                              ))}
+                            </div>
+                            <div style={{padding:"6px 10px",background:"#080808",border:"1px solid #1A1A1A",fontSize:10,color:"#888"}}>
+                              <div style={{fontSize:8,color:"#555",letterSpacing:2,marginBottom:4}}>PER-RUN AUCs (sorted)</div>
+                              {[...r.aucs].sort((a,b)=>a-b).map((auc,i)=>(
+                                <span key={i} style={{marginRight:10,color:i===0||i===r.aucs.length-1?"#666":"#CCC"}}>
+                                  {i===0||i===r.aucs.length-1 ? "⊘" : "·"} {auc.toFixed(3)}
+                                </span>
+                              ))}
+                              <div style={{fontSize:8,color:"#555",marginTop:4}}>⊘ = trimmed (high/low). Verdict uses the middle {r.runs - 2}.</div>
                             </div>
                           </div>
                         );

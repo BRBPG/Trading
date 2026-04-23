@@ -1,5 +1,6 @@
 import { predictNN, trainNN as trainNNRaw, getNNInfo, resetNN as resetNNRaw } from "./nn";
 import { predictGBM, loadGBM, trainGBM as trainGBMRaw, saveGBM, getGBMInfo, resetGBM as resetGBMRaw } from "./gbm";
+import { predictRegime, getRegimeInfo, trainRegimeModels as trainRegimeRaw, resetRegimeModels as resetRegimeRaw } from "./regime";
 
 // ─── Pre-trained logistic regression (v3, 16-dim) ──────────────────────────
 // Honest note: these defaults are a mild bullish-tech prior + a PEAD prior
@@ -350,10 +351,20 @@ export function scoreSetup(q, context = {}) {
   // financial data. They capture feature interactions (e.g. VIX_z × RSI)
   // that a 16→16→8→1 NN can't represent well. Carries its own weight in
   // the composite, which ramps from 0 → 0.45 as samples grow.
-  const gbmModel  = loadGBM();
-  const gbmProb   = gbmModel ? predictGBM(gbmModel, features) : null;
+  //
+  // Regime override: if regime-conditional GBMs are trained and the
+  // current macro regime is non-neutral, USE THE REGIME MODEL instead of
+  // the universal GBM. This lets the model learn separate weight sets for
+  // high-VIX vs low-VIX markets where the same features have different
+  // meanings (e.g. low RSI = buy signal in calm, panic-trap in crisis).
+  const universalGBM  = loadGBM();
+  const universalProb = universalGBM ? predictGBM(universalGBM, features) : null;
+  const regimePred    = macro ? predictRegime(features, macro) : null;
+  const gbmProb   = regimePred?.prob != null ? regimePred.prob : universalProb;
   const gbmInfo   = getGBMInfo();
+  const regimeInfo = getRegimeInfo();
   const gbmReady  = gbmProb != null;
+  const gbmSource = regimePred?.used || (universalProb != null ? "universal" : null);
 
   // ── Blend weights ───────────────────────────────────────────────────
   // GBM dominates as it accumulates samples (tabular ML is its forté).
@@ -439,6 +450,8 @@ export function scoreSetup(q, context = {}) {
     crisis,
     nnInfo,
     gbmInfo,
+    gbmSource,                  // "high_vol" | "low_vol" | "universal" | null
+    regimeInfo,                 // { highTrained, lowTrained, ... } or null
     stopLong, stopShort, tgt3Long, tgt3Short,
   };
 }
@@ -519,6 +532,13 @@ export function trainGBMFromSim(simTrades) {
 
 export function resetGBM() { resetGBMRaw(); }
 export { getGBMInfo };
+
+// ─── Regime-conditional models ─────────────────────────────────────────────
+export function trainRegimeFromSim(simTrades) {
+  return trainRegimeRaw(simTrades);
+}
+export function resetRegime() { resetRegimeRaw(); }
+export { getRegimeInfo };
 
 // ─── Decision log (localStorage) ────────────────────────────────────────────
 const LOG_KEY = "trader_decision_log";
