@@ -16,6 +16,7 @@ const KEYS = {
   lrWeights: "trader_lr_weights_v3",
   nnWeights: "trader_nn_weights_v3",
   lrBag:     "trader_lr_bag_v2",    // bag storage unchanged; 16-dim works fine
+  gbm:       "trader_gbm_v1",        // gradient-boosted trees model
   earnings:  "trader_earnings_cache_v1", // earnings cache (optional export)
 };
 
@@ -34,6 +35,7 @@ export function exportState() {
     lrWeights: safeParse(localStorage.getItem(KEYS.lrWeights)) ?? null,
     nnWeights: safeParse(localStorage.getItem(KEYS.nnWeights)) ?? null,
     lrBag:     safeParse(localStorage.getItem(KEYS.lrBag)) ?? null,
+    gbm:       safeParse(localStorage.getItem(KEYS.gbm)) ?? null,
   };
   return payload;
 }
@@ -97,6 +99,20 @@ export function importState(payload, { mode = "replace" } = {}) {
       && payload.nnWeights.W1[0]?.length === 16) {
     localStorage.setItem(KEYS.nnWeights, JSON.stringify(payload.nnWeights));
     restored.nnWeights = true;
+  }
+
+  // GBM model — array of trees + scalar metadata. We don't validate inner
+  // tree shape (variable depth, recursive), just sanity-check trees array.
+  if (payload.gbm && Array.isArray(payload.gbm.trees) && payload.gbm.trees.length > 0) {
+    localStorage.setItem(KEYS.gbm, JSON.stringify(payload.gbm));
+    restored.gbm = true;
+  }
+
+  // LR bag — 30 bootstrap models with weight + bias each. Imported as-is
+  // if shape is plausible; the bag is feature-dim-aware so old bags work.
+  if (payload.lrBag && Array.isArray(payload.lrBag.bags) && payload.lrBag.bags.length > 0) {
+    localStorage.setItem(KEYS.lrBag, JSON.stringify(payload.lrBag));
+    restored.lrBag = true;
   }
 
   return restored;

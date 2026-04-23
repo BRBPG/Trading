@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
 import { generateMockQuote, generateLiveIndicators, computeIndicators } from "./mockData";
-import { scoreSetup, logDecision, reviewDecision, getPerformanceStats, getLog, adaptWeights, resetWeights, getCurrentWeights, trainNNFromLog, trainNNFromSim, resetNN, getNNInfo, FEATURE_NAMES } from "./model";
+import { scoreSetup, logDecision, reviewDecision, getPerformanceStats, getLog, adaptWeights, resetWeights, getCurrentWeights, trainNNFromLog, trainNNFromSim, resetNN, getNNInfo, trainGBMFromSim, trainGBMFromLog, FEATURE_NAMES } from "./model";
 import { computeSimMetrics, summariseEdge } from "./simMetrics";
 import { runWalkForward, interpretWF } from "./walkForward";
 import { runBacktest } from "./backtest";
@@ -1110,9 +1110,16 @@ export default function App() {
         // Train both the NN (flexible) and the LR bag (calibrated + uncertainty)
         // on the same sim batch. Running them together means the UI's
         // uncertainty band is always aligned with the NN's current state.
-        const nnOut = trainNNFromSim(simResult.trades);
+        // Train all three model types on the same sim batch:
+        //   - NN: small dense net (16→16→8→1), captures smooth nonlinearities
+        //   - GBM: gradient-boosted trees, captures feature interactions
+        //   - LR Bag: 30 bootstrap LRs, gives ensemble uncertainty
+        // The composite ensemble in scoreSetup picks them up automatically
+        // on the next refresh (each is loaded from localStorage).
+        const nnOut  = trainNNFromSim(simResult.trades);
+        const gbmOut = trainGBMFromSim(simResult.trades);
         const bagOut = trainBagFromSim(simResult.trades);
-        setTrainResult({ ...nnOut, bag: bagOut });
+        setTrainResult({ ...nnOut, gbm: gbmOut, bag: bagOut });
       } catch (err) {
         setTrainResult({ error: err.message || String(err) });
       }
@@ -1329,7 +1336,7 @@ export default function App() {
                       <div style={{marginTop:6,fontSize:10,color:"#888"}}>
                         Confidence: <b style={{color:"#FFF"}}>{m.confidence}%</b>
                         &nbsp;·&nbsp; Agreement: <b style={{color:m.agreement.count>=m.agreement.total?"#2ECC71":m.agreement.count>=(m.agreement.total-1)?"#C9A84C":"#E74C3C"}}>{m.agreement.count}/{m.agreement.total} {m.agreement.total===1?"(NN untrained)":"models"}</b>
-                        &nbsp;·&nbsp; Weights: LR {(m.weights.lr*100).toFixed(0)}% · NN {(m.weights.nn*100).toFixed(0)}% · Tree {(m.weights.tree*100).toFixed(0)}%
+                        &nbsp;·&nbsp; Weights: LR {(m.weights.lr*100).toFixed(0)}% · NN {(m.weights.nn*100).toFixed(0)}% · GBM {((m.weights.gbm||0)*100).toFixed(0)}% · Tree {(m.weights.tree*100).toFixed(0)}%
                       </div>
                       <div style={{marginTop:8,width:"100%",height:8,background:"#0A0A0A",borderRadius:4,overflow:"hidden"}}>
                         <div style={{width:`${m.compositeProb}%`,height:"100%",background:m.compositeProb>58?"#2ECC71":m.compositeProb<42?"#E74C3C":"#C9A84C"}}/>
@@ -1371,9 +1378,9 @@ export default function App() {
 
                     {/* ═══ NN ═══ */}
                     <div style={{background:"#111",border:"1px solid #1E1E1E",padding:12}}>
-                      <div style={{fontSize:9,color:"#555",letterSpacing:2,marginBottom:8}}>NEURAL NET (7→8→4→1, backprop)</div>
+                      <div style={{fontSize:9,color:"#555",letterSpacing:2,marginBottom:8}}>NEURAL NET (16→16→8→1, backprop)</div>
                       {m.nnProb == null ? (
-                        <div style={{fontSize:11,color:"#666"}}>Untrained — run SIMULATE & TRAIN or 🧠 LEARN with ≥8 reviewed trades.</div>
+                        <div style={{fontSize:11,color:"#666"}}>Untrained — run SIMULATE then TRAIN, or 🧠 LEARN with ≥8 reviewed trades.</div>
                       ) : (
                         <>
                           <div style={{fontSize:18,fontWeight:900,color:m.nnProb>58?"#2ECC71":m.nnProb<42?"#E74C3C":"#C9A84C"}}>
@@ -1384,6 +1391,26 @@ export default function App() {
                           </div>
                           <div style={{marginTop:6,fontSize:9,color:"#666"}}>
                             Trained on {m.nnInfo.trainedOn} samples · {m.nnInfo.epochs} epochs total · final loss {m.nnInfo.finalLoss?.toFixed(4) ?? "?"}
+                          </div>
+                        </>
+                      )}
+                    </div>
+
+                    {/* ═══ GBM ═══ */}
+                    <div style={{background:"#111",border:"1px solid #1E1E1E",padding:12,borderLeft:"3px solid #2A6A9A"}}>
+                      <div style={{fontSize:9,color:"#5AACDF",letterSpacing:2,marginBottom:8}}>GRADIENT-BOOSTED TREES (depth-4, 100 rounds, second-order Newton)</div>
+                      {m.gbmProb == null ? (
+                        <div style={{fontSize:11,color:"#666"}}>Untrained — run SIMULATE then TRAIN with ≥20 sim trades, or 🧠 LEARN with ≥20 reviewed trades. GBM is the most likely to find genuine edge in tabular features.</div>
+                      ) : (
+                        <>
+                          <div style={{fontSize:18,fontWeight:900,color:m.gbmProb>58?"#2ECC71":m.gbmProb<42?"#E74C3C":"#C9A84C"}}>
+                            {m.gbmProb}% bullish
+                          </div>
+                          <div style={{marginTop:4,width:"100%",height:6,background:"#222",borderRadius:3}}>
+                            <div style={{width:`${m.gbmProb}%`,height:"100%",background:m.gbmProb>58?"#2ECC71":m.gbmProb<42?"#E74C3C":"#C9A84C",borderRadius:3}}/>
+                          </div>
+                          <div style={{marginTop:6,fontSize:9,color:"#666"}}>
+                            Trained on {m.gbmInfo.trainedOn} samples · {m.gbmInfo.rounds} boosting rounds · final loss {m.gbmInfo.finalLoss?.toFixed(4) ?? "?"}
                           </div>
                         </>
                       )}
@@ -1643,6 +1670,12 @@ export default function App() {
                             for <b style={{color:"#FFF"}}>{trainResult.epochs}</b> epochs
                             {trainResult.loss != null && <> (final loss <b style={{color:"#FFF"}}>{trainResult.loss.toFixed(4)}</b>)</>}.
                             Stopped: {trainResult.reason}</div>
+                          {trainResult.gbm?.trees && (
+                            <div>✓ GBM trained on <b style={{color:"#FFF"}}>{trainResult.gbm.trainedOn}</b> samples for <b style={{color:"#FFF"}}>{trainResult.gbm.rounds}</b> boosting rounds (final loss <b style={{color:"#FFF"}}>{trainResult.gbm.finalLoss?.toFixed(4)}</b>). Stopped: {trainResult.gbm.reason}</div>
+                          )}
+                          {trainResult.gbm && !trainResult.gbm.trees && (
+                            <div style={{color:"#C9A84C"}}>⚠ GBM: {trainResult.gbm.reason}</div>
+                          )}
                           {trainResult.bag?.ok && (
                             <div>✓ LR bag (<b style={{color:"#FFF"}}>{trainResult.bag.nBags}</b> bootstrap models) trained on <b style={{color:"#FFF"}}>{trainResult.bag.trainedOn}</b> samples — ensemble ready for uncertainty-aware predictions.</div>
                           )}
@@ -1838,16 +1871,20 @@ export default function App() {
                       disabled={reviewed.length < 2}
                       onClick={()=>{
                         const reviewedSet = decisionLog.filter(d=>d.reviewed);
-                        const lrRes = adaptWeights(reviewedSet);
-                        // NN needs ≥8 samples to train (vs LR's ≥2). Only train if eligible.
-                        const nnRes = reviewedSet.length >= 8 ? trainNNFromLog(reviewedSet) : null;
+                        const lrRes  = adaptWeights(reviewedSet);
+                        const nnRes  = reviewedSet.length >= 8  ? trainNNFromLog(reviewedSet)  : null;
+                        const gbmRes = reviewedSet.length >= 20 ? trainGBMFromLog(reviewedSet) : null;
                         alert(
                           `LR (logistic regression):\n` +
                           `  Updated from ${lrRes.trained} reviewed trades (40 epochs).\n\n` +
                           `NN (neural network):\n` +
                           (nnRes
                             ? `  Trained on ${nnRes.trained} samples for ${nnRes.epochs} epochs.\n  Stopped: ${nnRes.reason}`
-                            : `  Skipped — needs ≥8 reviewed trades, have ${reviewedSet.length}.`)
+                            : `  Skipped — needs ≥8 reviewed trades, have ${reviewedSet.length}.`) +
+                          `\n\nGBM (gradient-boosted trees):\n` +
+                          (gbmRes
+                            ? `  Trained on ${gbmRes.trainedOn} samples for ${gbmRes.rounds} rounds.\n  Stopped: ${gbmRes.reason}`
+                            : `  Skipped — needs ≥20 reviewed trades, have ${reviewedSet.length}.`)
                         );
                       }}
                       style={{background:reviewed.length>=2?"#0A1A2A":"#111",

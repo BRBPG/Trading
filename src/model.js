@@ -1,4 +1,5 @@
 import { predictNN, trainNN as trainNNRaw, getNNInfo, resetNN as resetNNRaw } from "./nn";
+import { predictGBM, loadGBM, trainGBM as trainGBMRaw, saveGBM, getGBMInfo, resetGBM as resetGBMRaw } from "./gbm";
 
 // ─── Pre-trained logistic regression (v3, 16-dim) ──────────────────────────
 // Honest note: these defaults are a mild bullish-tech prior + a PEAD prior
@@ -344,18 +345,35 @@ export function scoreSetup(q, context = {}) {
   const nnInfo    = getNNInfo();
   const nnReady   = nnProb != null;
 
+  // ── GBM probability (null if untrained) ─────────────────────────────
+  // Gradient-boosted trees consistently outperform a small NN on tabular
+  // financial data. They capture feature interactions (e.g. VIX_z × RSI)
+  // that a 16→16→8→1 NN can't represent well. Carries its own weight in
+  // the composite, which ramps from 0 → 0.45 as samples grow.
+  const gbmModel  = loadGBM();
+  const gbmProb   = gbmModel ? predictGBM(gbmModel, features) : null;
+  const gbmInfo   = getGBMInfo();
+  const gbmReady  = gbmProb != null;
+
   // ── Blend weights ───────────────────────────────────────────────────
+  // GBM dominates as it accumulates samples (tabular ML is its forté).
+  // NN is a smaller secondary contributor. LR + Tree are baseline priors.
   const treeWeight = 0.20 + 0.20 * (tree.strength ?? 0.5);
-  const nnWeight   = nnReady ? Math.min(0.40, nnInfo.trainedOn / 125) : 0;
+  const nnWeight   = nnReady  ? Math.min(0.30, nnInfo.trainedOn  / 150) : 0;
+  const gbmWeight  = gbmReady ? Math.min(0.45, gbmInfo.trainedOn / 100) : 0;
   const lrWeight   = 0.40;
-  const totalRaw   = lrWeight + treeWeight + nnWeight;
+  const totalRaw   = lrWeight + treeWeight + nnWeight + gbmWeight;
 
   const lrW   = lrWeight   / totalRaw;
   const treeW = treeWeight / totalRaw;
   const nnW   = nnWeight   / totalRaw;
+  const gbmW  = gbmWeight  / totalRaw;
 
   const treeScore = treeSignalToScore(tree.signal);
-  let compositeProb = lrW * lrProb + treeW * treeScore + nnW * (nnProb ?? 0.5);
+  let compositeProb = lrW * lrProb
+                    + treeW * treeScore
+                    + nnW * (nnProb ?? 0.5)
+                    + gbmW * (gbmProb ?? 0.5);
 
   // Crisis bias: nearest analogue's bias pushes +/- 5%
   const crisisBias = crisis?.regime === "melt_up" || crisis?.regime === "recovery" ?  0.05
@@ -370,23 +388,29 @@ export function scoreSetup(q, context = {}) {
   // nnDir = lrDir, which guaranteed at least 2/3 agreement and "boosted"
   // confidence vacuously for the first ~50 trades of a new install. Now: if
   // NN isn't ready, we only count 2-way agreement between LR and Tree.
+  // Pairwise agreement count among ALL trained models (LR + Tree always
+  // count; NN and GBM count only when ready). Agreement total = number of
+  // pairs being compared. This keeps the boost meaningful as the ensemble
+  // size grows.
   const lrDir   = lrProb > 0.5   ? 1 : -1;
   const treeDir = treeScore > 0.5 ? 1 : -1;
-  const nnDir   = nnReady ? (nnProb > 0.5 ? 1 : -1) : null;
-  let agreeCount, agreeTotal;
-  if (nnReady) {
-    agreeCount = (lrDir === treeDir ? 1 : 0) + (lrDir === nnDir ? 1 : 0) + (treeDir === nnDir ? 1 : 0);
-    agreeTotal = 3;
-  } else {
-    agreeCount = lrDir === treeDir ? 1 : 0;
-    agreeTotal = 1;
+  const nnDir   = nnReady  ? (nnProb  > 0.5 ? 1 : -1) : null;
+  const gbmDir  = gbmReady ? (gbmProb > 0.5 ? 1 : -1) : null;
+  const dirs = [lrDir, treeDir];
+  if (nnReady)  dirs.push(nnDir);
+  if (gbmReady) dirs.push(gbmDir);
+  let agreeCount = 0, agreeTotal = 0;
+  for (let i = 0; i < dirs.length; i++) {
+    for (let j = i + 1; j < dirs.length; j++) {
+      agreeTotal++;
+      if (dirs[i] === dirs[j]) agreeCount++;
+    }
   }
-  // Boost scales to the pool size — with only LR+Tree we can't reach a
-  // "3/3" state, so full agreement in 2-model mode earns the 2/3 boost tier.
-  const agreementBoost =
-    agreeTotal === 3
-      ? (agreeCount >= 3 ? 1.20 : agreeCount === 2 ? 1.0 : 0.75)
-      : (agreeCount === 1 ? 1.0 : 0.75);
+  // Boost = full agreement → 1.20, no agreement → 0.75, mixed → 1.0.
+  const agreeRatio = agreeTotal > 0 ? agreeCount / agreeTotal : 0.5;
+  const agreementBoost = agreeRatio >= 1.0 ? 1.20
+                       : agreeRatio >= 0.5 ? 1.0
+                       : 0.75;
 
   const rawConfidence = Math.abs(compositeProb - 0.5) * 200;
   const confidence    = Math.min(100, Math.round(rawConfidence * agreementBoost));
@@ -403,8 +427,9 @@ export function scoreSetup(q, context = {}) {
     features,
     lrProb: (lrProb * 100).toFixed(1),
     nnProb: nnReady ? (nnProb * 100).toFixed(1) : null,
+    gbmProb: gbmReady ? (gbmProb * 100).toFixed(1) : null,
     compositeProb: (compositeProb * 100).toFixed(1),
-    weights: { lr: lrW, nn: nnW, tree: treeW, crisisBias },
+    weights: { lr: lrW, nn: nnW, gbm: gbmW, tree: treeW, crisisBias },
     direction,
     confidence,
     agreement: { count: agreeCount, total: agreeTotal, boost: agreementBoost },
@@ -413,6 +438,7 @@ export function scoreSetup(q, context = {}) {
     treeReason: tree.reason,
     crisis,
     nnInfo,
+    gbmInfo,
     stopLong, stopShort, tgt3Long, tgt3Short,
   };
 }
@@ -457,6 +483,42 @@ export const trainNN = trainNNFromLog;
 
 export function resetNN() { resetNNRaw(); }
 export { getNNInfo };
+
+// ─── GBM wrappers ──────────────────────────────────────────────────────────
+// Same shape as the NN wrappers. trainGBM returns the trained model and
+// also persists it via saveGBM (so subsequent scoreSetup calls pick it up).
+export function trainGBMFromLog(reviewedLog) {
+  const samples = reviewedLog
+    .filter(d => d.reviewed && d.outcome && d.features)
+    .map(d => ({
+      x: d.features,
+      y: d.outcome === "WIN" ? 1 : 0,
+    }));
+  if (samples.length < 20) {
+    return { trained: 0, rounds: 0, reason: `Need ≥20 reviewed samples, got ${samples.length}` };
+  }
+  const result = trainGBMRaw(samples);
+  if (result.trees) saveGBM(result);
+  return result;
+}
+
+export function trainGBMFromSim(simTrades) {
+  const samples = simTrades
+    .filter(d => d.outcome && d.features)
+    .map(d => ({
+      x: d.features,
+      y: d.outcome === "WIN" ? 1 : 0,
+    }));
+  if (samples.length < 20) {
+    return { trained: 0, rounds: 0, reason: `Need ≥20 sim samples, got ${samples.length}` };
+  }
+  const result = trainGBMRaw(samples);
+  if (result.trees) saveGBM(result);
+  return result;
+}
+
+export function resetGBM() { resetGBMRaw(); }
+export { getGBMInfo };
 
 // ─── Decision log (localStorage) ────────────────────────────────────────────
 const LOG_KEY = "trader_decision_log";
