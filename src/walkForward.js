@@ -88,8 +88,21 @@ function auc(preds) {
   return wins / (pos.length * neg.length);
 }
 
+// Mask the specified feature indices in a sample's x vector by setting
+// them to zero. Used by runAblationStudy to measure per-feature AUC delta.
+function maskFeatures(sample, slotsToZero) {
+  if (!slotsToZero || !slotsToZero.length) return sample;
+  const x = [...sample.x];
+  for (const i of slotsToZero) if (i >= 0 && i < x.length) x[i] = 0;
+  return { ...sample, x };
+}
+
 export function runWalkForward(simTrades, opts = {}) {
-  const { folds = 5, epochs = 80, embargoSec = 3 * 60 * 60, modelKind = "nn" } = opts;
+  const { folds = 5, epochs = 80, embargoSec = 3 * 60 * 60, modelKind = "nn", maskSlots = [] } = opts;
+  // maskSlots: array of feature-vector indices to zero before both training
+  // and prediction. Enables leave-one-out feature ablation — runAblation-
+  // Study wraps this by calling runWalkForward multiple times with
+  // different masks and diffing the resulting AUCs.
   // modelKind: "nn" (default, equity) or "gbm" (crypto sanity check).
   //   425-param NN on 24-sample folds is massively over-parameterised and
   //   will reliably memorise noise, which — combined with near-zero crypto
@@ -109,7 +122,11 @@ export function runWalkForward(simTrades, opts = {}) {
   // overlap. This is Marcos López de Prado's "purged k-fold with embargo".
 
   // Chronological sort — walk-forward only makes sense in time order.
-  const all = toSamples(simTrades).sort((a, b) => a.timestamp - b.timestamp);
+  // Apply feature-mask BEFORE sort so the mask propagates into every
+  // downstream train/test path consistently.
+  const all = toSamples(simTrades)
+    .map(s => maskFeatures(s, maskSlots))
+    .sort((a, b) => a.timestamp - b.timestamp);
   if (all.length < folds * 8) {
     return {
       error: `Not enough samples for ${folds}-fold walk-forward (need ≥${folds * 8}, have ${all.length}). Run a sim with more days.`,
@@ -339,6 +356,62 @@ export function runWalkForward(simTrades, opts = {}) {
       },
       meta: metaMetrics,
     },
+  };
+}
+
+// ─── Ablation study (Phase 4 Commit 7) ───────────────────────────────────
+// For each target feature, run walk-forward with that slot zeroed and
+// measure AUC delta vs the baseline (all features active). Leave-one-out
+// feature importance — measures each feature's MARGINAL contribution.
+//
+// Interpretation:
+//   delta > 0.005 with tight CI → feature carries real signal
+//   delta ≈ 0                   → feature is redundant or dead
+//   delta < -0.005              → feature is actively hurting (rare)
+//
+// Cost: N+1 × single walk-forward runtime. At 5 folds × ~500ms each, a
+// 10-feature ablation is ~30s. Cheaper than a full multi-sim.
+//
+// targets: array of { slot: number, name: string } — the indices to
+// ablate and human-readable labels for the report.
+export function runAblationStudy(simTrades, baseOpts = {}, targets = []) {
+  if (!simTrades?.length) return { error: "no trades provided" };
+  // Baseline run — all features active.
+  const baseline = runWalkForward(simTrades, baseOpts);
+  if (baseline.error) return { error: `baseline: ${baseline.error}` };
+  const baseAUC = baseline.overall?.oosAUC;
+  if (baseAUC == null) return { error: "baseline produced no AUC" };
+
+  const results = [];
+  for (const t of targets) {
+    const masked = runWalkForward(simTrades, { ...baseOpts, maskSlots: [t.slot] });
+    if (masked.error) {
+      results.push({ ...t, auc: null, delta: null, error: masked.error });
+      continue;
+    }
+    const maskedAUC = masked.overall?.oosAUC;
+    if (maskedAUC == null) {
+      results.push({ ...t, auc: null, delta: null, error: "no auc" });
+      continue;
+    }
+    // delta = baseline AUC − masked AUC. Positive delta means removing
+    // the feature HURT the model, so the feature was contributing. The
+    // bigger the positive delta, the more important the feature.
+    results.push({
+      ...t,
+      aucWithout: maskedAUC,
+      aucBaseline: baseAUC,
+      delta: baseAUC - maskedAUC,
+    });
+  }
+  // Sort by delta descending — most important features at the top.
+  results.sort((a, b) => (b.delta ?? -Infinity) - (a.delta ?? -Infinity));
+
+  return {
+    baselineAUC: baseAUC,
+    baselineLogLoss: baseline.overall?.oosLogLoss,
+    baselineSamples: baseline.overall?.oosSamples,
+    results,
   };
 }
 

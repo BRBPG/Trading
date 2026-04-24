@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect, useCallback } from "react";
 import { generateMockQuote, generateLiveIndicators, computeIndicators } from "./mockData";
 import { scoreSetup, logDecision, reviewDecision, getPerformanceStats, getLog, adaptWeights, resetWeights, getCurrentWeights, trainNNFromLog, trainNNFromSim, resetNN, getNNInfo, trainGBMFromSim, trainGBMFromLog, trainRegimeFromSim, FEATURE_NAMES } from "./model";
 import { computeSimMetrics, summariseEdge } from "./simMetrics";
-import { runWalkForward, interpretWF } from "./walkForward";
+import { runWalkForward, interpretWF, runAblationStudy } from "./walkForward";
 import { runBacktest } from "./backtest";
 import { calcADX, calcWilliamsR, calcStochastic, calcROC, calcZScore,
          calcCMF, calcMaxDrawdown, calcSharpe, calcBeta, engineerFeatures,
@@ -1057,6 +1057,8 @@ export default function App() {
   const [multiSimNRuns, setMultiSimNRuns] = useState(20);
   const [trainResult, setTrainResult] = useState(null);
   const [training, setTraining] = useState(false);
+  const [ablationResult, setAblationResult] = useState(null);
+  const [ablationRunning, setAblationRunning] = useState(false);
   // Phase 3d step 2: per-symbol perp funding-rate history, fetched in bulk
   // on refresh when universe is crypto. Map<symbol, records[]> where each
   // record is { time, rate }. Consumed by scoreSetup call sites via
@@ -1758,6 +1760,58 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
     }
     setMultiSimRunning(false);
     setMultiSimState({ phase: null, run: 0, total: 0 });
+  }
+
+  // Ablation study — per-feature leave-one-out AUC delta. Runs on the
+  // trades from the most recent sim (single-sim result preferred; falls
+  // back to triggering a fresh sim if no trades are cached). N+1 walk-
+  // forwards total; ~10-30s depending on fold count.
+  async function runAblation() {
+    if (ablationRunning) return;
+    // Need sim trades to run walk-forwards against. Prefer whatever the
+    // single-sim produced; if the user hasn't run one yet, bail with a
+    // helpful message rather than surprising them with a long fetch.
+    const tradesSource = simResult?.trades;
+    if (!tradesSource || tradesSource.length < 50) {
+      setAblationResult({ error: "Run SIM first (with a daily-horizon BTC or crypto window) so there are ≥50 labelled trades to ablate against." });
+      return;
+    }
+    setAblationRunning(true);
+    setAblationResult(null);
+    // Per-universe targets: which feature slots to test. For crypto-family
+    // we target slots 7-15 (everything non-OHLCV). For equities, we'd
+    // target the macro/PEAD slots — deferred since equity didn't need
+    // this pivot.
+    const cryptoTargets = [
+      { slot: 7,  name: "BTC dominance z" },
+      { slot: 8,  name: "TS momentum z" },
+      { slot: 9,  name: "XS momentum rank" },
+      { slot: 10, name: "Perp funding z" },
+      { slot: 11, name: "DVOL-RV spread z" },
+      { slot: 12, name: "BTC OI Δlog z" },
+      { slot: 13, name: "RV 5d/30d ratio" },
+      { slot: 14, name: "DOW sin" },
+      { slot: 15, name: "Top L/S contrarian z" },
+    ];
+    const targets = isCryptoUniverse(universe) ? cryptoTargets : [];
+    if (!targets.length) {
+      setAblationResult({ error: "Ablation targets defined only for crypto/btc universes in this build." });
+      setAblationRunning(false);
+      return;
+    }
+    try {
+      // Yield once so the UI paints the "running" state before we block.
+      await new Promise(r => setTimeout(r, 30));
+      const out = runAblationStudy(tradesSource, {
+        folds: 5,
+        epochs: 60,
+        modelKind: isCryptoUniverse(universe) ? "gbm" : "nn",
+      }, targets);
+      setAblationResult(out);
+    } catch (err) {
+      setAblationResult({ error: err.message || String(err) });
+    }
+    setAblationRunning(false);
   }
 
   // ─── Train NN on the most recent sim batch ────────────────────────────────
@@ -2627,6 +2681,66 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                           ? `${multiSimState.phase || "starting"}... run ${multiSimState.run}/${multiSimState.total}`
                           : `▶ RUN ${multiSimNRuns}-SIM AVERAGE`}
                       </button>
+
+                      {/* ─── ABLATION STUDY (Phase 4 Commit 7) ─────────────
+                          Per-feature leave-one-out AUC delta on the trades
+                          from the LAST single-sim. Cheap compared to multi-
+                          sim (~N+1 walk-forwards), objective measurement
+                          of which features actually carry signal. */}
+                      {isCryptoUniverse(universe) && (
+                        <div style={{marginTop:10}}>
+                          <button onClick={runAblation} disabled={ablationRunning || !simResult?.trades}
+                            style={{background:ablationRunning?"#111":"#14141F",
+                              border:`1px solid ${ablationRunning?"#2A2A2A":"#6A6AC9"}`,
+                              color:ablationRunning?"#666":"#B0B0FF",
+                              fontSize:10,padding:"6px 12px",cursor:(ablationRunning||!simResult?.trades)?"not-allowed":"pointer",
+                              fontFamily:"inherit",letterSpacing:2,fontWeight:700,width:"100%"}}
+                            title="Leave-one-out feature ablation. Runs walk-forward once per feature slot with that slot zeroed, measures AUC delta vs baseline. Requires a completed sim with ≥50 trades.">
+                            {ablationRunning ? "ABLATING..." : "🧪 ABLATE FEATURES (last sim)"}
+                          </button>
+                          {ablationResult?.error && (
+                            <div style={{marginTop:6,fontSize:9,color:"#E74C3C"}}>⚠ {ablationResult.error}</div>
+                          )}
+                          {ablationResult && !ablationResult.error && (
+                            <div style={{marginTop:8,padding:"6px 10px",background:"#080810",border:"1px solid #1A1A28",fontSize:9,color:"#888"}}>
+                              <div style={{fontSize:8,color:"#6A6AC9",letterSpacing:2,marginBottom:6}}>
+                                🧪 ABLATION — per-feature AUC delta vs baseline ({ablationResult.baselineAUC?.toFixed(3)})
+                              </div>
+                              <div style={{display:"grid",gridTemplateColumns:"0.6fr 2fr 1fr 1fr",gap:4,fontSize:9,marginBottom:4}}>
+                                <div style={{color:"#555"}}>SLOT</div>
+                                <div style={{color:"#555"}}>FEATURE</div>
+                                <div style={{color:"#555"}}>AUC w/o</div>
+                                <div style={{color:"#555"}}>Δ vs base</div>
+                                {ablationResult.results.map(r => {
+                                  const d = r.delta;
+                                  const col = d == null ? "#666"
+                                            : d > 0.005 ? "#2ECC71"    // feature helps
+                                            : d < -0.005 ? "#E74C3C"    // feature hurts
+                                            : "#888";                   // dead / neutral
+                                  return (
+                                    <React.Fragment key={r.slot}>
+                                      <div style={{color:"#888"}}>[{r.slot}]</div>
+                                      <div style={{color:"#CCC"}}>{r.name}</div>
+                                      <div style={{color:"#888"}}>{r.aucWithout?.toFixed(3) ?? "—"}</div>
+                                      <div style={{color:col,fontWeight:700}}>
+                                        {d == null ? "—" : (d >= 0 ? "+" : "") + d.toFixed(4)}
+                                      </div>
+                                    </React.Fragment>
+                                  );
+                                })}
+                              </div>
+                              <div style={{fontSize:8,color:"#555",marginTop:6,lineHeight:1.5}}>
+                                Δ &gt; +0.005 (green) = feature carries signal; removing it hurts.
+                                Δ ≈ 0 = feature is dead or redundant with others.
+                                Δ &lt; -0.005 (red) = feature is actively contributing noise; consider dropping.
+                                Ordering: top = most important. Δ values below ±0.005 are within CI
+                                noise at our sample size; repeat ablation on different sim windows
+                                to confirm before acting on small deltas.
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
                       {multiSimResult?.error && (
                         <>
                           <div style={{marginTop:10,fontSize:10,color:"#E74C3C",lineHeight:1.6}}>⚠ {multiSimResult.error}</div>
