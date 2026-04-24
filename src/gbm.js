@@ -406,6 +406,56 @@ export function getGBMInfo(universe = "equities") {
   };
 }
 
+// ─── Persistent feature mask ───────────────────────────────────────────────
+// The user-applied feature verdict lives here. When set, every training
+// path (trainGBMFromSim, runWalkForward, runContinuousTrain) zeros out
+// these feature slots before feeding samples to the model. This is "THE
+// model's feature set" — a single source of truth that survives refreshes
+// and applies system-wide, per universe.
+function maskKeyFor(universe = "equities") {
+  if (universe === "btc")    return "trader_active_mask_v1_btc";
+  if (universe === "crypto") return "trader_active_mask_v1_crypto";
+  return "trader_active_mask_v1";
+}
+
+export function getActiveMask(universe = "equities") {
+  try {
+    const raw = localStorage.getItem(maskKeyFor(universe));
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed?.slots)) return [];
+    return parsed.slots.filter(n => Number.isInteger(n) && n >= 0);
+  } catch { return []; }
+}
+
+export function setActiveMask(universe, slots, meta = {}) {
+  const clean = Array.isArray(slots)
+    ? [...new Set(slots.filter(n => Number.isInteger(n) && n >= 0))].sort((a, b) => a - b)
+    : [];
+  localStorage.setItem(maskKeyFor(universe), JSON.stringify({
+    slots: clean,
+    appliedAt: new Date().toISOString(),
+    ...meta,
+  }));
+}
+
+export function clearActiveMask(universe = "equities") {
+  localStorage.removeItem(maskKeyFor(universe));
+}
+
+export function getActiveMaskInfo(universe = "equities") {
+  try {
+    const raw = localStorage.getItem(maskKeyFor(universe));
+    if (!raw) return { slots: [], appliedAt: null };
+    const parsed = JSON.parse(raw);
+    return {
+      slots: Array.isArray(parsed.slots) ? parsed.slots : [],
+      appliedAt: parsed.appliedAt || null,
+      source: parsed.source || null,
+    };
+  } catch { return { slots: [], appliedAt: null }; }
+}
+
 // ─── Feature importance (gain-based) ───────────────────────────────────────
 // Walks all trees and aggregates total gain attributed to each feature.
 // Useful for debugging: which features is the model actually using?

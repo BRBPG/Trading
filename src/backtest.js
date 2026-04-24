@@ -273,12 +273,13 @@ function simulateOutcome(bars, i, verdict, holdBars, atr, costBps = 15) {
   };
 }
 
-// Pick N random entry indices that leave room for the forward window. If the
-// available range is tight (e.g. daily mode with limited history), CAP n at
-// the available range rather than silently returning empty — an empty return
-// here cascades to "sim ran and produced nothing" with no visible error.
-function pickEntries(totalBars, warmup, forward, n) {
-  const lo = warmup, hi = totalBars - forward - 1;
+// Pick N random entry indices in the half-open range [lo, hi). Caller is
+// responsible for reserving warmup at the head (lo) AND forward-window space
+// at the tail (hi = upperBound - forwardBars - 1). If the available range is
+// tight (e.g. daily mode with limited history), CAP n at the available range
+// rather than silently returning empty — an empty return here cascades to
+// "sim ran and produced nothing" with no visible error.
+function pickEntriesRange(lo, hi, n) {
   const range = hi - lo;
   if (range <= 0) return [];
   // Allow sampling up to ~80% of available range to avoid total clustering
@@ -301,6 +302,13 @@ export async function runBacktest(symbols, opts = {}) {
   const {
     interval = "5m",
     daysAgo = 7,
+    // endDaysAgo shifts the RECENT edge of the sampling window back in time.
+    // Default 0 = sample up to "now". Set endDaysAgo = simDaysAgo to test
+    // the saved model on a time window it never saw during training: the
+    // sampler picks entries in [now - daysAgo, now - endDaysAgo] (older
+    // window, not overlapping with a training run whose endDaysAgo was 0).
+    // The bar fetch automatically expands to cover daysAgo + warmup.
+    endDaysAgo = 0,
     holdHours = 3,
     samplesPerSymbol = 10,
     costBps = 15,  // round-trip in basis points; realistic retail default
@@ -512,8 +520,13 @@ export async function runBacktest(symbols, opts = {}) {
       ? (isCryptoRun ? 1 : 5 / 7)
       : (isCryptoRun ? 288 : 78);
     const intendedWindowBars = Math.max(1, Math.round(daysAgo * barsPerCalDay));
+    // endDaysAgoBars: number of bars at the RIGHT edge to exclude (holdout
+    // for test-saved-model). Default 0 means we sample up to the most
+    // recent valid bar. Reserve HOLD_BARS + 1 at the tail either way.
+    const endDaysAgoBars = Math.max(0, Math.round(endDaysAgo * barsPerCalDay));
     const windowLo = Math.max(WARMUP_BARS, bars.closes.length - intendedWindowBars);
-    const entries = pickEntries(bars.closes.length, windowLo, HOLD_BARS + 1, samplesPerSymbol);
+    const windowHi = bars.closes.length - endDaysAgoBars - (HOLD_BARS + 1);
+    const entries = pickEntriesRange(windowLo, windowHi, samplesPerSymbol);
     onProgress({ phase: "simulating", symbol, candidates: entries.length, done: s, total: symbols.length });
 
     for (const i of entries) {

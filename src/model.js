@@ -1,5 +1,5 @@
 import { predictNN, trainNN as trainNNRaw, getNNInfo, resetNN as resetNNRaw } from "./nn";
-import { predictGBM, loadGBM, trainGBM as trainGBMRaw, saveGBM, getGBMInfo, resetGBM as resetGBMRaw } from "./gbm";
+import { predictGBM, loadGBM, trainGBM as trainGBMRaw, saveGBM, getGBMInfo, resetGBM as resetGBMRaw, getActiveMask } from "./gbm";
 import { predictRegime, getRegimeInfo, trainRegimeModels as trainRegimeRaw, resetRegimeModels as resetRegimeRaw } from "./regime";
 
 // ─── Pre-trained logistic regression (v3, 16-dim, PER UNIVERSE) ────────────
@@ -720,14 +720,33 @@ export function trainGBMFromLog(reviewedLog, universe = "equities") {
 // warm-start (used by the final masked-feature retrain in runContinuous
 // so the deployed model doesn't inherit trees that split on features
 // now being masked to zero).
+//
+// Active feature mask: the user-applied verdict (persistent localStorage
+// mask) is read here and zeroed out on every sample before training.
+// Extra slots passed via opts.extraMaskSlots are UNIONED in — this is how
+// the continuous Thompson loop layers exploration on top of the applied
+// verdict. Pass opts.ignoreActiveMask:true to bypass (used only when we
+// need a baseline measurement against the full feature set).
 export function trainGBMFromSim(simTrades, universe = "equities", opts = {}) {
-  const { coldStart = false, maxTreesTotal = 300, ...gbmOpts } = opts;
+  const {
+    coldStart = false,
+    maxTreesTotal = 300,
+    extraMaskSlots = [],
+    ignoreActiveMask = false,
+    ...gbmOpts
+  } = opts;
+  const activeMask = ignoreActiveMask ? [] : getActiveMask(universe);
+  const fullMask = new Set([...activeMask, ...extraMaskSlots]);
   const samples = simTrades
     .filter(d => d.outcome && d.features)
-    .map(d => ({
-      x: d.features,
-      y: deriveBullishLabel(d),
-    }));
+    .map(d => {
+      let x = d.features;
+      if (fullMask.size > 0) {
+        x = x.slice();
+        for (const s of fullMask) if (s < x.length) x[s] = 0;
+      }
+      return { x, y: deriveBullishLabel(d) };
+    });
   if (samples.length < 20) {
     return { trained: 0, rounds: 0, reason: `Need ≥20 sim samples, got ${samples.length}` };
   }

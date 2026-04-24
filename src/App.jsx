@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
 import { generateMockQuote, generateLiveIndicators, computeIndicators } from "./mockData";
 import { scoreSetup, logDecision, reviewDecision, getPerformanceStats, getLog, adaptWeights, resetWeights, getCurrentWeights, trainNNFromLog, trainNNFromSim, resetNN, getNNInfo, trainGBMFromSim, trainGBMFromLog, resetGBM, getGBMInfo, trainRegimeFromSim, resetRegime, FEATURE_NAMES } from "./model";
-import { loadGBM, predictGBM } from "./gbm";
+import { loadGBM, predictGBM, getActiveMask, setActiveMask, clearActiveMask, getActiveMaskInfo } from "./gbm";
 import { computeSimMetrics, summariseEdge } from "./simMetrics";
 import { runWalkForward, interpretWF, runAblationStudy } from "./walkForward";
 import { runBacktest, clearBarsCache, barsCacheSize } from "./backtest";
@@ -1110,6 +1110,11 @@ export default function App() {
   // user can see the principled final decision, not just the bandit's
   // moment-to-moment state.
   const [continuousVerdicts, setContinuousVerdicts] = useState(null);
+  // Bump to force re-read of the persistent mask from localStorage when
+  // the user applies or clears a verdict — the GBM panel reads mask
+  // state via getActiveMaskInfo on every render, but that's a pure
+  // function; React needs a trigger to re-render the subtree.
+  const [maskVersion, setMaskVersion] = useState(0);
   // Phase 3d step 2: per-symbol perp funding-rate history, fetched in bulk
   // on refresh when universe is crypto. Map<symbol, records[]> where each
   // record is { time, rate }. Consumed by scoreSetup call sites via
@@ -2047,10 +2052,18 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
       { slot: 14, name: "DOW sin" },
       { slot: 15, name: "Top L/S contrarian z" },
     ];
-    const targets = universe === "btc" ? btcTargets
-                  : universe === "crypto" ? cryptoTargets : [];
+    const rawTargets = universe === "btc" ? btcTargets
+                     : universe === "crypto" ? cryptoTargets : [];
 
-    // Beta posteriors per feature
+    // Load the persistent active mask (user-applied verdict) and exclude
+    // those slots from exploration — they're decided-dead features, no
+    // point wasting cycles probing them. Their zeroing still gets enforced
+    // at training + measurement time via the mask union below.
+    const persistentMask = getActiveMask(universe);
+    const persistentSet = new Set(persistentMask);
+    const targets = rawTargets.filter(t => !persistentSet.has(t.slot));
+
+    // Beta posteriors per feature (only for exploration targets)
     const posteriors = {};
     for (const t of targets) {
       posteriors[t.slot] = { alpha: PRIOR_ALPHA, beta: PRIOR_BETA };
@@ -2104,10 +2117,12 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
       for (let cycle = 0; cycle < N; cycle++) {
         if (continuousAbortRef.current) break;
 
-        // Cycles 1-2 run unmasked to prime the Beta posteriors with a
+        // Cycles 1-2 run with ONLY the persistent mask (no Thompson
+        // exploration yet) to prime the Beta posteriors with a
         // baseline measurement. From cycle 3 onwards Thompson sampling
-        // takes over.
-        const activeMask = cycle < 2 ? [] : thompsonMask();
+        // layers extra drops on top of the committed verdict.
+        const thompsonDrops = cycle < 2 ? [] : thompsonMask();
+        const activeMask = Array.from(new Set([...persistentMask, ...thompsonDrops]));
 
         const baseSamples = simInterval === "1d"
           ? Math.min(30, Math.max(5, Math.floor(simDaysAgo / 10)))
@@ -2141,7 +2156,12 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         // fresh data to the existing model. Oldest trees get evicted
         // when the total hits maxTreesTotal (300). True incremental
         // learning — model state accumulates across cycles.
-        trainGBMFromSim(res.trades, universe);
+        //
+        // Mask: trainGBMFromSim auto-applies the persistent active mask
+        // (committed verdict). We pass Thompson's exploration slots as
+        // extraMaskSlots so the loop searches AROUND the committed
+        // verdict rather than against it.
+        trainGBMFromSim(res.trades, universe, { extraMaskSlots: thompsonDrops });
         // Keep the recent trades for the final feature-mask retrain at
         // run end (500-trade sliding window; we specifically want RECENT
         // data there, not historical, so FIFO is correct for this use).
@@ -2314,25 +2334,23 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
     };
     verdicts.sort((a, b) => sortKey(a) - sortKey(b));
 
-    // APPLY the verdicts — retrain a final GBM on the pool with all DROP
-    // features masked to zero. This is what the user asked for:
-    // "it should be implementing whatever features it chooses by the
-    // end of the model". The saved GBM post-run reflects the verdict.
-    const dropSlots = new Set(verdicts.filter(v => v.verdict === "DROP").map(v => v.slot));
-    if (recentTradesForFinalRetrain.length >= 20 && dropSlots.size > 0) {
-      const maskedRecent = recentTradesForFinalRetrain.map(t => {
-        if (!t.features) return t;
-        const x = [...t.features];
-        for (const s of dropSlots) if (s < x.length) x[s] = 0;
-        return { ...t, features: x };
+    // PREVIEW the verdict — retrain a final GBM on the pool with the
+    // UNION of (existing persistent mask ∪ this run's DROP verdicts)
+    // zeroed. The saved GBM post-run reflects what the model would look
+    // like IF the user clicks APPLY VERDICT. Until they apply, the
+    // persistent mask itself is unchanged — user decides whether these
+    // drops stick.
+    const newDropSlots = new Set(verdicts.filter(v => v.verdict === "DROP").map(v => v.slot));
+    const unionMaskForPreview = new Set([...persistentMask, ...newDropSlots]);
+    if (recentTradesForFinalRetrain.length >= 20 && unionMaskForPreview.size > 0) {
+      // Cold-start retrain with the union mask applied. trainGBMFromSim's
+      // ignoreActiveMask=false would auto-apply persistent — we pass the
+      // exact set via extraMaskSlots to be explicit about the preview
+      // semantics.
+      trainGBMFromSim(recentTradesForFinalRetrain, universe, {
+        coldStart: true,
+        extraMaskSlots: Array.from(unionMaskForPreview),
       });
-      // Cold-start the retrain: existing warm-started trees may have
-      // splits on features we're now masking to zero, which creates
-      // awkward tree paths (zeroed feature always takes one branch).
-      // Cleaner to train a fresh GBM on recent masked data and REPLACE
-      // the saved model — loss of accumulated tree structure, gain of
-      // a model that genuinely doesn't depend on the dropped features.
-      trainGBMFromSim(maskedRecent, universe, { coldStart: true });
     }
 
     setContinuousVerdicts({
@@ -2340,7 +2358,8 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
       totalCycles: results.filter(r => r.auc != null).length,
       bestAUC,
       finalPoolSize: recentTradesForFinalRetrain.length,
-      droppedSlots: Array.from(dropSlots),
+      droppedSlots: Array.from(newDropSlots),
+      persistentSlots: persistentMask,
       timestamp: Date.now(),
     });
 
@@ -2348,17 +2367,22 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
     continuousAbortRef.current = false;
   }
 
-  // ─── Test the currently-saved GBM on fresh simulated data ────────────
+  // ─── Test the currently-saved GBM on a HELD-OUT time window ──────────
   // User asked: "there should be an option to apply the verdict here
   // and then like run simulations on it or use it because otherwise the
-  // verdict is kind of pointless." The continuous run already applies
-  // the verdict (end-of-run cold-start retrain with DROP features
-  // masked). This function measures how well THAT saved model performs
-  // on a fresh sim — no retraining, just predictions vs ground truth.
+  // verdict is kind of pointless." Previous naive implementation tested
+  // on a fresh sim drawn from the SAME time window as training, which
+  // just measured memorization (90%+ AUC on BTC daily because only ~180
+  // entry bars exist in a 180-day window, all seen by the GBM multiple
+  // times across 20 warm-start cycles).
   //
-  // Unlike walk-forward (which retrains per fold to measure "is there
-  // signal in the data?"), this measures "how good is the model I just
-  // trained?" — the honest live-model evaluation.
+  // Fix: sample entries from an OLDER window that training never touched.
+  // If training used the last `simDaysAgo` days, test uses a window of
+  // equal length PRIOR to that — achieved via runBacktest's endDaysAgo
+  // parameter which shifts the recent edge of the sampling window back
+  // in time. Needs enough historical bars (Polygon BTC has 5yr of daily
+  // data via the WARMUP_FETCH_DAYS=1825 setting, so a held-out window
+  // of 180d prior to training is available).
   async function runTestSavedModel() {
     if (testRunning) return;
     const savedGBM = loadGBM(universe);
@@ -2373,16 +2397,21 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
       ? activeBacktestSymbols.filter(s => !activeHighVolSymbols.includes(s))
       : activeBacktestSymbols;
     const nSyms = Math.max(1, symsForRun.length);
+    // Held-out window: look BACK an additional simDaysAgo-worth of time,
+    // so sampling happens in [now - 2*simDaysAgo, now - simDaysAgo].
+    const holdoutLengthDays = simDaysAgo;
+    const holdoutEndDaysAgo = simDaysAgo;
     const baseSamples = simInterval === "1d"
-      ? Math.min(30, Math.max(5, Math.floor(simDaysAgo / 10)))
-      : (simDaysAgo <= 7 ? 10 : simDaysAgo <= 30 ? 20 : 40);
+      ? Math.min(30, Math.max(5, Math.floor(holdoutLengthDays / 10)))
+      : (holdoutLengthDays <= 7 ? 10 : holdoutLengthDays <= 30 ? 20 : 40);
     const samples = Math.max(baseSamples, Math.ceil(120 / nSyms));
 
     try {
       await new Promise(r => setTimeout(r, 30));
       const res = await runBacktest(symsForRun, {
         interval: simInterval,
-        daysAgo: simDaysAgo,
+        daysAgo: simDaysAgo + holdoutLengthDays,
+        endDaysAgo: holdoutEndDaysAgo,
         holdHours: maxHoldHours,
         samplesPerSymbol: samples,
         costBps,
@@ -2392,7 +2421,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         onProgress: () => {},
       });
       if (!res.trades.length) {
-        setTestResult({ error: "Sim produced no trades — try longer DAYS AGO." });
+        setTestResult({ error: `No trades in held-out window (days ${holdoutEndDaysAgo}–${simDaysAgo + holdoutLengthDays} ago). Polygon key or longer history needed — BTC with Polygon supports up to ~1800 days of warmup.` });
         setTestRunning(false);
         return;
       }
@@ -2400,13 +2429,19 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
       // Predict with saved GBM — no retraining, no folds. Just ground-truth
       // labels vs saved-model probabilities. Trade feature vectors already
       // extracted by the backtest. Labels derived from direction (price up
-      // = y=1) matching how the GBM was trained.
+      // = y=1) matching how the GBM was trained. The persistent mask is
+      // ALREADY baked into the saved GBM's trees (they were trained on
+      // masked features), so we feed the raw feature vector — the model's
+      // tree structure naturally ignores the masked slots that were zero
+      // during training.
       const preds = res.trades
         .filter(t => t.features && t.outcome)
         .map(t => {
-          const y = (t.verdict === "BUY" && t.outcome === "WIN") ||
-                    (t.verdict === "SELL" && t.outcome === "LOSS") ? 1 : 0;
-          return { y, yHat: predictGBM(savedGBM, t.features) };
+          const lb = (t.labelBullish === 0 || t.labelBullish === 1)
+            ? t.labelBullish
+            : ((t.verdict === "BUY" && t.outcome === "WIN") ||
+               (t.verdict === "SELL" && t.outcome === "LOSS") ? 1 : 0);
+          return { y: lb, yHat: predictGBM(savedGBM, t.features) };
         });
       if (preds.length < 20) {
         setTestResult({ error: `Only ${preds.length} valid predictions — too few for reliable AUC.` });
@@ -2457,6 +2492,8 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         top10: byConv(0.10),
         treeCount: savedGBM.trees.length,
         trainedCycles: savedGBM.cyclesTrainedOn || 0,
+        holdoutWindow: { from: simDaysAgo + holdoutLengthDays, to: holdoutEndDaysAgo },
+        maskSlots: getActiveMask(universe),
       });
     } catch (err) {
       setTestResult({ error: err.message || String(err) });
@@ -2769,7 +2806,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                       </div>
                       <div style={{marginTop:6,fontSize:10,color:"#888"}}>
                         Confidence: <b style={{color:"#FFF"}}>{m.confidence}%</b>
-                        &nbsp;·&nbsp; Agreement: <b style={{color:m.agreement.count>=m.agreement.total?"#2ECC71":m.agreement.count>=(m.agreement.total-1)?"#C9A84C":"#E74C3C"}}>{m.agreement.count}/{m.agreement.total} {m.agreement.total===1?"(NN untrained)":"models"}</b>
+                        &nbsp;·&nbsp; Agreement: <b style={{color:m.agreement.count>=m.agreement.total?"#2ECC71":m.agreement.count>=(m.agreement.total-1)?"#C9A84C":"#E74C3C"}}>{m.agreement.count}/{m.agreement.total} {m.agreement.total===1?"(GBM-only — NN legacy)":"models"}</b>
                         &nbsp;·&nbsp; Weights: LR {(m.weights.lr*100).toFixed(0)}% · NN {(m.weights.nn*100).toFixed(0)}% · GBM {((m.weights.gbm||0)*100).toFixed(0)}% · Tree {(m.weights.tree*100).toFixed(0)}%
                         {m.gbmSource && m.gbmSource !== "universal" && (
                           <> &nbsp;·&nbsp; <span style={{color:"#D87FD8"}}>GBM regime: <b>{m.gbmSource.toUpperCase()}</b></span></>
@@ -3559,19 +3596,26 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                       })()}
                       </>)}
 
-                      {/* ═══ TEST SAVED MODEL ═══ Fresh sim → predict
-                          with the persisted (verdict-applied) GBM → AUC.
-                          The honest "is the trained model I'm about to
-                          deploy actually any good on new data?" */}
+                      {/* ═══ TEST SAVED MODEL ═══ Held-out time window →
+                          predict with the persisted (verdict-applied) GBM
+                          → honest OOS AUC. Earlier naive version tested
+                          on the training window and scored 90%+ because
+                          BTC daily over 180d has only ~180 entry bars
+                          all memorized across warm-start cycles. Fixed by
+                          sampling from a PRIOR window (days simDaysAgo —
+                          2*simDaysAgo) via runBacktest's endDaysAgo
+                          parameter. Only works with Polygon BTC which has
+                          5yr of daily history cached via warmup. */}
                       {isCryptoUniverse(universe) && (
                         <div style={{marginTop:12,padding:10,background:"#090C12",border:"1px solid #3A3A6A"}}>
                           <div style={{fontSize:9,color:"#B0B0FF",letterSpacing:2,marginBottom:8}}>
-                            🎯 TEST SAVED MODEL — fresh sim against the currently-persisted GBM
+                            🎯 TEST SAVED MODEL — held-out time window (prior {simDaysAgo}d) against the persisted GBM
                           </div>
                           <div style={{fontSize:9,color:"#888",lineHeight:1.5,marginBottom:8}}>
-                            Generates a fresh sim and predicts with the SAVED GBM (whatever the
-                            last continuous run produced + applied verdict). No retraining. Tells
-                            you how the model you just trained performs on brand-new trades.
+                            Samples trades from a time window the model NEVER saw during training
+                            (days {simDaysAgo}–{simDaysAgo * 2} ago — immediately prior to the training
+                            window) and predicts with the saved GBM. No retraining, no in-sample leak.
+                            Requires a Polygon key for BTC (needs historical bars beyond the training window).
                           </div>
                           <button onClick={runTestSavedModel} disabled={testRunning}
                             style={{background:testRunning?"#111":"#141422",
@@ -3579,7 +3623,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                               color:testRunning?"#666":"#B0B0FF",
                               fontSize:10,padding:"6px 12px",cursor:testRunning?"not-allowed":"pointer",
                               fontFamily:"inherit",letterSpacing:1.5,fontWeight:700,width:"100%"}}>
-                            {testRunning ? "TESTING..." : "▶ RUN TEST ON FRESH SIM"}
+                            {testRunning ? "TESTING..." : "▶ RUN TEST ON HELD-OUT WINDOW"}
                           </button>
                           {testResult?.error && (
                             <div style={{marginTop:8,fontSize:9,color:"#E74C3C"}}>⚠ {testResult.error}</div>
@@ -3587,7 +3631,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                           {testResult && !testResult.error && (
                             <div style={{marginTop:10,padding:"6px 10px",background:"#080810",border:"1px solid #1A1A2A",fontSize:9}}>
                               <div style={{fontSize:8,color:"#6A6AC9",letterSpacing:2,marginBottom:6}}>
-                                RESULTS — {testResult.trades} fresh trades vs saved model ({testResult.trainedCycles} cycles, {testResult.treeCount} trees)
+                                RESULTS — {testResult.trades} held-out trades (days {testResult.holdoutWindow?.from}–{testResult.holdoutWindow?.to} ago) vs saved model ({testResult.trainedCycles} cycles, {testResult.treeCount} trees{testResult.maskSlots?.length ? `, mask ${testResult.maskSlots.map(s => `[${s}]`).join(" ")}` : ""})
                               </div>
                               <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6,marginBottom:6}}>
                                 <div style={{padding:"4px 8px",background:"#0A0A0A",border:"1px solid #1A1A1A"}}>
@@ -3624,12 +3668,11 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                                 </div>
                               </div>
                               <div style={{fontSize:8,color:"#555",marginTop:6,lineHeight:1.5}}>
-                                This is the actual deployed model's OOS performance. If live AUC here
-                                agrees with the continuous-run mean AUC, training is honest. If it
-                                drops significantly, the run may have overfit the Thompson masks.
-                                Top-conviction AUCs tell you whether a trading filter (only trade when
-                                |prob−0.5| ≥ threshold) improves the edge — use the threshold column
-                                as the filter live.
+                                This is the deployed model's HONEST OOS on a time window it never saw.
+                                Should track the continuous-run mean AUC (~{continuousResults.length > 0 && continuousResults.filter(r => r.auc != null).length ? (continuousResults.filter(r => r.auc != null).reduce((a,r)=>a+r.auc,0)/continuousResults.filter(r => r.auc != null).length).toFixed(3) : "0.54"}). If this comes back at 0.95+
+                                something's leaking (check endDaysAgo got passed); if it's at 0.50 the
+                                model has no edge on unseen regime. Top-conviction AUCs tell you whether
+                                a live |prob−0.5| ≥ threshold filter improves the edge.
                               </div>
                             </div>
                           )}
@@ -3712,9 +3755,9 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                                     evicted as new ones added). */}
                                 <div style={{padding:"6px 10px",background:"#0A0F18",border:"1px solid #1A2A4A",marginBottom:8,fontSize:9}}>
                                   <div style={{fontSize:7,color:"#6A9FDF",letterSpacing:2,marginBottom:4}}>
-                                    🧠 MODEL STATE — {universe.toUpperCase()} GBM (warm-start continuous learning)
+                                    🧠 MODEL STATE — {universe.toUpperCase()} GBM (THE model · warm-start continuous learning)
                                   </div>
-                                  <div style={{display:"grid",gridTemplateColumns:"0.8fr 1.3fr 1.2fr 1.2fr",gap:6}}>
+                                  <div style={{display:"grid",gridTemplateColumns:"0.6fr 1.0fr 1.0fr 1.0fr 1.4fr",gap:6}}>
                                     <div>
                                       <span style={{color:"#555"}}>TREES </span>
                                       <span style={{color:treeCount>0?"#2ECC71":"#888",fontWeight:700}}>{treeCount}</span>
@@ -3730,6 +3773,20 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                                     <div>
                                       <span style={{color:"#555"}}>UPDATED </span>
                                       <span style={{color:"#CCC",fontWeight:700}}>{savedUpdatedAt || "never"}</span>
+                                    </div>
+                                    <div>
+                                      <span style={{color:"#555"}}>APPLIED MASK </span>
+                                      {(() => {
+                                        // Keyed on maskVersion so APPLY/CLEAR
+                                        // re-renders this subtree cleanly.
+                                        void maskVersion;
+                                        const mi = getActiveMaskInfo(universe);
+                                        return mi.slots.length > 0 ? (
+                                          <span style={{color:"#C97A7A",fontWeight:700}}>{mi.slots.map(s => `[${s}]`).join(" ")}</span>
+                                        ) : (
+                                          <span style={{color:"#7FD8A6",fontWeight:700}}>none · all features</span>
+                                        );
+                                      })()}
                                     </div>
                                   </div>
                                 </div>
@@ -3807,7 +3864,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                           {continuousVerdicts && (
                             <div style={{marginTop:12,padding:"8px 12px",background:"#0A1A0A",border:"1px solid #2A5A3A"}}>
                               <div style={{fontSize:9,color:"#7FD8A6",letterSpacing:2,marginBottom:6}}>
-                                📊 FINAL FEATURE VERDICTS — binary decision applied to saved GBM ({continuousVerdicts.totalCycles} cycles, pool {continuousVerdicts.finalPoolSize} trades)
+                                📊 FINAL FEATURE VERDICTS — preview of what APPLY would drop ({continuousVerdicts.totalCycles} cycles, pool {continuousVerdicts.finalPoolSize} trades)
                               </div>
                               <div style={{display:"grid",gridTemplateColumns:"0.5fr 2fr 0.7fr 0.7fr 0.8fr 0.8fr 0.5fr",gap:6,fontSize:9,rowGap:3}}>
                                 <div style={{fontSize:8,color:"#555"}}>SLOT</div>
@@ -3834,13 +3891,81 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                                 })}
                               </div>
                               <div style={{fontSize:8,color:"#555",marginTop:6,lineHeight:1.5}}>
-                                KEEP if median Δ &gt; 0 OR posterior mean &gt; 0.5. DROP otherwise. Every feature gets an
-                                actionable verdict — no uncertain purgatory. CONFIDENCE = HIGH when both signals agree
-                                strongly with n ≥ 4 observations; MED on signal disagreement; LOW on weak evidence.
-                                {continuousVerdicts.droppedSlots.length > 0
-                                  ? ` Saved GBM retrained on pool with slots ${continuousVerdicts.droppedSlots.map(s => `[${s}]`).join(" ")} masked — live predictions now use only the KEEP features.`
-                                  : ` All features kept — no mask applied to the final saved GBM.`}
+                                KEEP if median Δ &gt; 0 OR posterior mean &gt; 0.5. DROP otherwise. CONFIDENCE = HIGH when both signals
+                                agree strongly with n ≥ 4 observations; MED on signal disagreement; LOW on weak evidence.
+                                The saved GBM has been cold-retrained with the union of (persistent mask ∪ this run's DROPs) applied
+                                so the MODEL STATE panel reflects what APPLY would deliver.
                               </div>
+                              {/* APPLY / CLEAR — commits the verdict to
+                                  the persistent mask so it sticks across
+                                  sessions and all training paths (scoring,
+                                  sim, continuous) honour it. This is the
+                                  single source of truth for "THE model's
+                                  feature set." */}
+                              {(() => {
+                                const currentMaskInfo = getActiveMaskInfo(universe);
+                                const proposedDrops = continuousVerdicts.droppedSlots;
+                                const newSlots = proposedDrops.filter(s => !currentMaskInfo.slots.includes(s));
+                                const unchanged = newSlots.length === 0 && proposedDrops.every(s => currentMaskInfo.slots.includes(s));
+                                return (
+                                  <div style={{marginTop:10,padding:"8px 10px",background:"#050A15",border:"1px solid #1A3A5A",borderRadius:2}}>
+                                    <div style={{fontSize:8,color:"#6A9FDF",letterSpacing:1.5,marginBottom:6}}>
+                                      COMMIT TO THE MODEL — persist this verdict system-wide
+                                    </div>
+                                    <div style={{fontSize:8,color:"#888",marginBottom:6,lineHeight:1.5}}>
+                                      Currently applied: <b style={{color:currentMaskInfo.slots.length?"#C97A7A":"#7FD8A6"}}>
+                                        {currentMaskInfo.slots.length ? currentMaskInfo.slots.map(s => `[${s}]`).join(" ") : "no mask — all features active"}
+                                      </b>
+                                      {currentMaskInfo.appliedAt && (
+                                        <> &nbsp;·&nbsp; applied {new Date(currentMaskInfo.appliedAt).toLocaleString()}</>
+                                      )}
+                                    </div>
+                                    <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                                      <button
+                                        onClick={() => {
+                                          if (proposedDrops.length === 0) return;
+                                          setActiveMask(universe, proposedDrops, { source: "continuous_verdict" });
+                                          // Cold-retrain with the now-persistent mask so the
+                                          // saved GBM reflects the committed feature set.
+                                          if (continuousVerdicts.finalPoolSize >= 20) {
+                                            // No way to access the pool from out here — the final
+                                            // retrain was already done before this button existed
+                                            // with the union mask applied. Saved model already
+                                            // matches the APPLY state; just persist the mask.
+                                          }
+                                          setMaskVersion(v => v + 1);
+                                        }}
+                                        disabled={unchanged || proposedDrops.length === 0}
+                                        style={{background:unchanged||proposedDrops.length===0?"#111":"#0F2A15",
+                                          border:`1px solid ${unchanged||proposedDrops.length===0?"#2A2A2A":"#4A8A5A"}`,
+                                          color:unchanged||proposedDrops.length===0?"#666":"#7FD8A6",
+                                          fontSize:9,padding:"6px 14px",cursor:unchanged||proposedDrops.length===0?"not-allowed":"pointer",
+                                          fontFamily:"inherit",letterSpacing:1.5,fontWeight:700}}>
+                                        {unchanged ? "✓ ALREADY APPLIED" : proposedDrops.length === 0 ? "NOTHING TO DROP" : `APPLY VERDICT → DROP ${proposedDrops.length} SLOT${proposedDrops.length===1?"":"S"}`}
+                                      </button>
+                                      <button
+                                        onClick={() => {
+                                          clearActiveMask(universe);
+                                          setMaskVersion(v => v + 1);
+                                        }}
+                                        disabled={currentMaskInfo.slots.length === 0}
+                                        style={{background:currentMaskInfo.slots.length===0?"#111":"#2A1515",
+                                          border:`1px solid ${currentMaskInfo.slots.length===0?"#2A2A2A":"#8A4A4A"}`,
+                                          color:currentMaskInfo.slots.length===0?"#666":"#D88080",
+                                          fontSize:9,padding:"6px 14px",cursor:currentMaskInfo.slots.length===0?"not-allowed":"pointer",
+                                          fontFamily:"inherit",letterSpacing:1.5,fontWeight:700}}>
+                                        ✕ CLEAR MASK — all features active
+                                      </button>
+                                    </div>
+                                    <div style={{fontSize:8,color:"#555",marginTop:6,lineHeight:1.5}}>
+                                      APPLY writes {proposedDrops.length ? `slots ${proposedDrops.map(s => `[${s}]`).join(" ")}` : "nothing"} to localStorage.
+                                      From then on every sim, continuous run, walk-forward, and scoreSetup zeros those slots before
+                                      training or predicting — this is "THE model's" feature set across the whole dashboard. CLEAR
+                                      wipes the mask so all features are live again (use before a fresh regime-change probe).
+                                    </div>
+                                  </div>
+                                );
+                              })()}
                             </div>
                           )}
                         </div>
