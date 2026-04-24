@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
 import { generateMockQuote, generateLiveIndicators, computeIndicators } from "./mockData";
 import { scoreSetup, logDecision, reviewDecision, getPerformanceStats, getLog, adaptWeights, resetWeights, getCurrentWeights, trainNNFromLog, trainNNFromSim, resetNN, getNNInfo, trainGBMFromSim, trainGBMFromLog, resetGBM, getGBMInfo, trainRegimeFromSim, resetRegime, FEATURE_NAMES } from "./model";
-import { loadGBM } from "./gbm";
+import { loadGBM, predictGBM } from "./gbm";
 import { computeSimMetrics, summariseEdge } from "./simMetrics";
 import { runWalkForward, interpretWF, runAblationStudy } from "./walkForward";
 import { runBacktest, clearBarsCache, barsCacheSize } from "./backtest";
@@ -1069,6 +1069,14 @@ export default function App() {
   const [simDaysAgo, setSimDaysAgo] = useState(180);  // btc default: 180d window
   const [wfResult, setWfResult] = useState(null);
   const [wfRunning, setWfRunning] = useState(false);
+  // TEST SAVED MODEL — runs a fresh sim and evaluates the currently-
+  // saved GBM (which has the verdict applied, if the continuous run
+  // produced any DROPs). Unlike walk-forward which trains fresh per
+  // fold, this measures the ACTUAL deployed model's OOS performance
+  // on brand-new trades. The honest check "is the model I trained
+  // yesterday any good?"
+  const [testRunning, setTestRunning] = useState(false);
+  const [testResult, setTestResult] = useState(null);
   const [multiSimResult, setMultiSimResult] = useState(null);
   const [multiSimRunning, setMultiSimRunning] = useState(false);
   const [multiSimState, setMultiSimState] = useState({ phase: null, run: 0, total: 0 });
@@ -2340,6 +2348,122 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
     continuousAbortRef.current = false;
   }
 
+  // ─── Test the currently-saved GBM on fresh simulated data ────────────
+  // User asked: "there should be an option to apply the verdict here
+  // and then like run simulations on it or use it because otherwise the
+  // verdict is kind of pointless." The continuous run already applies
+  // the verdict (end-of-run cold-start retrain with DROP features
+  // masked). This function measures how well THAT saved model performs
+  // on a fresh sim — no retraining, just predictions vs ground truth.
+  //
+  // Unlike walk-forward (which retrains per fold to measure "is there
+  // signal in the data?"), this measures "how good is the model I just
+  // trained?" — the honest live-model evaluation.
+  async function runTestSavedModel() {
+    if (testRunning) return;
+    const savedGBM = loadGBM(universe);
+    if (!savedGBM?.trees?.length) {
+      setTestResult({ error: "No saved GBM to test. Run ADAPTIVE CONTINUOUS TRAINING first." });
+      return;
+    }
+    setTestRunning(true);
+    setTestResult(null);
+
+    const symsForRun = excludeHighVol
+      ? activeBacktestSymbols.filter(s => !activeHighVolSymbols.includes(s))
+      : activeBacktestSymbols;
+    const nSyms = Math.max(1, symsForRun.length);
+    const baseSamples = simInterval === "1d"
+      ? Math.min(30, Math.max(5, Math.floor(simDaysAgo / 10)))
+      : (simDaysAgo <= 7 ? 10 : simDaysAgo <= 30 ? 20 : 40);
+    const samples = Math.max(baseSamples, Math.ceil(120 / nSyms));
+
+    try {
+      await new Promise(r => setTimeout(r, 30));
+      const res = await runBacktest(symsForRun, {
+        interval: simInterval,
+        daysAgo: simDaysAgo,
+        holdHours: maxHoldHours,
+        samplesPerSymbol: samples,
+        costBps,
+        polygonKey: polygonKey || null,
+        earningsMap,
+        universe,
+        onProgress: () => {},
+      });
+      if (!res.trades.length) {
+        setTestResult({ error: "Sim produced no trades — try longer DAYS AGO." });
+        setTestRunning(false);
+        return;
+      }
+
+      // Predict with saved GBM — no retraining, no folds. Just ground-truth
+      // labels vs saved-model probabilities. Trade feature vectors already
+      // extracted by the backtest. Labels derived from direction (price up
+      // = y=1) matching how the GBM was trained.
+      const preds = res.trades
+        .filter(t => t.features && t.outcome)
+        .map(t => {
+          const y = (t.verdict === "BUY" && t.outcome === "WIN") ||
+                    (t.verdict === "SELL" && t.outcome === "LOSS") ? 1 : 0;
+          return { y, yHat: predictGBM(savedGBM, t.features) };
+        });
+      if (preds.length < 20) {
+        setTestResult({ error: `Only ${preds.length} valid predictions — too few for reliable AUC.` });
+        setTestRunning(false);
+        return;
+      }
+
+      // AUC via Mann-Whitney U
+      const pos = preds.filter(p => p.y === 1).map(p => p.yHat);
+      const neg = preds.filter(p => p.y === 0).map(p => p.yHat);
+      let auc = null;
+      if (pos.length && neg.length) {
+        let wins = 0;
+        for (const a of pos) for (const b of neg) {
+          if (a > b) wins += 1;
+          else if (a === b) wins += 0.5;
+        }
+        auc = wins / (pos.length * neg.length);
+      }
+      // Log-loss clipped to [0.01, 0.99]
+      const logLoss = preds.reduce((acc, p) => {
+        const yh = Math.max(0.01, Math.min(0.99, p.yHat));
+        return acc - (p.y * Math.log(yh) + (1 - p.y) * Math.log(1 - yh));
+      }, 0) / preds.length;
+      const accuracy = preds.filter(p => (p.yHat >= 0.5 ? 1 : 0) === p.y).length / preds.length;
+      // Conviction-stratified: top 30% / 10% by |yHat - 0.5|
+      const byConv = (q) => {
+        const sorted = [...preds].sort((a, b) => Math.abs(b.yHat - 0.5) - Math.abs(a.yHat - 0.5));
+        const take = Math.max(1, Math.floor(preds.length * q));
+        const subset = sorted.slice(0, take);
+        const subPos = subset.filter(p => p.y === 1).map(p => p.yHat);
+        const subNeg = subset.filter(p => p.y === 0).map(p => p.yHat);
+        if (!subPos.length || !subNeg.length) return { n: subset.length, auc: null };
+        let w = 0;
+        for (const a of subPos) for (const b of subNeg) {
+          if (a > b) w += 1; else if (a === b) w += 0.5;
+        }
+        return { n: subset.length, auc: w / (subPos.length * subNeg.length),
+                 threshold: Math.min(...subset.map(p => Math.abs(p.yHat - 0.5))) };
+      };
+
+      setTestResult({
+        trades: preds.length,
+        auc,
+        logLoss,
+        accuracy,
+        top30: byConv(0.30),
+        top10: byConv(0.10),
+        treeCount: savedGBM.trees.length,
+        trainedCycles: savedGBM.cyclesTrainedOn || 0,
+      });
+    } catch (err) {
+      setTestResult({ error: err.message || String(err) });
+    }
+    setTestRunning(false);
+  }
+
   // ─── Train NN on the most recent sim batch ────────────────────────────────
   function trainOnSim() {
     if (training || !simResult?.trades?.length) return;
@@ -3434,6 +3558,83 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                         );
                       })()}
                       </>)}
+
+                      {/* ═══ TEST SAVED MODEL ═══ Fresh sim → predict
+                          with the persisted (verdict-applied) GBM → AUC.
+                          The honest "is the trained model I'm about to
+                          deploy actually any good on new data?" */}
+                      {isCryptoUniverse(universe) && (
+                        <div style={{marginTop:12,padding:10,background:"#090C12",border:"1px solid #3A3A6A"}}>
+                          <div style={{fontSize:9,color:"#B0B0FF",letterSpacing:2,marginBottom:8}}>
+                            🎯 TEST SAVED MODEL — fresh sim against the currently-persisted GBM
+                          </div>
+                          <div style={{fontSize:9,color:"#888",lineHeight:1.5,marginBottom:8}}>
+                            Generates a fresh sim and predicts with the SAVED GBM (whatever the
+                            last continuous run produced + applied verdict). No retraining. Tells
+                            you how the model you just trained performs on brand-new trades.
+                          </div>
+                          <button onClick={runTestSavedModel} disabled={testRunning}
+                            style={{background:testRunning?"#111":"#141422",
+                              border:`1px solid ${testRunning?"#2A2A2A":"#4A4A8A"}`,
+                              color:testRunning?"#666":"#B0B0FF",
+                              fontSize:10,padding:"6px 12px",cursor:testRunning?"not-allowed":"pointer",
+                              fontFamily:"inherit",letterSpacing:1.5,fontWeight:700,width:"100%"}}>
+                            {testRunning ? "TESTING..." : "▶ RUN TEST ON FRESH SIM"}
+                          </button>
+                          {testResult?.error && (
+                            <div style={{marginTop:8,fontSize:9,color:"#E74C3C"}}>⚠ {testResult.error}</div>
+                          )}
+                          {testResult && !testResult.error && (
+                            <div style={{marginTop:10,padding:"6px 10px",background:"#080810",border:"1px solid #1A1A2A",fontSize:9}}>
+                              <div style={{fontSize:8,color:"#6A6AC9",letterSpacing:2,marginBottom:6}}>
+                                RESULTS — {testResult.trades} fresh trades vs saved model ({testResult.trainedCycles} cycles, {testResult.treeCount} trees)
+                              </div>
+                              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6,marginBottom:6}}>
+                                <div style={{padding:"4px 8px",background:"#0A0A0A",border:"1px solid #1A1A1A"}}>
+                                  <div style={{fontSize:7,color:"#555"}}>OOS AUC</div>
+                                  <div style={{color: testResult.auc >= 0.56 ? "#2ECC71" : testResult.auc >= 0.52 ? "#C9A84C" : "#E74C3C",fontWeight:700,fontSize:14}}>
+                                    {testResult.auc != null ? testResult.auc.toFixed(3) : "—"}
+                                  </div>
+                                </div>
+                                <div style={{padding:"4px 8px",background:"#0A0A0A",border:"1px solid #1A1A1A"}}>
+                                  <div style={{fontSize:7,color:"#555"}}>LOG-LOSS</div>
+                                  <div style={{color: testResult.logLoss < 0.69 ? "#2ECC71" : "#888",fontWeight:700,fontSize:14}}>
+                                    {testResult.logLoss != null ? testResult.logLoss.toFixed(3) : "—"}
+                                  </div>
+                                </div>
+                                <div style={{padding:"4px 8px",background:"#0A0A0A",border:"1px solid #1A1A1A"}}>
+                                  <div style={{fontSize:7,color:"#555"}}>ACCURACY</div>
+                                  <div style={{color: testResult.accuracy >= 0.55 ? "#2ECC71" : testResult.accuracy >= 0.5 ? "#C9A84C" : "#E74C3C",fontWeight:700,fontSize:14}}>
+                                    {(testResult.accuracy * 100).toFixed(1)}%
+                                  </div>
+                                </div>
+                              </div>
+                              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6}}>
+                                <div style={{padding:"4px 8px",background:"#0A0A0A",border:"1px solid #1A1A1A"}}>
+                                  <div style={{fontSize:7,color:"#555"}}>TOP-30% CONVICTION</div>
+                                  <div style={{color: testResult.top30?.auc >= 0.56 ? "#2ECC71" : "#C9A84C",fontWeight:700}}>
+                                    AUC {testResult.top30?.auc?.toFixed(3) ?? "—"} · filter |p-0.5| ≥ {testResult.top30?.threshold?.toFixed(3) ?? "—"}
+                                  </div>
+                                </div>
+                                <div style={{padding:"4px 8px",background:"#0A0A0A",border:"1px solid #1A1A1A"}}>
+                                  <div style={{fontSize:7,color:"#555"}}>TOP-10% CONVICTION</div>
+                                  <div style={{color: testResult.top10?.auc >= 0.56 ? "#2ECC71" : "#C9A84C",fontWeight:700}}>
+                                    AUC {testResult.top10?.auc?.toFixed(3) ?? "—"} · filter |p-0.5| ≥ {testResult.top10?.threshold?.toFixed(3) ?? "—"}
+                                  </div>
+                                </div>
+                              </div>
+                              <div style={{fontSize:8,color:"#555",marginTop:6,lineHeight:1.5}}>
+                                This is the actual deployed model's OOS performance. If live AUC here
+                                agrees with the continuous-run mean AUC, training is honest. If it
+                                drops significantly, the run may have overfit the Thompson masks.
+                                Top-conviction AUCs tell you whether a trading filter (only trade when
+                                |prob−0.5| ≥ threshold) improves the edge — use the threshold column
+                                as the filter live.
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
 
                       {/* ═══ ADAPTIVE CONTINUOUS TRAINING (Phase 6 prelude) ═══
                           Runs N sim → train → walk-forward cycles. Every 3rd
