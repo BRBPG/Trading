@@ -1021,17 +1021,27 @@ export default function App() {
   // Max-hold (timeout) for the simulator. Stop and target still exit early
   // on the first bar that touches them — this only governs how long the trade
   // is held when NEITHER stop nor target has been hit.
-  const [maxHoldHours, setMaxHoldHours] = useState(3);
+  const [maxHoldHours, setMaxHoldHours] = useState(5);  // 5-day swing default (btc)
   // Horizon mode: "5m" (intraday 5-min bars, hold 1-24h) vs "1d" (daily
   // bars, hold 1-20 days). The daily horizon is where published retail
   // effects like PEAD and factor momentum live; intraday is mostly noise
   // net of costs. Changing this resets maxHoldHours to a sensible default.
-  const [simInterval, setSimInterval] = useState("5m");
+  // BTC single-asset defaults: daily horizon (all derivative features are
+  // daily-gated), 18 bps cost (top-tier venue), 180d lookback as sensible
+  // starting window.
+  const [simInterval, setSimInterval] = useState("1d");
   // Universe: "equities" (default, the existing US stocks + UK pipeline) or
   // "crypto" (BTC/ETH/alts via Yahoo). Switches the watchlist, session
   // handling, cost defaults, and which model guards fire (e.g. PEAD
   // disabled on crypto since there's no earnings concept).
-  const [universe, setUniverse] = useState("equities");
+  // Universe hard-pinned to BTC single-asset as of Phase 6. Equity and
+  // multi-crypto paths are retained in the model/backtest/training code
+  // (so they still compile and run if the flag is flipped in devtools)
+  // but the UI no longer exposes them — they created unnecessary UI tree
+  // complexity that was a memory/re-render pressure source on the heavy
+  // MODEL tab. Single-universe + 150-coin broad-market context gives the
+  // cleanest mental model for the bot pivot.
+  const [universe] = useState("btc");
   // Runtime-resolved watchlists. Use these throughout the live loop +
   // sim dispatch rather than the compile-time WATCHLIST constant, so that
   // switching universe actually changes which symbols are fetched.
@@ -1044,10 +1054,10 @@ export default function App() {
   // noise sources are removed. Live dashboard / live ANALYZE unaffected.
   const [excludeHighVol, setExcludeHighVol] = useState(false);
   // Round-trip transaction cost applied to every simulated trade's P&L.
-  const [costBps, setCostBps] = useState(15);
+  const [costBps, setCostBps] = useState(18);  // btc top-tier venue default
   // How far back the backtester fetches bars. Capped at 7 on Yahoo, unlimited
   // with Polygon. Set higher for more training data (and more regime variety).
-  const [simDaysAgo, setSimDaysAgo] = useState(7);
+  const [simDaysAgo, setSimDaysAgo] = useState(180);  // btc default: 180d window
   const [wfResult, setWfResult] = useState(null);
   const [wfRunning, setWfRunning] = useState(false);
   const [multiSimResult, setMultiSimResult] = useState(null);
@@ -2149,12 +2159,16 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
           Object.entries(posteriors).map(([s, p]) => [s, p.alpha / (p.alpha + p.beta)])
         );
 
+        // Record only the small summary — NOT the full trades array.
+        // Keeping res.trades across cycles was pushing heap usage over
+        // iPad Safari's ~500MB budget after ~5 cycles; explicit trade
+        // retention here is the hot path for that leak.
         results.push({
           cycle: cycle + 1,
           auc: aucNow,
           logLoss: logLossNow,
           gap: gapNow,
-          trades: res.trades.length,
+          trades: res.trades.length,  // count only, not the array
           mask: activeMask,
           posteriorUpdates,
           posteriors: posteriorSnapshot,
@@ -2162,7 +2176,15 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
           bestSoFar: bestAUC,
           timestamp: Date.now(),
         });
-        setContinuousResults([...results]);
+        // Cap stored history at 50 cycles for display. For longer runs
+        // the older results fall off — keeps React's VDOM bounded.
+        const historyForUI = results.length > 50 ? results.slice(-50) : results;
+        setContinuousResults([...historyForUI]);
+
+        // Explicit cleanup — nullify the large intermediate objects so
+        // they GC before next cycle's fetch allocates more.
+        res.trades = null;
+        ablationDeltas = null;
 
         // Inter-cycle sleep in 500ms increments for prompt abort.
         const sleepIncrements = Math.ceil(INTER_CYCLE_SLEEP_MS / 500);
@@ -2232,46 +2254,16 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
             levels card highlights the matching row, the AI analysis adapts
             its reasoning, and the position sizing uses the matching stop
             distance. One knob, everything aligned. */}
-        {/* Universe toggle — swaps the entire asset class. Switching auto-
-            adjusts the horizon default (crypto → daily) and the cost model
-            (crypto → 30bps), resets the selected symbol to the first of the
-            new watchlist, and disables equity-only features (PEAD, crisis
-            analogue, Buffett persona) for crypto. One knob propagates. */}
-        <button onClick={()=>{
-          // 3-way cycle: equities → crypto → btc → equities. BTC mode is
-          // single-asset focus for the Phase 4 pivot after the 40-coin
-          // crypto universe landed three diagnostics at coin flip.
-          const cycle = { equities: "crypto", crypto: "btc", btc: "equities" };
-          const nextU = cycle[universe] || "equities";
-          setUniverse(nextU);
-          const newList = watchlistFor(nextU);
-          if (!newList.includes(selected)) setSelected(newList[0]);
-          // Per-universe defaults:
-          //   equities → 5m + 15 bps (US-session, tight stops, tuned)
-          //   crypto   → 1d + 30 bps (24/7, research-Tier-A evidence)
-          //   btc      → 1d + 18 bps (single-asset, top-tier venue costs)
-          if (nextU === "crypto") {
-            setSimInterval("1d");
-            setCostBps(30);
-            if (simDaysAgo < 90) setSimDaysAgo(polygonKey ? 180 : 7);
-            if (maxHoldHours < 24) setMaxHoldHours(5);
-          } else if (nextU === "btc") {
-            setSimInterval("1d");
-            setCostBps(18);
-            if (simDaysAgo < 90) setSimDaysAgo(polygonKey ? 180 : 7);
-            if (maxHoldHours < 24) setMaxHoldHours(5);
-          } else {
-            setSimInterval("5m");
-            setCostBps(15);
-          }
-        }}
-          title="Cycle asset universe: equities → crypto (40 symbols) → btc (single-asset focus) → equities. BTC mode isolates training on Bitcoin only — fresh storage keys, xsMomRank disabled (structurally undefined on n=1), dominance proxy disabled (redundant with TS momentum on self)."
-          style={{background: universe === "btc" ? "#14141F" : universe === "crypto" ? "#1A140F" : "#0F1A0F",
-            border:`1px solid ${universe === "btc" ? "#6A6AC9" : universe === "crypto" ? "#C97A2A" : "#2A6A4A"}`,
-            color: universe === "btc" ? "#B0B0FF" : universe === "crypto" ? "#FFB07A" : "#7FD8A6",
-            fontFamily:"inherit",fontSize:9,padding:"3px 10px",cursor:"pointer",letterSpacing:2,fontWeight:700,marginRight:6}}>
-          UNIVERSE: {universe === "btc" ? "BTC (1-asset)" : universe === "crypto" ? "CRYPTO (40)" : "EQUITIES"}
-        </button>
+        {/* Universe fixed to BTC single-asset. Equity + multi-crypto paths
+            are archived (still in code for reference) but removed from UI
+            per Phase 6 pivot: BTC only, 150-coin broad-market context for
+            XS rank / dominance / breadth. One-asset focus reduces React
+            render pressure on the heavy MODEL tab and simplifies the bot
+            deployment story — exchange integration targets only BTC-USD. */}
+        <div style={{background:"#14141F",border:"1px solid #6A6AC9",color:"#B0B0FF",
+          fontFamily:"inherit",fontSize:9,padding:"3px 10px",letterSpacing:2,fontWeight:700,marginRight:6}}>
+          UNIVERSE: BTC (1-asset)
+        </div>
         <button onClick={()=>setSimInterval(simInterval === "1d" ? "5m" : "1d")}
           title="Global horizon — switches the entire app between intraday (tight stops, short holds) and swing (wider stops, multi-day holds). Set here or in the SIM card's HORIZON dropdown; they share state."
           style={{background:simInterval === "1d" ? "#0F1F18" : "#0A0F14",
