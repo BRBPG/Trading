@@ -12,6 +12,7 @@ import { cleanBars, assessQuality, cleaningSummary } from "./cleaning";
 import { downloadExport, importState } from "./persistence";
 import { fetchMacroSnapshot } from "./macro";
 import { fetchBTCDominance, timeSeriesMomentum, xsMomRankLive, rvRatioLive, dayOfWeekSinAt } from "./crypto";
+import { fetchTopCryptoSnapshot, xsRankLive as xsRankLiveBroad, breadthLive } from "./broadMarket";
 import { fetchFundingForUniverse, fundingZLive } from "./funding";
 import { calendarFeatures } from "./calendar";
 import { getEarningsBatch, computePeadFeatures } from "./earnings";
@@ -1065,6 +1066,11 @@ export default function App() {
   // record is { time, rate }. Consumed by scoreSetup call sites via
   // fundingZLive(). Empty Map in equity mode.
   const [fundingMap, setFundingMap] = useState(new Map());
+  // Phase 4.5: top-150 crypto snapshot for btc-universe broad-market context.
+  // One CoinGecko call per refresh (cached in-module), populates XS rank +
+  // breadth + raw dominance for live scoring of BTC without needing to pull
+  // 150 bar series in the browser. Backtest uses the historical-bar pipeline.
+  const [broadMarketSnapshot, setBroadMarketSnapshot] = useState(null);
   const chatRef = useRef(null);
   const importInputRef = useRef(null);
 
@@ -1108,18 +1114,27 @@ export default function App() {
     // crypto, also fetch BTC dominance in parallel — feeds the dominanceZ
     // feature slot via macro.cryptoContext downstream.
     const isCryptoUni = isCryptoUniverse(universe);
-    const [results, macroSnap, btcDom, funding] = await Promise.all([
+    const [results, macroSnap, btcDom, funding, broadSnap] = await Promise.all([
       Promise.all(activeWatchlist.map(s=>fetchQuote(s, finnhubKey))),
       fetchMacroSnapshot().catch(() => null),
-      // BTC dominance only meaningful on multi-crypto — on btc-only universe
-      // it's redundant with self-TS-momentum, so skip the fetch entirely.
+      // BTC dominance from CoinGecko /global — kept for crypto universe
+      // (approximated feed). On btc we compute REAL dominance from the
+      // top-150 snapshot below.
       universe === "crypto" ? fetchBTCDominance().catch(() => null) : Promise.resolve(null),
       // Funding rates: fetched for both "crypto" (40 symbols) and "btc"
       // (just BTC-USD). Session-cached inside funding.js.
       isCryptoUni
         ? fetchFundingForUniverse(activeWatchlist, { concurrency: 10 }).catch(() => new Map())
         : Promise.resolve(new Map()),
+      // Phase 4.5: btc-only broad-market snapshot. CoinGecko is used here
+      // specifically because it's the best free source for market-cap +
+      // cross-sectional return metadata that Polygon doesn't provide. Not a
+      // Polygon downgrade — different data layer entirely.
+      universe === "btc"
+        ? fetchTopCryptoSnapshot(150).catch(() => null)
+        : Promise.resolve(null),
     ]);
+    if (broadSnap) setBroadMarketSnapshot(broadSnap);
     if (funding && funding.size) setFundingMap(funding);
     setQuotes(prev => {
       const map = { ...prev };
@@ -1218,16 +1233,26 @@ export default function App() {
     // feature slot (which equity mode uses for VIX_term).
     const selectedQuote = quotes[selected];
     const isCryptoUni = isCryptoUniverse(universe);
-    // On btc single-asset universe, xsMomRank is structurally undefined
-    // (n=1 has no cross-section) so always 0. tsMom + fundingZ are still
-    // computed from BTC's own data.
+    // Phase 4.5: btc universe uses top-150 snapshot for XS rank + breadth
+    // + (raw) dominance live. Crypto universe keeps the in-watchlist
+    // 40-coin rank; equity unchanged.
+    const btcSnapEntry = universe === "btc" && broadMarketSnapshot
+      ? broadMarketSnapshot.find(s => s.symbol === "BTC") : null;
     const cryptoCtx = (isCryptoUni && selectedQuote?.closes) ? {
       ...(macro?.cryptoContext || {}),
       tsMom: timeSeriesMomentum(selectedQuote.closes),
-      xsMomRank: universe === "btc" ? 0 : xsMomRankLive(selected, quotes),
+      // XS rank: btc → 150-coin snapshot; crypto → 40-coin live.
+      xsMomRank: universe === "btc"
+        ? (btcSnapEntry && broadMarketSnapshot
+            ? xsRankLiveBroad(btcSnapEntry.ret14dPct, broadMarketSnapshot)
+            : 0)
+        : xsMomRankLive(selected, quotes),
       fundingZ: fundingZLive(fundingMap.get(selected)),
       rvRatio: rvRatioLive(selectedQuote.closes, 5, 30),
+      // DOW on crypto universe; breadth on btc (replaced DOW).
       dowSin: dayOfWeekSinAt(Math.floor(Date.now() / 1000)),
+      breadth: universe === "btc" && broadMarketSnapshot
+        ? breadthLive(broadMarketSnapshot) : 0,
     } : macro?.cryptoContext;
     const modelCtx = {
       macro: macro ? { ...macro, cryptoContext: cryptoCtx } : null,
@@ -2167,14 +2192,21 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
 
           {tab==="model"&&(()=>{
             const q = quotes[selected];
-            // Crypto: augment with per-symbol TS momentum before scoring
+            const btcSnapEntryM = universe === "btc" && broadMarketSnapshot
+              ? broadMarketSnapshot.find(s => s.symbol === "BTC") : null;
             const cryptoCtx = (isCryptoUniverse(universe) && q?.closes) ? {
               ...(macro?.cryptoContext || {}),
               tsMom: timeSeriesMomentum(q.closes),
-              xsMomRank: universe === "btc" ? 0 : xsMomRankLive(selected, quotes),
+              xsMomRank: universe === "btc"
+                ? (btcSnapEntryM && broadMarketSnapshot
+                    ? xsRankLiveBroad(btcSnapEntryM.ret14dPct, broadMarketSnapshot)
+                    : 0)
+                : xsMomRankLive(selected, quotes),
               fundingZ: fundingZLive(fundingMap.get(selected)),
               rvRatio: rvRatioLive(q.closes, 5, 30),
               dowSin: dayOfWeekSinAt(Math.floor(Date.now() / 1000)),
+              breadth: universe === "btc" && broadMarketSnapshot
+                ? breadthLive(broadMarketSnapshot) : 0,
             } : macro?.cryptoContext;
             const m = q ? scoreSetup(q, {
               macro: macro ? { ...macro, cryptoContext: cryptoCtx } : null,

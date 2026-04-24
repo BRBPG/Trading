@@ -151,7 +151,8 @@ function extractFeatures(q, macro = null, calendar = null, pead = null, universe
   //   [11]  Oil momentum            DVOL-RV spread z (Alexander 2023; BTC-only, daily-only)
   //   [12]  Gold momentum           BTC perp OI Δlog z (BTC-only, daily-only, ~30d depth)
   //   [13]  TOD edge                RV 5d/30d ratio (Catania 2019)
-  //   [14]  PEAD daysSinceEarnings  DOW cyclical sin (Caporale-Plastun 2019)
+  //   [14]  PEAD daysSinceEarnings  btc: broad-market breadth (Phase 4.5)
+  //                                 crypto: DOW cyclical (Caporale-Plastun 2019)
   //   [15]  PEAD surpriseDecayed    Top-trader L/S contrarian z (Kakinaka 2022)
   //
   // crypto context arrives via macro.cryptoContext (set upstream by the
@@ -187,9 +188,17 @@ function extractFeatures(q, macro = null, calendar = null, pead = null, universe
   const tod_edge = isCrypto
     ? clip1(macro?.cryptoContext?.rvRatio ?? 0)
     : clip0to1(calendar?.todEdge ?? 0.5);
-  // Slot [14]: crypto = day-of-week sin encoding (Caporale-Plastun 2019
-  // Monday effect); equity = PEAD daysSinceEarnings.
-  const pead_days = isCrypto
+  // Slot [14] — three-way split:
+  //   btc universe:    market breadth (% of top-150 with positive 14d
+  //                    return, centred 0). Replaced DOW_sin after Phase 4
+  //                    ablation showed Δ = −0.026 (actively harmful noise).
+  //   crypto universe: DOW_sin retained. Changing the slot here would
+  //                    require retraining existing crypto weights; deferred
+  //                    to a unified sweep when crypto also gets broad-market.
+  //   equity:          PEAD daysSinceEarnings (unchanged).
+  const pead_days = universe === "btc"
+    ? clip1(macro?.cryptoContext?.breadth ?? 0)
+    : isCrypto
     ? clip1(macro?.cryptoContext?.dowSin ?? 0)
     : clip1(pead?.daysSinceEarnings ?? 0);
   // Slot [15]: crypto = top-trader L/S contrarian z (Kakinaka-Umeno 2022,
@@ -225,12 +234,15 @@ export const FEATURE_NAMES_CRYPTO = [
   "RV_ratio",
   "DOW_sin", "TopLS_z",
 ];
+// Phase 4.5: btc universe now has a 150-coin broad-market context so
+// slots [7][9] are no longer structural zeros, and slot [14] carries
+// breadth instead of the ablation-negative DOW_sin.
 export const FEATURE_NAMES_BTC = [
   "RSI", "MACD", "Mom", "BB", "EMA9/20", "EMA20/50", "Vol",
-  "— (n/a single-asset)", "TS_mom_z",
-  "— (n/a single-asset)", "Fund_z", "DVOL-RV_z", "OI_z",
+  "BTC_dom_z", "TS_mom_z",
+  "XS_rank_150", "Fund_z", "DVOL-RV_z", "OI_z",
   "RV_ratio",
-  "DOW_sin", "TopLS_z",
+  "Breadth_150", "TopLS_z",
 ];
 
 function logisticScoreFromFeatures(f, universe = "equities") {

@@ -27,6 +27,14 @@ import { timeSeriesMomentumAt, approximateDominanceZFromBTCReturns, xsMomRankAt,
 import { fetchFundingForUniverse, fundingZAt } from "./funding";
 import { fetchDvolHistory, dvolRvSpreadAt } from "./dvol";
 import { fetchBtcOIHistory, oiZAt, fetchBtcTopLSHistory, topLSZAt } from "./openInterest";
+import {
+  fetchTopCryptoSnapshot,
+  fetchTopCryptoBars,
+  precomputeReturns14d,
+  xsRankAt,
+  breadthAt,
+  makeDominanceZLookup,
+} from "./broadMarket";
 
 const YAHOO_PROXIES = [
   u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
@@ -375,6 +383,32 @@ export async function runBacktest(symbols, opts = {}) {
     ]);
   }
 
+  // Phase 4.5: broad-market context for btc universe. Fetches top-150 coin
+  // snapshot from CoinGecko (metadata only — symbols + supplies), then
+  // historical bars for each via the existing Polygon-first pipeline.
+  // Produces three derived signals: XS rank, real dominance z, breadth.
+  // Only on btc daily — on multi-symbol crypto the existing 40-coin
+  // watchlist + approximated dominance are kept (changing them would
+  // require retraining existing trained crypto weights).
+  let broadMarket = null;
+  if (universe === "btc" && isDaily) {
+    onProgress({ phase: "fetching_broad_market", done: 0, total: 1 });
+    const snapshot = await fetchTopCryptoSnapshot(150);
+    if (snapshot) {
+      const coinBarsMap = await fetchTopCryptoBars(
+        snapshot, fetchHistoricalBars, fetchDaysAgo, polygonKey, interval
+      );
+      const returnsMap = precomputeReturns14d(coinBarsMap);
+      const btcBars = symbolBars.get("BTC-USD");
+      // BTC's own entry for supply lookup. Default to 19.8M (April 2026
+      // ballpark) if CoinGecko didn't return it (highly unlikely but safe).
+      const btcEntry = snapshot.find(s => s.symbol === "BTC")
+        || { circulatingSupply: 19800000 };
+      const dominanceZAt = makeDominanceZLookup(btcBars, btcEntry.circulatingSupply, returnsMap);
+      broadMarket = { returnsMap, dominanceZAt };
+    }
+  }
+
   const trades = [];
   const errors = [];
   let barsSource = null;  // "polygon" | "yahoo" | mixed — reported back to UI
@@ -477,36 +511,43 @@ export async function runBacktest(symbols, opts = {}) {
       //     which is redundant with TS momentum when BTC IS the subject)
       //   - xsMomRank  = 0 (no cross-section with n=1)
       //   - tsMom, fundingZ still apply
+      // Broad-market derived features — only populated on btc universe with
+      // daily horizon (where we fetched the top-150 basket). Gives real XS
+      // rank (vs 40-coin dead), real dominance (vs self-referential zero),
+      // and breadth (vs DOW_sin which ablated red).
+      const bmRank = (broadMarket && symbol === "BTC-USD")
+        ? xsRankAt(bars, i, broadMarket.returnsMap) : null;
+      const bmBreadth = (broadMarket && symbol === "BTC-USD")
+        ? breadthAt(bars, i, broadMarket.returnsMap) : null;
+      const bmDomZ = (broadMarket && symbol === "BTC-USD")
+        ? broadMarket.dominanceZAt(bars.timestamps[i]) : null;
+
       const cryptoContext = isCryptoRun ? {
+        // Slot [7] — real BTC dominance on btc universe (price × supply
+        // share of top-150 sum, z vs rolling 60d window). Crypto universe
+        // keeps the old BTC-14d-return proxy (changing it would require
+        // retraining existing crypto weights; deferred to a separate commit).
         dominanceZ: universe === "btc"
-          ? 0
+          ? (bmDomZ ?? 0)
           : (btcHistBars ? approximateDominanceZFromBTCReturns(btcHistBars, bars.timestamps[i]) : 0),
         tsMom:      timeSeriesMomentumAt(bars, i, 14, 30),
+        // Slot [9] — XS rank. btc universe now uses top-150 basket instead
+        // of structural-zero. Crypto universe keeps the 40-coin rank.
         xsMomRank:  universe === "btc"
-          ? 0
+          ? (bmRank ?? 0)
           : xsMomRankAt(symbol, bars.timestamps[i], universeReturns),
         fundingZ:   fundingRecs ? fundingZAt(fundingRecs, bars.timestamps[i], 21) : 0,
-        // RV regime: ratio of 5-bar realized vol / 30-bar realized vol,
-        // clipped centred at 0. Works on both daily and 5-min bars (the
-        // ratio is unit-free).
         rvRatio:    rvRatioAt(bars, i, 5, 30),
-        // DVOL-RV spread z — only populated on daily sims where the 30d
-        // IV + 30d RV matching is meaningful. 0 on 5-min sims.
         dvolRvZ:    (dvolRecords && symbol === "BTC-USD")
                       ? dvolRvSpreadAt(bars, i, dvolRecords) : 0,
-        // OI Δlog z — BTC-only, daily-only. Feature is 0 for entries
-        // older than the ~30-day Binance depth; GBM learns to ignore
-        // those rows for slot [12] and use the live-window slice.
         oiZ:        (oiRecords && symbol === "BTC-USD")
                       ? oiZAt(oiRecords, bars.timestamps[i], 21) : 0,
-        // Day-of-week cyclical encoding (Caporale-Plastun 2019).
-        // Applies to both crypto (24/7 so DOW is real) and btc.
-        // Only meaningful on daily bars; 5-min bars oscillate through
-        // DOW faster than trades can react.
+        // Slot [14] — btc universe uses breadth (% of top-150 with positive
+        // 14d return, centred on 0). Crypto universe keeps DOW_sin to avoid
+        // retraining; it was retired on btc because ablation showed
+        // Δ = −0.026 (actively harmful noise) and breadth is better-motivated.
         dowSin:     isDaily ? dayOfWeekSinAt(bars.timestamps[i]) : 0,
-        // Top-trader long/short positioning z (Kakinaka & Umeno 2022).
-        // Contrarian framing — sign flipped in topLSZAt so positive
-        // = contrarian-bullish. BTC-only, daily-only, ~30d depth.
+        breadth:    bmBreadth ?? 0,
         topLSZ:     (lsRecords && symbol === "BTC-USD")
                       ? topLSZAt(lsRecords, bars.timestamps[i], 21) : 0,
       } : null;
