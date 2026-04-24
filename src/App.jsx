@@ -2148,6 +2148,22 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
     setContinuousVerdicts(null);
 
     try {
+      // Holdout slice: reserve the most recent portion of the window so
+      // training NEVER sees it. TEST SAVED MODEL then evaluates the
+      // deployed model exclusively on this held-out recent slice — the
+      // market conditions closest to what live deployment will face.
+      //
+      // Why this matters: training on a single contiguous window lets
+      // the GBM memorize bar-by-bar patterns specific to that window.
+      // If the model ever sees a given day during training, testing on
+      // it again just measures recall, not generalization. Hold out ≥15%
+      // of the window (min 30 days) so the test is genuinely out-of-
+      // sample. User is explicitly told to set DAYS AGO large (720+)
+      // so the training window stays big enough to learn from.
+      const trainHoldoutDays = Math.max(30, Math.floor(simDaysAgo * 0.15));
+      const trainDaysAgo = simDaysAgo;
+      const trainEndDaysAgo = trainHoldoutDays;
+
       for (let cycle = 0; cycle < N; cycle++) {
         if (continuousAbortRef.current) break;
 
@@ -2158,14 +2174,20 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         const thompsonDrops = cycle < 2 ? [] : thompsonMask();
         const activeMask = Array.from(new Set([...persistentMask, ...thompsonDrops]));
 
+        // Scale sample count with the training window length — at 180d we
+        // want ~120 trades, at 720d we want ~300 so we're not over-sampling
+        // any single bar. Density stays ~0.5 trades per available day,
+        // which is meaningful diversity without crushing the loop time.
+        const effectiveTrainDays = Math.max(1, trainDaysAgo - trainEndDaysAgo);
         const baseSamples = simInterval === "1d"
-          ? Math.min(30, Math.max(5, Math.floor(simDaysAgo / 10)))
+          ? Math.min(60, Math.max(10, Math.floor(effectiveTrainDays / 6)))
           : (simDaysAgo <= 7 ? 10 : simDaysAgo <= 30 ? 20 : 40);
-        const samples = Math.max(baseSamples, Math.ceil(120 / nSyms));
+        const samples = Math.max(baseSamples, Math.ceil(150 / nSyms));
 
         const res = await runBacktest(symsForRun, {
           interval: simInterval,
-          daysAgo: simDaysAgo,
+          daysAgo: trainDaysAgo,
+          endDaysAgo: trainEndDaysAgo,
           holdHours: maxHoldHours,
           samplesPerSymbol: samples,
           costBps,
@@ -2431,22 +2453,18 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
     continuousAbortRef.current = false;
   }
 
-  // ─── Test the currently-saved GBM on a HELD-OUT time window ──────────
-  // User asked: "there should be an option to apply the verdict here
-  // and then like run simulations on it or use it because otherwise the
-  // verdict is kind of pointless." Previous naive implementation tested
-  // on a fresh sim drawn from the SAME time window as training, which
-  // just measured memorization (90%+ AUC on BTC daily because only ~180
-  // entry bars exist in a 180-day window, all seen by the GBM multiple
-  // times across 20 warm-start cycles).
+  // ─── Test the currently-saved GBM on the HELD-OUT recent slice ───────
+  // The continuous loop reserves the most recent ≥15% of the sim window
+  // as a holdout that training NEVER samples from. TEST SAVED MODEL
+  // evaluates the deployed GBM exclusively on that recent slice —
+  // genuinely out-of-sample, and importantly the market conditions
+  // closest to what live deployment will face (so the AUC here is a
+  // realistic estimate of how the model will perform when we deploy).
   //
-  // Fix: sample entries from an OLDER window that training never touched.
-  // If training used the last `simDaysAgo` days, test uses a window of
-  // equal length PRIOR to that — achieved via runBacktest's endDaysAgo
-  // parameter which shifts the recent edge of the sampling window back
-  // in time. Needs enough historical bars (Polygon BTC has 5yr of daily
-  // data via the WARMUP_FETCH_DAYS=1825 setting, so a held-out window
-  // of 180d prior to training is available).
+  // If continuous training hasn't been run yet (or the holdout is
+  // inconsistent with the current simDaysAgo), we compute the same
+  // slice deterministically: holdout = max(30, simDaysAgo * 0.15) days,
+  // anchored to "now."
   async function runTestSavedModel() {
     if (testRunning) return;
     const savedGBM = loadGBM(universe);
@@ -2461,21 +2479,19 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
       ? activeBacktestSymbols.filter(s => !activeHighVolSymbols.includes(s))
       : activeBacktestSymbols;
     const nSyms = Math.max(1, symsForRun.length);
-    // Held-out window: look BACK an additional simDaysAgo-worth of time,
-    // so sampling happens in [now - 2*simDaysAgo, now - simDaysAgo].
-    const holdoutLengthDays = simDaysAgo;
-    const holdoutEndDaysAgo = simDaysAgo;
+    // Match the continuous loop's holdout formula exactly.
+    const holdoutLengthDays = Math.max(30, Math.floor(simDaysAgo * 0.15));
     const baseSamples = simInterval === "1d"
-      ? Math.min(30, Math.max(5, Math.floor(holdoutLengthDays / 10)))
+      ? Math.min(30, Math.max(5, Math.floor(holdoutLengthDays / 3)))
       : (holdoutLengthDays <= 7 ? 10 : holdoutLengthDays <= 30 ? 20 : 40);
-    const samples = Math.max(baseSamples, Math.ceil(120 / nSyms));
+    const samples = Math.max(baseSamples, Math.ceil(60 / nSyms));
 
     try {
       await new Promise(r => setTimeout(r, 30));
       const res = await runBacktest(symsForRun, {
         interval: simInterval,
-        daysAgo: simDaysAgo + holdoutLengthDays,
-        endDaysAgo: holdoutEndDaysAgo,
+        daysAgo: holdoutLengthDays,
+        endDaysAgo: 0,
         holdHours: maxHoldHours,
         samplesPerSymbol: samples,
         costBps,
@@ -2485,7 +2501,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         onProgress: () => {},
       });
       if (!res.trades.length) {
-        setTestResult({ error: `No trades in held-out window (days ${holdoutEndDaysAgo}–${simDaysAgo + holdoutLengthDays} ago). Polygon key or longer history needed — BTC with Polygon supports up to ~1800 days of warmup.` });
+        setTestResult({ error: `No trades in held-out window (days 0–${holdoutLengthDays} ago). If DAYS AGO is very small the holdout is too short for hold-forward trades.` });
         setTestRunning(false);
         return;
       }
@@ -2556,7 +2572,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         top10: byConv(0.10),
         treeCount: savedGBM.trees.length,
         trainedCycles: savedGBM.cyclesTrainedOn || 0,
-        holdoutWindow: { from: simDaysAgo + holdoutLengthDays, to: holdoutEndDaysAgo },
+        holdoutWindow: { from: holdoutLengthDays, to: 0 },
         maskSlots: getActiveMask(universe),
       });
     } catch (err) {
@@ -3660,26 +3676,29 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                       })()}
                       </>)}
 
-                      {/* ═══ TEST SAVED MODEL ═══ Held-out time window →
-                          predict with the persisted (verdict-applied) GBM
-                          → honest OOS AUC. Earlier naive version tested
-                          on the training window and scored 90%+ because
-                          BTC daily over 180d has only ~180 entry bars
-                          all memorized across warm-start cycles. Fixed by
-                          sampling from a PRIOR window (days simDaysAgo —
-                          2*simDaysAgo) via runBacktest's endDaysAgo
-                          parameter. Only works with Polygon BTC which has
-                          5yr of daily history cached via warmup. */}
-                      {isCryptoUniverse(universe) && (
+                      {/* ═══ TEST SAVED MODEL ═══ Recent-holdout slice →
+                          predict with the persisted GBM → honest OOS AUC
+                          on data closest to live deployment conditions.
+                          The continuous loop reserves the most recent
+                          max(30d, 15% of window) for this test; training
+                          never samples from it. If this AUC comes back
+                          strong the model generalises, if it comes back
+                          near 0.5 the training window was too small and
+                          the model memorised — increase DAYS AGO. */}
+                      {isCryptoUniverse(universe) && (() => {
+                        const holdoutDays = Math.max(30, Math.floor(simDaysAgo * 0.15));
+                        const trainEnd = holdoutDays;
+                        return (
                         <div style={{marginTop:12,padding:10,background:"#090C12",border:"1px solid #3A3A6A"}}>
                           <div style={{fontSize:9,color:"#B0B0FF",letterSpacing:2,marginBottom:8}}>
-                            🎯 TEST SAVED MODEL — held-out time window (prior {simDaysAgo}d) against the persisted GBM
+                            🎯 TEST SAVED MODEL — recent {holdoutDays}d holdout (never seen during training)
                           </div>
                           <div style={{fontSize:9,color:"#888",lineHeight:1.5,marginBottom:8}}>
-                            Samples trades from a time window the model NEVER saw during training
-                            (days {simDaysAgo}–{simDaysAgo * 2} ago — immediately prior to the training
-                            window) and predicts with the saved GBM. No retraining, no in-sample leak.
-                            Requires a Polygon key for BTC (needs historical bars beyond the training window).
+                            Training samples days {trainEnd}–{simDaysAgo} ago. Test samples days 0–{holdoutDays} ago —
+                            the most recent slice, which the model never saw. A high AUC here means the model
+                            genuinely learned patterns that generalise into live trading conditions; a near-0.5 AUC
+                            means it memorised the training window. Fix for the latter: increase DAYS AGO so
+                            training sees a larger, more diverse window (720+ recommended).
                           </div>
                           <button onClick={runTestSavedModel} disabled={testRunning}
                             style={{background:testRunning?"#111":"#141422",
@@ -3741,7 +3760,8 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                             </div>
                           )}
                         </div>
-                      )}
+                        );
+                      })()}
 
                       {/* ═══ ADAPTIVE CONTINUOUS TRAINING (Phase 6 prelude) ═══
                           Runs N sim → train → walk-forward cycles. Every 3rd
@@ -3784,14 +3804,27 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                               </button>
                             )}
                           </div>
-                          <div style={{fontSize:8,color:"#666",lineHeight:1.5,marginBottom:6}}>
-                            Each cycle: fresh sim → train GBM → walk-forward measurement.
-                            Every 3rd cycle re-ablates and updates the feature mask based on
-                            rolling-median Δ per feature (drops features that consistently hurt,
-                            re-enables ones that start helping again). Every 9th cycle probes
-                            all features with empty mask to catch regime-shift recoveries.
-                            Best-AUC GBM is auto-preserved across cycles.
-                          </div>
+                          {(() => {
+                            const hold = Math.max(30, Math.floor(simDaysAgo * 0.15));
+                            const tooShort = simDaysAgo - hold < 120;
+                            return (
+                              <div style={{fontSize:8,color:"#666",lineHeight:1.5,marginBottom:6}}>
+                                <span style={{color:"#B0B0FF"}}>
+                                  Training samples days {hold}–{simDaysAgo} ago · holdout {hold}d reserved for TEST SAVED MODEL.
+                                </span> Each cycle picks fresh random entries from the training window, trains GBM,
+                                walk-forward measures. Every 3rd cycle re-ablates to update the feature mask; every
+                                9th cycle probes with empty mask for regime-shift recoveries. Best-AUC GBM is
+                                preserved.
+                                {tooShort && (
+                                  <div style={{marginTop:4,color:"#E74C3C"}}>
+                                    ⚠ Training window only {simDaysAgo - hold}d — too thin for a GBM to generalise (it'll
+                                    memorise the bars). For BTC with Polygon bump DAYS AGO to 720+ so training sees
+                                    ≥600d of diverse market regimes.
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })()}
                           {continuousResults.length > 0 && (() => {
                             const valid = continuousResults.filter(r => r.auc != null);
                             const aucs = valid.map(r => r.auc);
