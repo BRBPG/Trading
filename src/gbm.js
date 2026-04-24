@@ -138,8 +138,15 @@ export function trainGBM(samples, opts = {}) {
     verbose = false,
   } = opts;
 
-  if (!samples || samples.length < 20) {
-    return { trained: 0, rounds: 0, reason: `Need ≥20 samples, got ${samples?.length || 0}` };
+  // Lower bound at 12 samples (was 20) — with val-loss truncation doing
+  // the heavy lifting on overfit protection, the old 20-sample floor was
+  // unnecessarily strict. Walk-forward on a single-asset 100-trade run
+  // splits into 5 folds ≈ 20 samples/fold with embargo purge potentially
+  // dropping 1-2 more. 20-sample floor was causing every fold to skip
+  // silently ("Only 0/N runs produced valid OOS") — 12 still gives the
+  // 80/20 train/val split a 9/3 partition which is marginal but workable.
+  if (!samples || samples.length < 12) {
+    return { trained: 0, rounds: 0, reason: `Need ≥12 samples, got ${samples?.length || 0}` };
   }
 
   // ─── Time-ordered train / val split for honest early stopping ───────

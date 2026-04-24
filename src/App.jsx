@@ -1479,12 +1479,32 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
       // Intraday (5-min) mode: ~78 bars/day, so 7d = ~550 bars. Much more
       // room, can safely ask for more samples.
       const isDaily = simInterval === "1d";
-      const samples = isDaily
-        ? Math.min(30, Math.max(5, Math.floor(simDaysAgo / 10)))
-        : (simDaysAgo <= 7 ? 10 : simDaysAgo <= 30 ? 20 : 40);
-      const symsForRun = excludeHighVol
+      // Sample-size calibration MUST consider universe cardinality.
+      // Total trades/run = samplesPerSymbol × numSymbols. Walk-forward
+      // needs all.length ≥ folds*8 AND trainGBM needs ≥20 samples per
+      // fold. At 5 folds with even distribution, that's ~100 trades
+      // minimum for any fold to evaluate. Multi-symbol crypto hits
+      // that trivially (40 × 18 = 720); single-asset BTC with the old
+      // formula produced 1 × 18 = 18, which fails every fold silently
+      // and shows as "0/N runs produced valid OOS results".
+      // Target ≥100 trades/run regardless of symbol count.
+      const rawSyms = excludeHighVol
         ? activeBacktestSymbols.filter(s => !activeHighVolSymbols.includes(s))
         : activeBacktestSymbols;
+      const nSyms = Math.max(1, rawSyms.length);
+      const baseSamples = isDaily
+        ? Math.min(30, Math.max(5, Math.floor(simDaysAgo / 10)))
+        : (simDaysAgo <= 7 ? 10 : simDaysAgo <= 30 ? 20 : 40);
+      // Scale up for small universes so total trades/run ≥ 100.
+      // pickEntries caps at 80% of the feasible entry range so this
+      // multiplier can't over-sample beyond what the bars support —
+      // it'll just clip naturally.
+      const TARGET_TRADES_PER_RUN = 120;
+      const samples = Math.max(
+        baseSamples,
+        Math.ceil(TARGET_TRADES_PER_RUN / nSyms)
+      );
+      const symsForRun = rawSyms;
       const res = await runBacktest(symsForRun, {
         interval: simInterval,
         daysAgo: simDaysAgo,
@@ -1590,14 +1610,21 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
     let firstRunFetchLog = null;  // captured from run #1 — bars are cached
                                   // after that, so run #1 shows real fetch sources
     try {
-      for (let i = 0; i < N_RUNS; i++) {
-        setMultiSimState({ phase: "sim", run: i + 1, total: N_RUNS });
-        const samples = simInterval === "1d"
-          ? Math.min(30, Math.max(5, Math.floor(simDaysAgo / 10)))
-          : (simDaysAgo <= 7 ? 10 : simDaysAgo <= 30 ? 20 : 40);
-        const symsForRun = excludeHighVol
+      // Sample-size calibration mirrors runSimulation — must scale up on
+      // small universes. Without this, 1-asset BTC produces 18 trades/run,
+      // below the 20-sample trainGBM floor AND below walk-forward's 5-fold
+      // viability threshold. See "Only 0/N runs produced valid OOS" bug.
+      const rawSymsMS = excludeHighVol
         ? activeBacktestSymbols.filter(s => !activeHighVolSymbols.includes(s))
         : activeBacktestSymbols;
+      const nSymsMS = Math.max(1, rawSymsMS.length);
+      for (let i = 0; i < N_RUNS; i++) {
+        setMultiSimState({ phase: "sim", run: i + 1, total: N_RUNS });
+        const baseSamples = simInterval === "1d"
+          ? Math.min(30, Math.max(5, Math.floor(simDaysAgo / 10)))
+          : (simDaysAgo <= 7 ? 10 : simDaysAgo <= 30 ? 20 : 40);
+        const samples = Math.max(baseSamples, Math.ceil(120 / nSymsMS));
+        const symsForRun = rawSymsMS;
       const res = await runBacktest(symsForRun, {
           interval: simInterval,
           daysAgo: simDaysAgo,
@@ -1653,14 +1680,21 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
       }
 
       if (aucs.length < 3) {
-        // Include fetchLog in error payload so the diagnostics panel
-        // renders even when no valid OOS predictions were produced —
-        // often the failure reason IS "all trades skipped as neutral"
-        // and the user needs to see that per-symbol table to diagnose.
         const totalSimTrades = tradeCounts.reduce((a, b) => a + b, 0);
-        const reason = totalSimTrades === 0
-          ? `All 20 runs produced 0 labelled trades — the model is neutral (|prob - 0.5| < 0.02) on every entry. This is EXPECTED for an untrained model: there's no conviction to label on. TRAIN models first (RUN SIMULATION once → TRAIN NN ON SIM), then re-run this diagnostic. See the fetch panel below for per-symbol source status.`
-          : `Only ${aucs.length}/${N_RUNS} runs produced valid OOS results (total sim trades: ${totalSimTrades}). Try a longer DAYS AGO or different settings.`;
+        const avgPerRun = totalSimTrades / N_RUNS;
+        // Specific diagnosis for the failure category instead of the old
+        // vague "try different settings". Three possible causes here and
+        // the message should distinguish them so the user doesn't chase
+        // the wrong fix.
+        let reason;
+        if (totalSimTrades === 0) {
+          reason = `All ${N_RUNS} runs produced 0 labelled trades — the model is neutral (|prob − 0.5| < 0.02) on every entry. Expected for an untrained model on an empty feature vector. TRAIN models first (RUN SIMULATION once → TRAIN GBM ON SIM), then re-run this diagnostic.`;
+        } else if (avgPerRun < 100) {
+          // Structural — sample count below walk-forward viability.
+          reason = `Sample-size shortfall: ${totalSimTrades} trades across ${N_RUNS} runs ≈ ${avgPerRun.toFixed(0)}/run. Walk-forward with 5 folds needs ≈100 trades/run minimum (GBM trains on ≥12 samples per fold × 5 folds + embargo purge margin). Cause: single-symbol universe on a short DAYS AGO window. Fix: increase DAYS AGO (try 365 on btc universe) or add more symbols to the backtest set. ${nSymsMS === 1 ? "You're on a 1-symbol universe — try 180+ DAYS AGO or switch to multi-symbol CRYPTO for structural sample count." : ""}`;
+        } else {
+          reason = `Only ${aucs.length}/${N_RUNS} runs produced valid OOS results (total sim trades: ${totalSimTrades}, avg ${avgPerRun.toFixed(0)}/run). Trades exist but walk-forward couldn't score them — possibly a labelling issue or per-fold class imbalance. Check the fetch diagnostics below.`;
+        }
         setMultiSimResult({ error: reason, fetchLog: firstRunFetchLog });
         setMultiSimRunning(false);
         return;

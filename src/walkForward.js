@@ -127,9 +127,15 @@ export function runWalkForward(simTrades, opts = {}) {
   const all = toSamples(simTrades)
     .map(s => maskFeatures(s, maskSlots))
     .sort((a, b) => a.timestamp - b.timestamp);
-  if (all.length < folds * 8) {
+  // Minimum viable total: folds × 12. The 12 here matches trainGBM's
+  // min-samples floor — if a fold's train set can't hit 12 samples after
+  // embargo purge, trainGBM returns { trees: null } and the fold skips
+  // silently. Check that up-front instead of burning 5 fold iterations
+  // for nothing.
+  const MIN_SAMPLES_PER_FOLD = 12;
+  if (all.length < folds * MIN_SAMPLES_PER_FOLD) {
     return {
-      error: `Not enough samples for ${folds}-fold walk-forward (need ≥${folds * 8}, have ${all.length}). Run a sim with more days.`,
+      error: `Not enough samples for ${folds}-fold walk-forward (need ≥${folds * MIN_SAMPLES_PER_FOLD}, have ${all.length}). Each fold's training set needs ≥${MIN_SAMPLES_PER_FOLD} samples for trainGBM to fit; with k folds that's ≈${folds * MIN_SAMPLES_PER_FOLD} total. Run a sim with more days or more symbols.`,
       samples: all.length,
     };
   }
@@ -152,7 +158,7 @@ export function runWalkForward(simTrades, opts = {}) {
   for (let i = 1; i < folds; i++) {
     const rawTrain = all.slice(0, i * foldSize);
     const testSet  = all.slice(i * foldSize, (i + 1) * foldSize);
-    if (rawTrain.length < 8 || testSet.length === 0) continue;
+    if (rawTrain.length < MIN_SAMPLES_PER_FOLD || testSet.length === 0) continue;
 
     // Find the earliest test-set timestamp and purge train samples whose
     // timestamp (representing the ENTRY — forward label extends after) could
@@ -160,7 +166,7 @@ export function runWalkForward(simTrades, opts = {}) {
     const firstTestT = testSet[0].timestamp;
     const trainSet = rawTrain.filter(s => s.timestamp <= firstTestT - embargoSec);
     totalPurged += rawTrain.length - trainSet.length;
-    if (trainSet.length < 8) continue;
+    if (trainSet.length < MIN_SAMPLES_PER_FOLD) continue;
 
     let preds, foldMeta, primaryModel;
     if (modelKind === "gbm") {
