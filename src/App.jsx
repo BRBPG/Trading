@@ -1676,12 +1676,17 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         tradeCounts.push(res.trades.length);
         pooledTrades.push(...res.trades);
         lastValidRes = res;
-        setMultiSimState({ phase: "wf", run: i + 1, total: N_RUNS });
+        setMultiSimState({ phase: "wf", run: i + 1, total: N_RUNS, fold: 0, totalFolds: 5 });
         // Brief yield so UI repaints between heavy WF runs.
         await new Promise(r => setTimeout(r, 30));
         const wf = await runWalkForward(res.trades, {
           folds: 5, epochs: 60,
           modelKind: isCryptoUniverse(universe) ? "gbm" : "nn",
+          // Fold-level progress — makes slow WF runs visibly progressing
+          // instead of appearing stuck. Updates UI every ~500ms.
+          onFoldProgress: (foldIdx, totalFolds) => {
+            setMultiSimState({ phase: "wf", run: i + 1, total: N_RUNS, fold: foldIdx, totalFolds });
+          },
         });
         if (wf.overall?.oosAUC != null) {
           aucs.push(wf.overall.oosAUC);
@@ -2830,7 +2835,9 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                           fontSize:11,padding:"8px 14px",cursor:multiSimRunning?"not-allowed":"pointer",
                           fontFamily:"inherit",letterSpacing:2,fontWeight:700,width:"100%"}}>
                         {multiSimRunning
-                          ? `${multiSimState.phase || "starting"}... run ${multiSimState.run}/${multiSimState.total}`
+                          ? (multiSimState.phase === "wf" && multiSimState.fold
+                             ? `wf... run ${multiSimState.run}/${multiSimState.total} · fold ${multiSimState.fold}/${multiSimState.totalFolds}`
+                             : `${multiSimState.phase || "starting"}... run ${multiSimState.run}/${multiSimState.total}`)
                           : `▶ RUN ${multiSimNRuns}-SIM AVERAGE`}
                       </button>
 
