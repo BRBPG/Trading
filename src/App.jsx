@@ -2894,16 +2894,43 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                       )}
                       {multiSimResult && !multiSimResult.error && (() => {
                         const r = multiSimResult;
-                        // Verdict logic: trimmed mean alone is misleading when
-                        // per-run variance is high. A 0.56 trimmed mean made up
-                        // of 0.32 + 0.69 + middle is NOT a stable edge — it's
-                        // a coin flip with wide swings. Real edge has tight
-                        // per-run agreement (std < 0.06). Penalise high
-                        // variance even when trimmed mean looks decent.
+                        // ─── POOLED AUC is the honest headline ────────────
+                        // Trimmed-mean-AUC averages 20 walk-forwards each on
+                        // ~N/20 trades per run → at single-asset BTC that's
+                        // ~22 samples per fold, which is sample-size-starved
+                        // and produces high-variance AUCs in the 0.30-0.60
+                        // range. Averaging them looks like coin-flip even
+                        // when the trained model HAS signal.
+                        //
+                        // Ablation baseline, when available, runs ONE walk-
+                        // forward on ALL pooled trades (~440/fold at 2200
+                        // total). That's the honest trained-model AUC
+                        // measurement. Use it as the primary verdict when
+                        // the user has run ablation; fall back to trimmed
+                        // mean otherwise.
+                        const pooledAUC = ablationResult && !ablationResult.error
+                          ? ablationResult.baselineAUC
+                          : null;
+                        const hasPooled = pooledAUC != null;
                         const HIGH_VARIANCE = r.stdAUC > 0.10;
                         const MED_VARIANCE  = r.stdAUC > 0.06;
+                        // Verdict prefers pooled AUC when available; only
+                        // falls back to trimmed mean if ablation hasn't run.
                         let verdict;
-                        if (HIGH_VARIANCE) {
+                        if (hasPooled) {
+                          // Pooled AUC is the trained-model truth. At
+                          // N≈2200 trades SE is ~0.011, so thresholds can
+                          // be tighter than the trimmed-mean versions.
+                          if (pooledAUC >= 0.56) {
+                            verdict = { label: "Real signal on pooled data — train and deploy", color: "#2ECC71" };
+                          } else if (pooledAUC >= 0.53) {
+                            verdict = { label: "Marginal edge on pooled data — train, watch variance", color: "#C9A84C" };
+                          } else if (pooledAUC >= 0.50) {
+                            verdict = { label: "Near-coin-flip even on pooled data — feature set needs work", color: "#C9A84C" };
+                          } else {
+                            verdict = { label: "Inverted — pooled AUC below 0.50, features anti-signal", color: "#E74C3C" };
+                          }
+                        } else if (HIGH_VARIANCE) {
                           verdict = { label: "Unstable — fragile / regime-dependent, don't train", color: "#E74C3C" };
                         } else if (r.trimmedMeanAUC >= 0.55 && !MED_VARIANCE) {
                           verdict = { label: "Genuine signal — train it", color: "#2ECC71" };
@@ -2916,9 +2943,41 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                         }
                         return (
                           <div style={{marginTop:12}}>
+                            {/* POOLED AUC headline panel — only renders
+                                once ablation has been run. This is the
+                                honest trained-model measurement (single
+                                WF on all ~2200 pooled trades) vs the
+                                per-run trimmed mean (20 WFs on ~110 each
+                                which is sample-size starved). */}
+                            {hasPooled && (
+                              <div style={{padding:"10px 12px",background:"#080810",border:`2px solid ${verdict.color}`,marginBottom:10}}>
+                                <div style={{fontSize:9,color:"#555",letterSpacing:2,marginBottom:4}}>
+                                  🎯 POOLED AUC — trained-model measurement ({ablationResult.baselineSamples ?? "?"} trades in walk-forward)
+                                </div>
+                                <div style={{display:"flex",alignItems:"baseline",gap:12,marginBottom:4}}>
+                                  <div style={{fontSize:32,color:verdict.color,fontWeight:900,fontFamily:"inherit"}}>
+                                    {pooledAUC.toFixed(3)}
+                                  </div>
+                                  <div style={{fontSize:11,color:verdict.color,fontWeight:700}}>
+                                    {verdict.label}
+                                  </div>
+                                </div>
+                                <div style={{fontSize:8,color:"#666",lineHeight:1.5}}>
+                                  This is the honest trained-model AUC. The per-run trimmed
+                                  mean below is a VARIANCE DIAGNOSTIC — it measures how the
+                                  same model performs on sample-starved 110-trade folds.
+                                  Per-run variance &gt; 0.06 is expected at single-asset
+                                  sample sizes and is NOT a verdict against the model.
+                                </div>
+                              </div>
+                            )}
                             <div style={{padding:"8px 10px",background:"#080808",border:`1px solid ${verdict.color}55`,borderLeft:`3px solid ${verdict.color}`,marginBottom:10}}>
-                              <div style={{fontSize:9,color:"#555",letterSpacing:2}}>VERDICT — {r.runs}-RUN TRIMMED MEAN</div>
-                              <div style={{fontSize:13,color:verdict.color,fontWeight:900,marginTop:2}}>{verdict.label}</div>
+                              <div style={{fontSize:9,color:"#555",letterSpacing:2}}>
+                                {hasPooled ? `PER-RUN STABILITY (${r.runs} runs × ~110 trades each)` : `VERDICT — ${r.runs}-RUN TRIMMED MEAN`}
+                              </div>
+                              <div style={{fontSize:13,color:verdict.color,fontWeight:900,marginTop:2}}>
+                                {hasPooled ? `Trimmed mean ${r.trimmedMeanAUC.toFixed(3)} — diagnostic only, not the headline` : verdict.label}
+                              </div>
                             </div>
                             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6,marginBottom:10}}>
                               {[
