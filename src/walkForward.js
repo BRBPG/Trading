@@ -39,11 +39,22 @@ function toSamples(simTrades) {
 
 // Log-loss = -mean(y·log(ŷ) + (1-y)·log(1-ŷ)). The canonical binary
 // classification metric; lower is better. Random guessing ≈ 0.693.
+//
+// Preds are now expected to already be clipped to [0.01, 0.99] by the
+// source (predictNN / predictGBM / logisticScoreFromFeatures / scoreWith-
+// Weights) but belt-and-braces — re-clip here. Worst-case per-sample
+// loss is bounded by -log(0.01) ≈ 4.605 under this convention, so one
+// confidently-wrong point can't dominate the mean. Kaggle's platform
+// clips at 1e-15; 0.01 is the tighter bound used for small-sample
+// finance where overfit-extreme outputs are the default not the edge.
 function logLoss(preds) {
   if (!preds.length) return null;
-  const eps = 1e-9;
-  const s = preds.reduce((acc, p) =>
-    acc - (p.y * Math.log(p.yHat + eps) + (1 - p.y) * Math.log(1 - p.yHat + eps)), 0);
+  const LO = 0.01, HI = 0.99;
+  const s = preds.reduce((acc, p) => {
+    const y = p.y;
+    const yh = Math.max(LO, Math.min(HI, p.yHat));
+    return acc - (y * Math.log(yh) + (1 - y) * Math.log(1 - yh));
+  }, 0);
   return s / preds.length;
 }
 

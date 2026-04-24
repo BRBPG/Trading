@@ -191,7 +191,12 @@ function logisticScoreFromFeatures(f, universe = "equities") {
   const n = Math.min(f.length, weights.length);
   let dot = bias;
   for (let i = 0; i < n; i++) dot += f[i] * weights[i];
-  return sigmoid(dot); // P(bullish)
+  // Clip to [0.01, 0.99]. LR doesn't saturate as aggressively as NN/GBM
+  // (L2-regularised linear model with bounded features) but it can still
+  // produce extreme probs on feature outliers. Keeping the same bound
+  // across all sub-models means the ensemble output + log-loss are both
+  // bounded by the same constant. See nn.js clipP comment.
+  return Math.max(0.01, Math.min(0.99, sigmoid(dot))); // P(bullish)
 }
 
 // ─── Decision tree — FORCED DECISIVE MODE with STRONG signals ────────────────

@@ -139,8 +139,22 @@ export function trainGBM(samples, opts = {}) {
     return { trained: 0, rounds: 0, reason: `Need ≥20 samples, got ${samples?.length || 0}` };
   }
 
-  const X = samples.map(s => s.x);
-  const y = samples.map(s => s.y);
+  // ─── Time-ordered train / val split for honest early stopping ───────
+  // Same rationale as trainNN: training-loss early stopping stops at
+  // the optimiser's plateau, not at the val-loss minimum. For GBMs this
+  // matters especially because each round is a committed addition to
+  // the model; training loss keeps dropping as we fit noise.
+  const sortedIdx = [...Array(samples.length).keys()]
+    .sort((a, b) => (samples[b].ageDays || 0) - (samples[a].ageDays || 0));
+  const useValSplit = sortedIdx.length >= 40;
+  const valSize = useValSplit ? Math.max(8, Math.floor(sortedIdx.length * 0.2)) : 0;
+  const trainIdx = sortedIdx.slice(0, sortedIdx.length - valSize);
+  const valIdx   = sortedIdx.slice(sortedIdx.length - valSize);
+
+  const X = trainIdx.map(i => samples[i].x);
+  const y = trainIdx.map(i => samples[i].y);
+  const Xval = valIdx.map(i => samples[i].x);
+  const yVal = valIdx.map(i => samples[i].y);
   const n = X.length;
   const d = X[0].length;
 
@@ -154,10 +168,17 @@ export function trainGBM(samples, opts = {}) {
   // Predictions start at log-odds of prior (class-balanced so ~0)
   const prior = Math.log((pos + 1) / (neg + 1));
   const predictions = new Array(n).fill(prior);
+  // Maintain parallel val-set logits so we can track val loss per round
+  // without re-running the full forest each round.
+  const valPreds = useValSplit ? new Array(Xval.length).fill(prior) : null;
 
   const trees = [];
   const history = [];
   let bestLoss = Infinity;
+  // Track round index of best val loss so we can TRUNCATE the tree list
+  // back to the best checkpoint at the end — GBMs are additive so
+  // rolling back is just slicing trees[].
+  let bestRound = 0;
   let stagnantRounds = 0;
 
   for (let round = 0; round < nRounds; round++) {
@@ -192,26 +213,50 @@ export function trainGBM(samples, opts = {}) {
     });
     trees.push(tree);
 
-    // Update predictions on ALL samples (not just subsample)
+    // Update predictions on ALL train samples (not just subsample)
     for (let i = 0; i < n; i++) {
       predictions[i] += learningRate * predictTree(tree, X[i]);
     }
+    // ...and on the val set too, so valLoss is O(1) per round.
+    if (useValSplit) {
+      for (let i = 0; i < Xval.length; i++) {
+        valPreds[i] += learningRate * predictTree(tree, Xval[i]);
+      }
+    }
 
-    // Compute training loss (BCE over full set)
-    let loss = 0;
+    // Compute training loss (BCE over full train set)
+    let trainLoss = 0;
     const eps = 1e-9;
     for (let i = 0; i < n; i++) {
       const p = sigmoid(predictions[i]);
-      loss -= sampleW[i] * (y[i] * Math.log(p + eps) + (1 - y[i]) * Math.log(1 - p + eps));
+      trainLoss -= sampleW[i] * (y[i] * Math.log(p + eps) + (1 - y[i]) * Math.log(1 - p + eps));
     }
-    loss /= n;
-    history.push(loss);
+    trainLoss /= n;
 
-    if (verbose && round % 10 === 0) console.log(`round ${round} loss=${loss.toFixed(4)}`);
+    // Val loss (unweighted — val is the honest held-out set, so no class
+    // weighting should bias the early-stop signal; match production
+    // log-loss conventions with [0.01, 0.99] clipping).
+    let vLoss = null;
+    if (useValSplit) {
+      let sum = 0;
+      for (let i = 0; i < valPreds.length; i++) {
+        const p = Math.max(0.01, Math.min(0.99, sigmoid(valPreds[i])));
+        sum -= yVal[i] * Math.log(p) + (1 - yVal[i]) * Math.log(1 - p);
+      }
+      vLoss = sum / valPreds.length;
+    }
+    history.push({ train: trainLoss, val: vLoss });
 
-    // Early stopping
-    if (loss < bestLoss - 1e-4) {
-      bestLoss = loss;
+    if (verbose && round % 10 === 0) {
+      console.log(`round ${round} train=${trainLoss.toFixed(4)} val=${vLoss?.toFixed(4) ?? "—"}`);
+    }
+
+    // Early stopping on val loss (or train loss fallback). Track best
+    // round so we can slice trees[] back to the checkpoint.
+    const watchLoss = useValSplit ? vLoss : trainLoss;
+    if (watchLoss < bestLoss - 1e-4) {
+      bestLoss = watchLoss;
+      bestRound = trees.length;  // length AT checkpoint (round+1 effective)
       stagnantRounds = 0;
     } else {
       stagnantRounds++;
@@ -219,26 +264,43 @@ export function trainGBM(samples, opts = {}) {
     }
   }
 
+  // Truncate trees back to the best-val-loss checkpoint. Any trees added
+  // after that point were overfitting noise.
+  if (useValSplit && bestRound < trees.length) {
+    trees.length = bestRound;
+  }
+
   return {
     trees,
     prior,
     learningRate,
     trainedOn: n,
+    valSize,
     rounds: trees.length,
-    finalLoss: history[history.length - 1],
+    finalLoss: bestLoss,
+    lossType: useValSplit ? "val" : "train",
     history,
     reason: trees.length === nRounds ? "completed all rounds" : "early stop (loss plateau)",
   };
 }
 
 // ─── Inference ─────────────────────────────────────────────────────────────
+// Clip to [0.01, 0.99] before returning. GBM logits accumulate across
+// rounds — 100 rounds × lr=0.1 × leaf-values ±2-5 easily produces ±30
+// logits, which sigmoid to ~1e-13 or ~1−1e-13. Unclipped those would
+// dominate any log-loss aggregation. Clip at source so downstream
+// consumers (ensemble, display, walk-forward) are always safe.
+const GBM_CLIP_LO = 0.01;
+const GBM_CLIP_HI = 0.99;
+
 export function predictGBM(model, x) {
   if (!model || !model.trees || !model.trees.length) return null;
   let logOdds = model.prior;
   for (const tree of model.trees) {
     logOdds += model.learningRate * predictTree(tree, x);
   }
-  return sigmoid(logOdds);
+  const p = sigmoid(logOdds);
+  return Math.max(GBM_CLIP_LO, Math.min(GBM_CLIP_HI, p));
 }
 
 // ─── Persistence ───────────────────────────────────────────────────────────

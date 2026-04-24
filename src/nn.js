@@ -116,10 +116,21 @@ function forward(W, x) {
   return { xn, z1, a1, z2, a2, z3, a3 };
 }
 
+// Clip sigmoid output to [0.01, 0.99] before returning. Prevents a single
+// confidently-wrong prediction from dominating log-loss: unclipped, a
+// sample at yHat=0.001 with y=1 contributes -log(0.001) ≈ 6.9 per sample;
+// clipped, it caps at -log(0.01) ≈ 4.6. The mean log-loss stays bounded
+// even when the NN has overfit a small fold and produces extreme logits.
+// Kaggle convention (they clip at 1e-15); the tighter 1e-2 here is
+// appropriate for small-sample finance where overfitting is the norm.
+const P_CLIP_LO = 0.01;
+const P_CLIP_HI = 0.99;
+function clipP(p) { return Math.max(P_CLIP_LO, Math.min(P_CLIP_HI, p)); }
+
 export function predictNN(features, universe = "equities") {
   const W = loadNN(universe);
   if (!W.trainedOn) return null; // Untrained — callers should fall back to LR
-  return forward(W, features).a3[0];
+  return clipP(forward(W, features).a3[0]);
 }
 
 // Score a batch of samples with a given weight set (does NOT touch the
@@ -129,7 +140,7 @@ export function predictNN(features, universe = "equities") {
 export function scoreWithWeights(W, samples) {
   return samples.map(s => ({
     y: s.y,
-    yHat: forward(W, s.x).a3[0],
+    yHat: clipP(forward(W, s.x).a3[0]),
   }));
 }
 
@@ -164,11 +175,33 @@ export function trainNN(samples, opts = {}) {
     return { trained: 0, epochs: 0, loss: null, history: [], reason: "Need at least 8 samples to train." };
   }
 
+  // ─── Time-ordered train / val split for honest early stopping ───────
+  // Goodfellow, Bengio, Courville (2016) §7.8: early-stop on the metric
+  // that matters for generalisation (validation loss), NOT on training
+  // loss. Training loss decreases monotonically under SGD by construction
+  // so stopping on it just catches the optimiser stalling — deep inside
+  // the overfit regime. Validation loss reliably peaks then rises when
+  // the model starts memorising noise.
+  //
+  // Split chronologically (oldest → train, newest → val). Random splits
+  // leak information via autocorrelation in financial time series. If
+  // samples carry ageDays (higher = older), sort; otherwise assume the
+  // caller passed them time-ordered (walk-forward does).
+  //
+  // Fall back to training-loss early stopping if the val set would be
+  // too small to be useful (< 8 samples). At 40+ training samples we have
+  // an 8-sample val set which is noisy but directionally meaningful.
+  const sortedSamples = [...samples].sort((a, b) => (b.ageDays || 0) - (a.ageDays || 0));
+  const useValSplit = sortedSamples.length >= 40;
+  const valSize = useValSplit ? Math.max(8, Math.floor(sortedSamples.length * 0.2)) : 0;
+  const trainSamples = sortedSamples.slice(0, sortedSamples.length - valSize);
+  const valSamples   = sortedSamples.slice(sortedSamples.length - valSize);
+
   // Class balancing — reweight minority class to equal influence
-  const pos = samples.filter(s => s.y === 1).length;
-  const neg = samples.length - pos;
-  const wPos = pos > 0 ? samples.length / (2 * pos) : 1;
-  const wNeg = neg > 0 ? samples.length / (2 * neg) : 1;
+  const pos = trainSamples.filter(s => s.y === 1).length;
+  const neg = trainSamples.length - pos;
+  const wPos = pos > 0 ? trainSamples.length / (2 * pos) : 1;
+  const wNeg = neg > 0 ? trainSamples.length / (2 * neg) : 1;
 
   // Time-decay weight per sample
   const timeWeight = (ageDays = 0) => Math.pow(0.5, ageDays / halfLifeDays);
@@ -179,21 +212,36 @@ export function trainNN(samples, opts = {}) {
   let W = isolated ? initWeights() : loadNN(universe);
   if (!W.trainedOn) W = initWeights();
 
-  // Fit normalisation on current batch
-  const X = samples.map(s => s.x);
+  // Fit normalisation on TRAIN batch only. Using val stats would leak.
+  const X = trainSamples.map(s => s.x);
   const { means, stds } = computeStats(X);
   W.means = means;
   W.stds = stds;
 
+  // Compute val BCE loss (clipped — matches production log-loss conventions).
+  function valLoss() {
+    if (!useValSplit) return null;
+    let total = 0;
+    for (const s of valSamples) {
+      const yHat = clipP(forward(W, s.x).a3[0]);
+      total -= s.y * Math.log(yHat) + (1 - s.y) * Math.log(1 - yHat);
+    }
+    return total / valSamples.length;
+  }
+
   const history = [];
+  // Track BEST WEIGHTS, not just best loss — so on early stop we return
+  // the weights at the val-loss minimum, not whatever state SGD left us
+  // in after patience epochs of degrading val loss.
   let bestLoss = Infinity, stagnantEpochs = 0;
+  let bestW = null;
 
   for (let epoch = 0; epoch < epochs; epoch++) {
-    const order = [...samples.keys()].sort(() => Math.random() - 0.5);
+    const order = [...trainSamples.keys()].sort(() => Math.random() - 0.5);
     let lossSum = 0, weightSum = 0;
 
     for (const i of order) {
-      const s = samples[i];
+      const s = trainSamples[i];
       const classW = s.y === 1 ? wPos : wNeg;
       const tW = timeWeight(s.ageDays || 0);
       const sampleW = classW * tW;
@@ -239,28 +287,85 @@ export function trainNN(samples, opts = {}) {
       for (let j = 0; j < W.b3.length; j++) W.b3[j] -= lr * db3[j];
     }
 
-    const avgLoss = lossSum / (weightSum || 1);
-    history.push(avgLoss);
+    const avgTrainLoss = lossSum / (weightSum || 1);
+    // Prefer val loss for early-stop; fall back to train loss only when
+    // the sample set is too small to carve out a val split.
+    const vLoss = useValSplit ? valLoss() : avgTrainLoss;
+    history.push({ train: avgTrainLoss, val: useValSplit ? vLoss : null });
 
-    // Early stopping
-    if (bestLoss - avgLoss > minDeltaPct * bestLoss) {
-      bestLoss = avgLoss;
+    // Early stopping on val loss (or train loss fallback). Snapshot
+    // weights whenever val loss improves so the final returned model
+    // is the one at the val-loss minimum.
+    if (bestLoss - vLoss > minDeltaPct * bestLoss) {
+      bestLoss = vLoss;
       stagnantEpochs = 0;
+      bestW = snapshotWeights(W);
     } else {
       stagnantEpochs++;
       if (stagnantEpochs >= patience) {
+        // Restore best-val weights — not whatever SGD left us in at the
+        // patience-exhaustion epoch. Keeps normalisation stats too.
+        if (bestW) restoreWeights(W, bestW);
         W.epochs = (W.epochs || 0) + epoch + 1;
-        W.trainedOn = samples.length;
-        W.finalLoss = avgLoss;
+        W.trainedOn = trainSamples.length;
+        W.finalLoss = bestLoss;
         if (!isolated) saveNN(W, universe);
-        return { trained: samples.length, epochs: epoch + 1, loss: avgLoss, history, reason: "Early stop — loss plateau", weights: isolated ? W : undefined };
+        return {
+          trained: trainSamples.length,
+          valSize,
+          epochs: epoch + 1,
+          loss: bestLoss,
+          lossType: useValSplit ? "val" : "train",
+          history,
+          reason: `Early stop — ${useValSplit ? "val" : "train"} loss plateau`,
+          weights: isolated ? W : undefined,
+        };
       }
     }
   }
 
+  // Full epochs completed without plateau — still prefer the best-val
+  // snapshot if we saw one, otherwise keep the final-epoch weights.
+  if (bestW && useValSplit) restoreWeights(W, bestW);
   W.epochs = (W.epochs || 0) + epochs;
-  W.trainedOn = samples.length;
-  W.finalLoss = history[history.length - 1];
+  W.trainedOn = trainSamples.length;
+  W.finalLoss = useValSplit ? bestLoss : history[history.length - 1].train;
   if (!isolated) saveNN(W, universe);
-  return { trained: samples.length, epochs, loss: W.finalLoss, history, reason: "Completed all epochs", weights: isolated ? W : undefined };
+  return {
+    trained: trainSamples.length,
+    valSize,
+    epochs,
+    loss: W.finalLoss,
+    lossType: useValSplit ? "val" : "train",
+    history,
+    reason: "Completed all epochs",
+    weights: isolated ? W : undefined,
+  };
+}
+
+// Deep-copy the learnable weight matrices + biases so we can restore the
+// best-val-loss snapshot at the end of training. Excludes the running
+// metadata fields (epochs, trainedOn, updatedAt).
+function snapshotWeights(W) {
+  return {
+    W1: W.W1.map(row => [...row]),
+    b1: [...W.b1],
+    W2: W.W2.map(row => [...row]),
+    b2: [...W.b2],
+    W3: W.W3.map(row => [...row]),
+    b3: [...W.b3],
+    means: W.means ? [...W.means] : null,
+    stds:  W.stds  ? [...W.stds]  : null,
+  };
+}
+
+function restoreWeights(W, snap) {
+  W.W1 = snap.W1.map(row => [...row]);
+  W.b1 = [...snap.b1];
+  W.W2 = snap.W2.map(row => [...row]);
+  W.b2 = [...snap.b2];
+  W.W3 = snap.W3.map(row => [...row]);
+  W.b3 = [...snap.b3];
+  if (snap.means) W.means = [...snap.means];
+  if (snap.stds)  W.stds  = [...snap.stds];
 }
