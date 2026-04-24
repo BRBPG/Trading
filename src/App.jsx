@@ -12,6 +12,7 @@ import { cleanBars, assessQuality, cleaningSummary } from "./cleaning";
 import { downloadExport, importState } from "./persistence";
 import { fetchMacroSnapshot } from "./macro";
 import { fetchBTCDominance, timeSeriesMomentum, xsMomRankLive } from "./crypto";
+import { fetchFundingForUniverse, fundingZLive } from "./funding";
 import { calendarFeatures } from "./calendar";
 import { getEarningsBatch, computePeadFeatures } from "./earnings";
 import { recommendSize } from "./sizing";
@@ -779,16 +780,18 @@ function ApiKeyModal({ onSave }) {
 function rankOpportunities(quotes, topN = 3, context = {}) {
   // context.earningsMap is { symbol → earnings[] } — per-symbol PEAD data
   // that needs per-symbol context building. macro/calendar are shared.
-  const { earningsMap = {}, ...sharedCtx } = context;
+  // context.fundingMap: Map<symbol, fundingRecords[]> for crypto funding-z.
+  const { earningsMap = {}, fundingMap = new Map(), ...sharedCtx } = context;
   const isCrypto = sharedCtx.universe === "crypto";
   return Object.values(quotes)
     .filter(q => q && q.price)
     .map(q => {
       const pead = earningsMap[q.symbol] ? computePeadFeatures(earningsMap[q.symbol]) : null;
       // Per-symbol crypto context: swap in this symbol's own tsMom + its
-      // XS rank within the active universe. Without this, all candidates
-      // would share the selected symbol's tsMom and the ranking would
-      // misrepresent each candidate's features.
+      // XS rank within the active universe + its own funding-z. Without
+      // per-symbol switching, all candidates would share the selected
+      // symbol's crypto features and the ranking would misrepresent each
+      // candidate.
       const perSymbolCtx = isCrypto && q.closes ? {
         ...sharedCtx,
         macro: sharedCtx.macro ? {
@@ -797,6 +800,7 @@ function rankOpportunities(quotes, topN = 3, context = {}) {
             ...(sharedCtx.macro.cryptoContext || {}),
             tsMom: timeSeriesMomentum(q.closes),
             xsMomRank: xsMomRankLive(q.symbol, quotes),
+            fundingZ: fundingZLive(fundingMap.get(q.symbol)),
           },
         } : null,
       } : sharedCtx;
@@ -1016,6 +1020,11 @@ export default function App() {
   const [multiSimNRuns, setMultiSimNRuns] = useState(20);
   const [trainResult, setTrainResult] = useState(null);
   const [training, setTraining] = useState(false);
+  // Phase 3d step 2: per-symbol perp funding-rate history, fetched in bulk
+  // on refresh when universe is crypto. Map<symbol, records[]> where each
+  // record is { time, rate }. Consumed by scoreSetup call sites via
+  // fundingZLive(). Empty Map in equity mode.
+  const [fundingMap, setFundingMap] = useState(new Map());
   const chatRef = useRef(null);
   const importInputRef = useRef(null);
 
@@ -1058,11 +1067,18 @@ export default function App() {
     // this call is nearly free after the first refresh. When universe is
     // crypto, also fetch BTC dominance in parallel — feeds the dominanceZ
     // feature slot via macro.cryptoContext downstream.
-    const [results, macroSnap, btcDom] = await Promise.all([
+    const [results, macroSnap, btcDom, funding] = await Promise.all([
       Promise.all(activeWatchlist.map(s=>fetchQuote(s, finnhubKey))),
       fetchMacroSnapshot().catch(() => null),
       universe === "crypto" ? fetchBTCDominance().catch(() => null) : Promise.resolve(null),
+      // Phase 3d step 2: bulk-fetch funding histories for every crypto
+      // symbol. Binance public fapi is session-cached inside funding.js so
+      // subsequent refreshes within 10 min reuse the cached records.
+      universe === "crypto"
+        ? fetchFundingForUniverse(activeWatchlist, { concurrency: 10 }).catch(() => new Map())
+        : Promise.resolve(new Map()),
     ]);
+    if (funding && funding.size) setFundingMap(funding);
     setQuotes(prev => {
       const map = { ...prev };
       results.forEach((r, i) => {
@@ -1163,6 +1179,7 @@ export default function App() {
       ...(macro?.cryptoContext || {}),
       tsMom: timeSeriesMomentum(selectedQuote.closes),
       xsMomRank: xsMomRankLive(selected, quotes),
+      fundingZ: fundingZLive(fundingMap.get(selected)),
     } : macro?.cryptoContext;
     const modelCtx = {
       macro: macro ? { ...macro, cryptoContext: cryptoCtx } : null,
@@ -1281,7 +1298,7 @@ PERSONA WEIGHTING AT THIS HORIZON:
     if (thinking || Object.keys(quotes).length < 3) return;
     setThinking(true);
     setTab("chat");
-    const modelCtx = { macro, calendar: calendarFeatures(), earningsMap, universe };
+    const modelCtx = { macro, calendar: calendarFeatures(), earningsMap, universe, fundingMap };
     const context = buildBestOpportunityContext(quotes, news, modelCtx);
     // Horizon preamble — same shape as sendToAI including persona weighting.
     // Best-opportunity scans are most at risk of getting horizon-wrong
@@ -1953,6 +1970,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
               ...(macro?.cryptoContext || {}),
               tsMom: timeSeriesMomentum(q.closes),
               xsMomRank: xsMomRankLive(selected, quotes),
+              fundingZ: fundingZLive(fundingMap.get(selected)),
             } : macro?.cryptoContext;
             const m = q ? scoreSetup(q, {
               macro: macro ? { ...macro, cryptoContext: cryptoCtx } : null,

@@ -24,6 +24,7 @@ import { fetchMacroHistorical } from "./macro";
 import { calendarFeaturesAt } from "./calendar";
 import { computePeadFeatures } from "./earnings";
 import { timeSeriesMomentumAt, approximateDominanceZFromBTCReturns, xsMomRankAt } from "./crypto";
+import { fetchFundingForUniverse, fundingZAt } from "./funding";
 
 const YAHOO_PROXIES = [
   u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
@@ -330,6 +331,17 @@ export async function runBacktest(symbols, opts = {}) {
     btcHistBars = btcFetch?.bars || null;
   }
 
+  // Phase 3d step 2: fetch funding-rate histories for every symbol once
+  // per backtest run. Binance public fapi endpoint, ~1000 records (~333d)
+  // per symbol. Cached session-scoped in funding.js. Symbols without an
+  // active Binance perp (some legacy alts) return null and their fundingZ
+  // feature stays at 0 — GBM will learn to ignore those rows for that slot.
+  let fundingBySymbol = new Map();
+  if (universe === "crypto") {
+    onProgress({ phase: "fetching_funding", done: 0, total: symbols.length });
+    fundingBySymbol = await fetchFundingForUniverse(symbols, { concurrency: 10 });
+  }
+
   const trades = [];
   const errors = [];
   let barsSource = null;  // "polygon" | "yahoo" | mixed — reported back to UI
@@ -417,13 +429,16 @@ export async function runBacktest(symbols, opts = {}) {
         ? computePeadFeatures(earningsMap[symbol], barTsMs)
         : null;
       // Crypto context for this entry: dominance proxy + TS momentum +
-      // cross-sectional 14d return rank (Liu-Tsyvinski 2022 — THE strongest
-      // single documented crypto factor). All point-in-time from cached
-      // bars. No network I/O per entry.
+      // cross-sectional 14d return rank + perp funding-rate z-score.
+      // Funding is the first feature not derived from OHLCV — reflects
+      // derivatives market positioning, documented contrarian signal
+      // (Hazel et al. 2021). All point-in-time.
+      const fundingRecs = fundingBySymbol.get(symbol);
       const cryptoContext = universe === "crypto" ? {
         dominanceZ: btcHistBars ? approximateDominanceZFromBTCReturns(btcHistBars, bars.timestamps[i]) : 0,
         tsMom:      timeSeriesMomentumAt(bars, i, 14, 30),
         xsMomRank:  xsMomRankAt(symbol, bars.timestamps[i], universeReturns),
+        fundingZ:   fundingRecs ? fundingZAt(fundingRecs, bars.timestamps[i], 21) : 0,
       } : null;
       const baseMacro = macroHist?.at(bars.timestamps[i]) || null;
       const modelCtx = {

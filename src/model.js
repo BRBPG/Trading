@@ -131,8 +131,8 @@ function extractFeatures(q, macro = null, calendar = null, pead = null, universe
   //   [7]   VIX z-score             BTC dominance z-score
   //   [8]   VIX term structure      time-series 14d momentum z
   //   [9]   DXY momentum            cross-sectional mom rank (Liu-Tsyvinski)
-  //   [10]  TNX momentum            (reserved — funding rate z Phase 3d)
-  //   [11]  Oil momentum            (reserved — DVOL-RV spread Phase 3d)
+  //   [10]  TNX momentum            perp funding-rate z (Hazel 2021)
+  //   [11]  Oil momentum            (reserved — DVOL-RV spread step 3)
   //   [12]  Gold momentum           0
   //   [13]  TOD edge                0
   //   [14]  PEAD daysSinceEarnings  0
@@ -149,8 +149,11 @@ function extractFeatures(q, macro = null, calendar = null, pead = null, universe
   const dxy_mom  = isCrypto
     ? clip1(macro?.cryptoContext?.xsMomRank ?? 0)
     : clip1((macro?.dxyMom5  || 0) * 100);
-  // Slots 10-15: all zeroed in crypto mode (reserved for future phases).
-  const tnx_mom  = isCrypto ? 0 : clip1((macro?.tnxMom5  || 0) * 100);
+  // Slot [10]: crypto = perp funding-rate z (Phase 3d step 2); equity = TNX.
+  const tnx_mom  = isCrypto
+    ? clip1(macro?.cryptoContext?.fundingZ ?? 0)
+    : clip1((macro?.tnxMom5  || 0) * 100);
+  // Slots 11-15: zeroed in crypto mode (slot 11 reserved for DVOL-RV step 3).
   const oil_mom  = isCrypto ? 0 : clip1((macro?.oilMom5  || 0) * 100);
   const gold_mom = isCrypto ? 0 : clip1((macro?.goldMom5 || 0) * 100);
   const tod_edge = isCrypto ? 0 : clip0to1(calendar?.todEdge ?? 0.5);
@@ -179,7 +182,7 @@ export const FEATURE_NAMES = [
 export const FEATURE_NAMES_CRYPTO = [
   "RSI", "MACD", "Mom", "BB", "EMA9/20", "EMA20/50", "Vol",
   "BTC_dom_z", "TS_mom_z",
-  "XS_mom_rank", "—", "—", "—",
+  "XS_mom_rank", "Fund_z", "—", "—",
   "—",
   "—", "—",
 ];
