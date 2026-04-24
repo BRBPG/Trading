@@ -11,7 +11,7 @@ import { BUFFETT_SYSTEM_PROMPT, buildBuffettContext } from "./buffett";
 import { cleanBars, assessQuality, cleaningSummary } from "./cleaning";
 import { downloadExport, importState } from "./persistence";
 import { fetchMacroSnapshot } from "./macro";
-import { fetchBTCDominance, timeSeriesMomentum, xsMomRankLive, rvRatioLive } from "./crypto";
+import { fetchBTCDominance, timeSeriesMomentum, xsMomRankLive, rvRatioLive, dayOfWeekSinAt } from "./crypto";
 import { fetchFundingForUniverse, fundingZLive } from "./funding";
 import { calendarFeatures } from "./calendar";
 import { getEarningsBatch, computePeadFeatures } from "./earnings";
@@ -837,6 +837,7 @@ function rankOpportunities(quotes, topN = 3, context = {}) {
             xsMomRank: sharedCtx.universe === "btc" ? 0 : xsMomRankLive(q.symbol, quotes),
             fundingZ: fundingZLive(fundingMap.get(q.symbol)),
             rvRatio: rvRatioLive(q.closes, 5, 30),
+            dowSin: dayOfWeekSinAt(Math.floor(Date.now() / 1000)),
           },
         } : null,
       } : sharedCtx;
@@ -1223,6 +1224,7 @@ export default function App() {
       xsMomRank: universe === "btc" ? 0 : xsMomRankLive(selected, quotes),
       fundingZ: fundingZLive(fundingMap.get(selected)),
       rvRatio: rvRatioLive(selectedQuote.closes, 5, 30),
+      dowSin: dayOfWeekSinAt(Math.floor(Date.now() / 1000)),
     } : macro?.cryptoContext;
     const modelCtx = {
       macro: macro ? { ...macro, cryptoContext: cryptoCtx } : null,
@@ -2052,6 +2054,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
               xsMomRank: universe === "btc" ? 0 : xsMomRankLive(selected, quotes),
               fundingZ: fundingZLive(fundingMap.get(selected)),
               rvRatio: rvRatioLive(q.closes, 5, 30),
+              dowSin: dayOfWeekSinAt(Math.floor(Date.now() / 1000)),
             } : macro?.cryptoContext;
             const m = q ? scoreSetup(q, {
               macro: macro ? { ...macro, cryptoContext: cryptoCtx } : null,

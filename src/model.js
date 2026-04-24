@@ -151,7 +151,7 @@ function extractFeatures(q, macro = null, calendar = null, pead = null, universe
   //   [11]  Oil momentum            DVOL-RV spread z (Alexander 2023; BTC-only, daily-only)
   //   [12]  Gold momentum           BTC perp OI Δlog z (BTC-only, daily-only, ~30d depth)
   //   [13]  TOD edge                RV 5d/30d ratio (Catania 2019)
-  //   [14]  PEAD daysSinceEarnings  (reserved — DOW cyclical, Commit 5)
+  //   [14]  PEAD daysSinceEarnings  DOW cyclical sin (Caporale-Plastun 2019)
   //   [15]  PEAD surpriseDecayed    (reserved — top L/S ratio z, Commit 6)
   //
   // crypto context arrives via macro.cryptoContext (set upstream by the
@@ -187,7 +187,11 @@ function extractFeatures(q, macro = null, calendar = null, pead = null, universe
   const tod_edge = isCrypto
     ? clip1(macro?.cryptoContext?.rvRatio ?? 0)
     : clip0to1(calendar?.todEdge ?? 0.5);
-  const pead_days = isCrypto ? 0 : clip1(pead?.daysSinceEarnings ?? 0);
+  // Slot [14]: crypto = day-of-week sin encoding (Caporale-Plastun 2019
+  // Monday effect); equity = PEAD daysSinceEarnings.
+  const pead_days = isCrypto
+    ? clip1(macro?.cryptoContext?.dowSin ?? 0)
+    : clip1(pead?.daysSinceEarnings ?? 0);
   const pead_surp = isCrypto ? 0 : clip1(pead?.surpriseDecayed ?? 0);
 
   return [
@@ -214,14 +218,14 @@ export const FEATURE_NAMES_CRYPTO = [
   "BTC_dom_z", "TS_mom_z",
   "XS_mom_rank", "Fund_z", "DVOL-RV_z", "OI_z",
   "RV_ratio",
-  "—", "—",
+  "DOW_sin", "—",
 ];
 export const FEATURE_NAMES_BTC = [
   "RSI", "MACD", "Mom", "BB", "EMA9/20", "EMA20/50", "Vol",
   "— (n/a single-asset)", "TS_mom_z",
   "— (n/a single-asset)", "Fund_z", "DVOL-RV_z", "OI_z",
   "RV_ratio",
-  "—", "—",
+  "DOW_sin", "—",
 ];
 
 function logisticScoreFromFeatures(f, universe = "equities") {

@@ -192,6 +192,30 @@ export function rvRatioLive(closes, shortW = 5, longW = 30) {
   return rvRatioAt({ closes }, closes.length - 1, shortW, longW);
 }
 
+// ─── Day-of-week cyclical encoding (Phase 4 Commit 5) ──────────────────────
+// Caporale & Plastun (2019), "The day of the week effect in the
+// cryptocurrency market," Finance Research Letters 31, document a
+// persistent Monday/weekend effect on BTC returns. Classic result —
+// weekend-closed-equities analog doesn't apply to 24/7 crypto but the
+// effect emerges from retail-participant behavior patterns.
+//
+// Encoding: sin(2π·dow/7) — single cyclical value that preserves the
+// week's periodicity in one slot. Range ≈ [-1, 1]. Monday (dow=1)
+// ≈ 0.78, Wednesday (dow=3) ≈ 0.43, Friday (dow=5) ≈ -0.97, Sunday
+// (dow=0) = 0.
+//
+// GBMs can ordinarily express day-of-week fine via a single feature
+// with 7 values — the sin encoding gives comparable expressiveness
+// (minus the exact Tuesday-vs-Thursday discrimination) in one slot
+// instead of two (which would be sin+cos for full cyclic recovery).
+// Given we only have 5 slots total and DOW is the LOWEST-priority of
+// the four documented features, one-slot sin is the right trade.
+export function dayOfWeekSinAt(timestampSec) {
+  const d = new Date(timestampSec * 1000);
+  const dow = d.getUTCDay();  // 0 = Sunday, 6 = Saturday
+  return Math.sin(2 * Math.PI * dow / 7);
+}
+
 // ─── Cross-sectional momentum rank (Liu-Tsyvinski 2022) ─────────────────────
 // For the target symbol at a given timestamp, compute its 14-bar return's
 // percentile rank within the active universe's 14-bar returns AT THE SAME

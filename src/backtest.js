@@ -23,7 +23,7 @@ import { fetchPolygonBars, hasPolygonKey } from "./polygon";
 import { fetchMacroHistorical } from "./macro";
 import { calendarFeaturesAt } from "./calendar";
 import { computePeadFeatures } from "./earnings";
-import { timeSeriesMomentumAt, approximateDominanceZFromBTCReturns, xsMomRankAt, rvRatioAt } from "./crypto";
+import { timeSeriesMomentumAt, approximateDominanceZFromBTCReturns, xsMomRankAt, rvRatioAt, dayOfWeekSinAt } from "./crypto";
 import { fetchFundingForUniverse, fundingZAt } from "./funding";
 import { fetchDvolHistory, dvolRvSpreadAt } from "./dvol";
 import { fetchBtcOIHistory, oiZAt } from "./openInterest";
@@ -495,6 +495,11 @@ export async function runBacktest(symbols, opts = {}) {
         // those rows for slot [12] and use the live-window slice.
         oiZ:        (oiRecords && symbol === "BTC-USD")
                       ? oiZAt(oiRecords, bars.timestamps[i], 21) : 0,
+        // Day-of-week cyclical encoding (Caporale-Plastun 2019).
+        // Applies to both crypto (24/7 so DOW is real) and btc.
+        // Only meaningful on daily bars; 5-min bars oscillate through
+        // DOW faster than trades can react.
+        dowSin:     isDaily ? dayOfWeekSinAt(bars.timestamps[i]) : 0,
       } : null;
       const baseMacro = macroHist?.at(bars.timestamps[i]) || null;
       const modelCtx = {
