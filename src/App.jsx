@@ -2282,6 +2282,10 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
             : "Livermore · Tudor Jones · Dennis · Simons · Williams"}
         </div>
         <div style={{display:"flex",alignItems:"center",gap:8}}>
+          {/* Build-version indicator. Current latest = btc-v2. If you
+              see an older string in the browser, the bundle is cached
+              and you need to hard-refresh. */}
+          <span style={{fontSize:8,color:"#444",letterSpacing:1}}>btc-v2</span>
           {mockCount>0&&<span style={{fontSize:9,color:"#C9A84C",letterSpacing:1}}>SIM {mockCount}/{loadedCount}</span>}
           <div style={{width:6,height:6,borderRadius:"50%",
             background:refreshing?"#C9A84C":loadedCount>0?"#2ECC71":"#555",animation:"pulse 2s infinite"}}/>
@@ -2486,7 +2490,15 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
             }) : null;
             return (
               <div style={{flex:1,overflowY:"auto",padding:14,fontSize:11,color:"#888"}}>
-                {!m ? <div>No data</div> : (
+                {!m ? (
+                  <div style={{padding:8,background:"#1A0F0F",border:"1px solid #4A1A1A",color:"#E74C3C",fontSize:10,lineHeight:1.6}}>
+                    No quote loaded for <b>{selected}</b>.<br/>
+                    Watchlist: {activeWatchlist.join(", ")}<br/>
+                    Loaded quotes: {Object.keys(quotes).length} / {activeWatchlist.length}<br/>
+                    {refreshing ? "⟳ Refreshing now…" : "Click REFRESH or check fetch diagnostics."}<br/>
+                    <span style={{fontSize:9,color:"#888"}}>If this persists, try hard-refresh (Cmd+Shift+R or close/reopen tab) to bust the browser cache.</span>
+                  </div>
+                ) : (
                   <div style={{display:"flex",flexDirection:"column",gap:12}}>
                     <div style={{color:"#C9A84C",fontSize:13,fontWeight:900,letterSpacing:2}}>{selected} — MODEL READOUT</div>
 
@@ -3982,7 +3994,16 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
 
           {tab==="quant"&&(()=>{
             const q = quotes[selected];
-            if (!q) return <div style={{padding:14,color:"#333"}}>No data</div>;
+            if (!q) return (
+              <div style={{padding:14}}>
+                <div style={{padding:8,background:"#1A0F0F",border:"1px solid #4A1A1A",color:"#E74C3C",fontSize:10,lineHeight:1.6}}>
+                  No quote loaded for <b>{selected}</b>.<br/>
+                  Watchlist: {activeWatchlist.join(", ")}<br/>
+                  Loaded quotes: {Object.keys(quotes).length} / {activeWatchlist.length}<br/>
+                  {refreshing ? "⟳ Refreshing now…" : "Click REFRESH or hard-refresh the page."}
+                </div>
+              </div>
+            );
             const qt = q.quant||{};
             const f = engineerFeatures(q, quotes);
             // BTC universe: "Beta vs SPY" and "Rel Strength vs SPY" are
