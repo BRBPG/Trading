@@ -127,9 +127,16 @@ async function fetchYahooHistorical(symbol, daysAgo = 7, interval = "5m") {
   const clamped = isDaily
     ? Math.max(daysAgo + 1, 10)
     : Math.min(Math.max(daysAgo + 1, 2), 60);
-  // Yahoo wants specific range strings for longer spans
+  // Yahoo range strings. Caller is responsible for passing an inflated
+  // daysAgo that already includes warmup buffer (runBacktest does this
+  // via WARMUP_FETCH_DAYS). Map daysAgo → range generously so we never
+  // return fewer bars than requested.
   const range = isDaily
-    ? (daysAgo <= 30 ? "1mo" : daysAgo <= 90 ? "3mo" : daysAgo <= 180 ? "6mo" : daysAgo <= 365 ? "1y" : "2y")
+    ? (daysAgo <= 60  ? "6mo"   // ≈ 126 trading days
+     : daysAgo <= 120 ? "1y"    // ≈ 252
+     : daysAgo <= 365 ? "2y"    // ≈ 504
+     : daysAgo <= 730 ? "5y"    // ≈ 1260
+     : "10y")
     : `${clamped}d`;
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=${yInterval}&range=${range}`;
   for (const proxy of YAHOO_PROXIES) {
@@ -293,7 +300,19 @@ export async function runBacktest(symbols, opts = {}) {
   // still treats holdHours as hours × 12 bars/hour.
   const isDaily = interval === "1d";
   const HOLD_BARS = isDaily ? Math.round(holdHours) : Math.round(holdHours * 12);
-  const WARMUP_BARS = isDaily ? 50 : 60;
+  // buildQuoteAt requires ≥100 bars of history for EMA50 + BB20 warmup.
+  // WARMUP_BARS must match that threshold or pickEntries will propose
+  // entries that buildQuoteAt silently rejects — surfaced previously as
+  // "90d sim returns 0 trades" because Yahoo returned only ~90 daily
+  // bars for daysAgo=90 and every candidate was < 100 bars in.
+  const WARMUP_BARS = 100;
+  // Extra days of history to pull beyond the user's requested window so
+  // there's room for the warmup AND the forward-hold window. Daily:
+  // WARMUP_BARS days of trading calendar ≈ 140 real days (5/7 trading).
+  // Intraday: 100 bars × 5 min ≈ 8 hours ≈ ~1 extra trading day, so bump
+  // by 2 days to be safe. HOLD_BARS additionally clipped inside the loop.
+  const WARMUP_FETCH_DAYS = isDaily ? 150 : 2;
+  const fetchDaysAgo = daysAgo + WARMUP_FETCH_DAYS;
 
   // Pre-fetch macro history ONCE per backtest run — the at(t) helper does
   // cheap in-memory binary-search lookups per entry, so this is O(symbols ×
@@ -307,7 +326,7 @@ export async function runBacktest(symbols, opts = {}) {
   // Cached via the same bars-cache so runs 2..N reuse it.
   let btcHistBars = null;
   if (universe === "crypto" && symbols.includes("BTC-USD")) {
-    const btcFetch = await fetchHistoricalBars("BTC-USD", daysAgo + 2, polygonKey, interval);
+    const btcFetch = await fetchHistoricalBars("BTC-USD", fetchDaysAgo, polygonKey, interval);
     btcHistBars = btcFetch?.bars || null;
   }
 
@@ -323,7 +342,7 @@ export async function runBacktest(symbols, opts = {}) {
     const symbol = symbols[s];
     onProgress({ phase: "fetching", symbol, done: s, total: symbols.length });
 
-    const fetched = await fetchHistoricalBars(symbol, daysAgo + 1, polygonKey, interval);
+    const fetched = await fetchHistoricalBars(symbol, fetchDaysAgo, polygonKey, interval);
     if (!fetched) {
       // Silent drops are the worst failure mode — record both in the
       // errors array (for legacy callers) and the fetchLog (for UI).
@@ -342,7 +361,22 @@ export async function runBacktest(symbols, opts = {}) {
     else if (barsSource !== fetched.source) barsSource = "mixed";
 
     // Reserve +1 bar beyond HOLD_BARS because entry is now at i+1, not i.
-    const entries = pickEntries(bars.closes.length, WARMUP_BARS, HOLD_BARS + 1, samplesPerSymbol);
+    // Entries are confined to the user's INTENDED window (last daysAgo
+    // calendar days). Warmup buffer at the head is for indicators only —
+    // we don't sample entries from it, or a 90d backtest would produce
+    // trades from 180d+ ago and contradict the UI label.
+    // Bars per calendar day depends on interval AND asset:
+    //   equity daily:   ~5/7 (trading calendar)
+    //   crypto daily:    1    (24/7 → 1 bar/day)
+    //   equity 5-min:   ~78   (6.5h × 12)
+    //   crypto 5-min:   288   (24h × 12)
+    const isCryptoRun = universe === "crypto";
+    const barsPerCalDay = isDaily
+      ? (isCryptoRun ? 1 : 5 / 7)
+      : (isCryptoRun ? 288 : 78);
+    const intendedWindowBars = Math.max(1, Math.round(daysAgo * barsPerCalDay));
+    const windowLo = Math.max(WARMUP_BARS, bars.closes.length - intendedWindowBars);
+    const entries = pickEntries(bars.closes.length, windowLo, HOLD_BARS + 1, samplesPerSymbol);
     onProgress({ phase: "simulating", symbol, candidates: entries.length, done: s, total: symbols.length });
 
     for (const i of entries) {
