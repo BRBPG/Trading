@@ -324,20 +324,22 @@ export async function runBacktest(symbols, opts = {}) {
   // For crypto, pre-fetch BTC bars to compute the BTC-dominance proxy at
   // each entry's timestamp (CoinGecko doesn't give historical dominance
   // on free tier; we approximate via BTC's own 14d return sign/magnitude).
-  // Cached via the same bars-cache so runs 2..N reuse it.
+  // Cached via the same bars-cache so runs 2..N reuse it. On btc universe
+  // the "dominance proxy" (BTC's 14d return) is redundant with TS momentum
+  // on the same symbol — both are functions of BTC's own price series —
+  // so we skip the extra fetch and set dominanceZ=0 later.
   let btcHistBars = null;
   if (universe === "crypto" && symbols.includes("BTC-USD")) {
     const btcFetch = await fetchHistoricalBars("BTC-USD", fetchDaysAgo, polygonKey, interval);
     btcHistBars = btcFetch?.bars || null;
   }
 
-  // Phase 3d step 2: fetch funding-rate histories for every symbol once
-  // per backtest run. Binance public fapi endpoint, ~1000 records (~333d)
-  // per symbol. Cached session-scoped in funding.js. Symbols without an
-  // active Binance perp (some legacy alts) return null and their fundingZ
-  // feature stays at 0 — GBM will learn to ignore those rows for that slot.
+  // Funding histories — Binance public fapi. For crypto (40 symbols) we
+  // bulk-fetch; for btc (single symbol) we still fetch but with
+  // concurrency=1 so there's no fanout overhead.
   let fundingBySymbol = new Map();
-  if (universe === "crypto") {
+  const isCryptoUniverse = universe === "crypto" || universe === "btc";
+  if (isCryptoUniverse) {
     onProgress({ phase: "fetching_funding", done: 0, total: symbols.length });
     fundingBySymbol = await fetchFundingForUniverse(symbols, { concurrency: 10 });
   }
@@ -381,7 +383,11 @@ export async function runBacktest(symbols, opts = {}) {
   // Stored as { timestamps, ret14 } so rank lookup is O(log n) via
   // binary search per symbol (total per entry: O(N_symbols × log bars)).
   const universeReturns = new Map();
-  if (universe === "crypto") {
+  // Only build universeReturns when cross-sectional rank is meaningful —
+  // at n < 3 symbols, xsMomRankAt degenerates to constant 0 and the
+  // compute is wasted. Explicit guard matches the audit finding that
+  // single-asset BTC runs should NOT populate slot [9] at all.
+  if (universe === "crypto" && symbolBars.size >= 3) {
     for (const [symbol, bars] of symbolBars) {
       const ret14 = new Array(bars.closes.length).fill(null);
       for (let i = 14; i < bars.closes.length; i++) {
@@ -408,7 +414,7 @@ export async function runBacktest(symbols, opts = {}) {
     //   crypto daily:    1    (24/7 → 1 bar/day)
     //   equity 5-min:   ~78   (6.5h × 12)
     //   crypto 5-min:   288   (24h × 12)
-    const isCryptoRun = universe === "crypto";
+    const isCryptoRun = universe === "crypto" || universe === "btc";
     const barsPerCalDay = isDaily
       ? (isCryptoRun ? 1 : 5 / 7)
       : (isCryptoRun ? 288 : 78);
@@ -434,10 +440,20 @@ export async function runBacktest(symbols, opts = {}) {
       // derivatives market positioning, documented contrarian signal
       // (Hazel et al. 2021). All point-in-time.
       const fundingRecs = fundingBySymbol.get(symbol);
-      const cryptoContext = universe === "crypto" ? {
-        dominanceZ: btcHistBars ? approximateDominanceZFromBTCReturns(btcHistBars, bars.timestamps[i]) : 0,
+      // Build crypto feature bundle for both "crypto" (multi-symbol) and
+      // "btc" (single-asset) universes. Differences on btc:
+      //   - dominanceZ = 0 (the multi-crypto proxy was BTC's 14d return,
+      //     which is redundant with TS momentum when BTC IS the subject)
+      //   - xsMomRank  = 0 (no cross-section with n=1)
+      //   - tsMom, fundingZ still apply
+      const cryptoContext = isCryptoRun ? {
+        dominanceZ: universe === "btc"
+          ? 0
+          : (btcHistBars ? approximateDominanceZFromBTCReturns(btcHistBars, bars.timestamps[i]) : 0),
         tsMom:      timeSeriesMomentumAt(bars, i, 14, 30),
-        xsMomRank:  xsMomRankAt(symbol, bars.timestamps[i], universeReturns),
+        xsMomRank:  universe === "btc"
+          ? 0
+          : xsMomRankAt(symbol, bars.timestamps[i], universeReturns),
         fundingZ:   fundingRecs ? fundingZAt(fundingRecs, bars.timestamps[i], 21) : 0,
       } : null;
       const baseMacro = macroHist?.at(bars.timestamps[i]) || null;

@@ -27,7 +27,10 @@
 // crypto because the features in effect differ (equity-only slots zeroed
 // on crypto) and the training sets are disjoint.
 function gbmKeyFor(universe = "equities") {
-  return universe === "crypto" ? "trader_gbm_v2_crypto" : "trader_gbm_v1";
+  // btc-only storage segregated from multi-crypto weights — clean slate.
+  if (universe === "btc")    return "trader_gbm_v3_btc";
+  if (universe === "crypto") return "trader_gbm_v2_crypto";
+  return "trader_gbm_v1";
 }
 const N_ROUNDS_DEFAULT = 100;
 const MAX_DEPTH_DEFAULT = 4;

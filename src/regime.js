@@ -20,7 +20,12 @@
 import { trainGBM, predictGBM } from "./gbm";
 
 function regimeKeyFor(universe = "equities") {
-  return universe === "crypto" ? "trader_regime_v2_crypto" : "trader_regime_v1";
+  // btc-only won't typically train regime models (too few trades per regime
+  // on a single symbol) but keep the key namespace isolated anyway so a
+  // future switch doesn't collide with multi-crypto state.
+  if (universe === "btc")    return "trader_regime_v3_btc";
+  if (universe === "crypto") return "trader_regime_v2_crypto";
+  return "trader_regime_v1";
 }
 const MIN_SAMPLES_PER_REGIME = 30;
 

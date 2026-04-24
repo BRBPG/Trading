@@ -30,9 +30,10 @@
 // independently. Architecture (16→16→8→1) is shared across universes —
 // only the trained weights diverge.
 function nnKeyFor(universe = "equities") {
-  return universe === "crypto"
-    ? "trader_nn_weights_v4_crypto"
-    : "trader_nn_weights_v3";
+  // btc-only storage segregated from multi-crypto weights — clean slate.
+  if (universe === "btc")    return "trader_nn_weights_v5_btc";
+  if (universe === "crypto") return "trader_nn_weights_v4_crypto";
+  return "trader_nn_weights_v3";
 }
 const NN_INPUT_DIM = 16;
 const NN_HIDDEN1 = 16;

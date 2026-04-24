@@ -25,7 +25,9 @@
 // independent of the single-LR weights used by the composite (model.js).
 
 function bagKeyFor(universe = "equities") {
-  return universe === "crypto" ? "trader_lr_bag_v3_crypto" : "trader_lr_bag_v2";
+  if (universe === "btc")    return "trader_lr_bag_v4_btc";
+  if (universe === "crypto") return "trader_lr_bag_v3_crypto";
+  return "trader_lr_bag_v2";
 }
 const N_BAGS = 30;
 const BAG_EPOCHS = 50;

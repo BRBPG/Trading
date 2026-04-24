@@ -18,19 +18,27 @@ const DEFAULT_WEIGHTS_EQUITIES = [
    0.00, 0.50,                                   // PEAD days (learned), surprise prior
 ];
 const DEFAULT_WEIGHTS_CRYPTO = new Array(16).fill(0);
+// BTC single-asset starts from neutral zero weights like multi-crypto —
+// we're measuring whether the feature set (retrained from scratch) carries
+// signal on BTC alone; any baked prior would contaminate that test.
+const DEFAULT_WEIGHTS_BTC = new Array(16).fill(0);
 const DEFAULT_BIAS = 0.04;
 const DEFAULT_BIAS_CRYPTO = 0.0;  // no directional prior
+const DEFAULT_BIAS_BTC = 0.0;     // no directional prior, clean-slate pivot
 
 function weightsKeyFor(universe) {
-  return universe === "crypto"
-    ? "trader_lr_weights_v4_crypto"
-    : "trader_lr_weights_v3";       // leave equities key unchanged for back-compat
+  // btc gets its own v5 key so the audit-flagged storage collision risk —
+  // where stale multi-symbol crypto weights would poison BTC training —
+  // is structurally prevented.
+  if (universe === "btc")    return "trader_lr_weights_v5_btc";
+  if (universe === "crypto") return "trader_lr_weights_v4_crypto";
+  return "trader_lr_weights_v3";   // leave equities key unchanged for back-compat
 }
 
 function defaultWeightsFor(universe) {
-  return universe === "crypto"
-    ? { weights: [...DEFAULT_WEIGHTS_CRYPTO], bias: DEFAULT_BIAS_CRYPTO }
-    : { weights: [...DEFAULT_WEIGHTS_EQUITIES], bias: DEFAULT_BIAS };
+  if (universe === "btc")    return { weights: [...DEFAULT_WEIGHTS_BTC], bias: DEFAULT_BIAS_BTC };
+  if (universe === "crypto") return { weights: [...DEFAULT_WEIGHTS_CRYPTO], bias: DEFAULT_BIAS_CRYPTO };
+  return { weights: [...DEFAULT_WEIGHTS_EQUITIES], bias: DEFAULT_BIAS };
 }
 
 function loadWeights(universe = "equities") {
@@ -115,12 +123,20 @@ function extractFeatures(q, macro = null, calendar = null, pead = null, universe
   const clip1 = v => Math.max(-1, Math.min(1, v || 0));
   const clip0to1 = v => Math.max(0, Math.min(1, v || 0));
 
-  // Is this a crypto asset? Equity-specific macro/calendar/PEAD features
-  // either produce nonsense (VIX on BTC) or timing-misaligned noise
-  // (earnings drift on a coin with no earnings). Zero those slots so they
-  // don't actively mispredict — the crypto-trained models can then place
-  // their own (near-zero) weights on those slots and ignore them.
-  const isCrypto = universe === "crypto";
+  // Is this a crypto asset (multi-symbol or single-asset BTC)? Equity-
+  // specific macro/calendar/PEAD features either produce nonsense (VIX on
+  // BTC) or timing-misaligned noise (earnings drift on a coin with no
+  // earnings). Zero those slots so they don't actively mispredict — the
+  // crypto-trained models can then place their own (near-zero) weights
+  // on those slots and ignore them.
+  // "btc" universe shares all crypto-mode feature routing (24/7, no earnings,
+  // crypto-native macro). Only the storage keys differ — see weightsKeyFor.
+  const isCrypto = universe === "crypto" || universe === "btc";
+  // Cross-sectional features only make sense with multiple symbols in the
+  // universe. On BTC-only, xsMomRank is structurally undefined (one symbol,
+  // no cross-section), so suppress it explicitly even if the upstream
+  // backtest accidentally populates it. Feature slot [9] stays at 0.
+  const isSingleAsset = universe === "btc";
 
   // ── Slot semantics differ by universe ─────────────────────────────
   // Same 16-dim vector, different meaning per universe. Storage keys are
@@ -147,7 +163,7 @@ function extractFeatures(q, macro = null, calendar = null, pead = null, universe
     ? clip1(macro?.cryptoContext?.tsMom ?? 0)
     : (macro?.vixTerm != null ? clip1((macro.vixTerm - 1) * 5) : 0);
   const dxy_mom  = isCrypto
-    ? clip1(macro?.cryptoContext?.xsMomRank ?? 0)
+    ? (isSingleAsset ? 0 : clip1(macro?.cryptoContext?.xsMomRank ?? 0))
     : clip1((macro?.dxyMom5  || 0) * 100);
   // Slot [10]: crypto = perp funding-rate z (Phase 3d step 2); equity = TNX.
   const tnx_mom  = isCrypto
@@ -183,6 +199,18 @@ export const FEATURE_NAMES_CRYPTO = [
   "RSI", "MACD", "Mom", "BB", "EMA9/20", "EMA20/50", "Vol",
   "BTC_dom_z", "TS_mom_z",
   "XS_mom_rank", "Fund_z", "—", "—",
+  "—",
+  "—", "—",
+];
+// BTC single-asset: XS momentum rank is structurally dead (n=1 has no
+// cross-section), so slot [9] is marked dead. The other crypto-native
+// features carry through. Future commits will populate slots [11-15]
+// with BTC-specific features (DVOL-RV spread, on-chain, etc.) — the
+// model still sees a 16-dim vector so storage shape stays stable.
+export const FEATURE_NAMES_BTC = [
+  "RSI", "MACD", "Mom", "BB", "EMA9/20", "EMA20/50", "Vol",
+  "BTC_dom_z", "TS_mom_z",
+  "— (n/a single-asset)", "Fund_z", "—", "—",
   "—",
   "—", "—",
 ];
@@ -398,9 +426,19 @@ export function scoreSetup(q, context = {}) {
   // nonsense — different asset class, different dynamics. Suppress for
   // crypto until Phase 3b adds a crypto-specific regime library (2017
   // mania, 2018 bear, 2022 LUNA/FTX, etc.).
-  const isCrypto = universe === "crypto";
-  const tree      = decisionTree(q);
-  const crisis    = findClosestCrisis(q);
+  const isCrypto = universe === "crypto" || universe === "btc";
+  // Decision tree is hand-coded for equity mean-reversion patterns
+  // (RSI-band → bounce). Firing it on crypto produces backwards calls
+  // that pollute the composite even though the weight is zeroed, so
+  // short-circuit the whole computation for any crypto universe. Audit
+  // item #10: avoid wasted compute + avoid any future accidental read
+  // of tree fields on crypto.
+  const tree      = isCrypto
+    ? { signal: "AVOID", strength: 0, reason: "muted for crypto/btc — equity-mean-reversion rules don't apply" }
+    : decisionTree(q);
+  // Crisis analogue library is equity-only (1929, 2008, COVID...). Skip
+  // entirely on crypto — findClosestCrisis only runs for equities.
+  const crisis    = isCrypto ? null : findClosestCrisis(q);
   const atr       = q.atr ?? 0;
   const price     = q.price ?? 0;
 

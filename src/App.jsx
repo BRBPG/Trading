@@ -53,6 +53,22 @@ const EQUITY_WATCHLIST = ["SPY","QQQ","AAPL","MSFT","AMZN","NVDA","AMD","TSM","T
 // MATIC was rebranded to POL in September 2024 when the Polygon ecosystem
 // migrated the native token. Polygon.io's ticker is now X:POLUSD and Yahoo
 // has migrated to POL-USD.
+// ─── BTC-only single-asset universe (Phase 4) ──────────────────────────────
+// After the 40-coin multi-symbol crypto pipeline landed three independent
+// diagnostics at null (overall AUC, conviction-stratified AUC, meta-labeling
+// AUC all at ~0.50), the pivot is to single-asset BTC focus. Rationale:
+//   - Retail feature universe is the ceiling on 40-coin universes where
+//     cross-sectional momentum degenerates (Liu-Tsyvinski 2022 used 1800+).
+//   - BTC has the richest orthogonal retail-accessible data (Deribit DVOL,
+//     Binance funding, on-chain metrics via free APIs) — most published
+//     retail-ML-for-crypto successes focus on BTC specifically.
+//   - Single-asset simplifies: no XS-rank degeneracy, no universe-level
+//     silent drops, no per-symbol feature normalization headaches.
+// Storage keys fully isolated from both "crypto" (multi-symbol weights) and
+// "equities" (different asset class entirely) — see model.js/nn.js/gbm.js
+// for btc-specific key routing.
+const BTC_WATCHLIST = ["BTC-USD"];
+
 const CRYPTO_WATCHLIST = [
   // ─── Tier 1: Top 10 by market cap / liquidity (original 3a universe) ───
   "BTC-USD","ETH-USD","SOL-USD","BNB-USD","XRP-USD",
@@ -98,15 +114,26 @@ function isCryptoSymbol(sym) {
   return /-USD(T)?$/.test(sym);
 }
 
+// Single-source truth for "is this universe a crypto-style asset class?"
+// Used everywhere we need to route features + 24/7 session handling + crypto-
+// specific model configuration. Both multi-symbol "crypto" and single-asset
+// "btc" pass this check — storage keys are still segregated per universe in
+// model.js/nn.js/gbm.js so they don't cross-contaminate.
+function isCryptoUniverse(universe) {
+  return universe === "crypto" || universe === "btc";
+}
+
 function watchlistFor(universe) {
-  return universe === "crypto" ? CRYPTO_WATCHLIST : EQUITY_WATCHLIST;
+  if (universe === "btc")    return BTC_WATCHLIST;
+  if (universe === "crypto") return CRYPTO_WATCHLIST;
+  return EQUITY_WATCHLIST;
 }
 
 function backtestSymbolsFor(universe) {
   // Equities: drop dot-suffix (non-US session-misaligned).
-  // Crypto: use all — 24/7 markets, no session mismatch.
+  // Crypto / BTC: use all — 24/7 markets, no session mismatch.
   const list = watchlistFor(universe);
-  return universe === "crypto"
+  return isCryptoUniverse(universe)
     ? [...list]
     : list.filter(s => !s.includes("."));
 }
@@ -120,7 +147,12 @@ function backtestSymbolsFor(universe) {
 //             effect to reset costBps when the user flips universe.
 // eslint-disable-next-line no-unused-vars
 function defaultCostBpsFor(universe) {
-  return universe === "crypto" ? 30 : 15;
+  // BTC on a top-tier venue (Coinbase Pro, Kraken, Binance) clears at ~15-20
+  // bps round-trip at retail size — tighter than the broad crypto average
+  // because BTC is the highest-liquidity pair by an order of magnitude.
+  if (universe === "btc")    return 18;
+  if (universe === "crypto") return 30;
+  return 15;
 }
 
 // Subset of the watchlist fed into the backtest / sim / training pipeline.
@@ -150,8 +182,11 @@ const BACKTEST_SYMBOLS = backtestSymbolsFor("equities");
 // multi-sim variance the way IONQ/RGTI did for equities.
 const HIGH_VOL_EQUITIES = ["IONQ", "RGTI"];
 const HIGH_VOL_CRYPTO   = ["DOGE-USD", "AVAX-USD"];  // tune with experience
+const HIGH_VOL_BTC      = [];                         // n/a for single-asset
 function highVolSymbolsFor(universe) {
-  return universe === "crypto" ? HIGH_VOL_CRYPTO : HIGH_VOL_EQUITIES;
+  if (universe === "btc")    return HIGH_VOL_BTC;
+  if (universe === "crypto") return HIGH_VOL_CRYPTO;
+  return HIGH_VOL_EQUITIES;
 }
 const HIGH_VOL_SYMBOLS = HIGH_VOL_EQUITIES;  // back-compat default
 
@@ -782,7 +817,7 @@ function rankOpportunities(quotes, topN = 3, context = {}) {
   // that needs per-symbol context building. macro/calendar are shared.
   // context.fundingMap: Map<symbol, fundingRecords[]> for crypto funding-z.
   const { earningsMap = {}, fundingMap = new Map(), ...sharedCtx } = context;
-  const isCrypto = sharedCtx.universe === "crypto";
+  const isCrypto = isCryptoUniverse(sharedCtx.universe);
   return Object.values(quotes)
     .filter(q => q && q.price)
     .map(q => {
@@ -799,7 +834,7 @@ function rankOpportunities(quotes, topN = 3, context = {}) {
           cryptoContext: {
             ...(sharedCtx.macro.cryptoContext || {}),
             tsMom: timeSeriesMomentum(q.closes),
-            xsMomRank: xsMomRankLive(q.symbol, quotes),
+            xsMomRank: sharedCtx.universe === "btc" ? 0 : xsMomRankLive(q.symbol, quotes),
             fundingZ: fundingZLive(fundingMap.get(q.symbol)),
           },
         } : null,
@@ -1067,14 +1102,16 @@ export default function App() {
     // this call is nearly free after the first refresh. When universe is
     // crypto, also fetch BTC dominance in parallel — feeds the dominanceZ
     // feature slot via macro.cryptoContext downstream.
+    const isCryptoUni = isCryptoUniverse(universe);
     const [results, macroSnap, btcDom, funding] = await Promise.all([
       Promise.all(activeWatchlist.map(s=>fetchQuote(s, finnhubKey))),
       fetchMacroSnapshot().catch(() => null),
+      // BTC dominance only meaningful on multi-crypto — on btc-only universe
+      // it's redundant with self-TS-momentum, so skip the fetch entirely.
       universe === "crypto" ? fetchBTCDominance().catch(() => null) : Promise.resolve(null),
-      // Phase 3d step 2: bulk-fetch funding histories for every crypto
-      // symbol. Binance public fapi is session-cached inside funding.js so
-      // subsequent refreshes within 10 min reuse the cached records.
-      universe === "crypto"
+      // Funding rates: fetched for both "crypto" (40 symbols) and "btc"
+      // (just BTC-USD). Session-cached inside funding.js.
+      isCryptoUni
         ? fetchFundingForUniverse(activeWatchlist, { concurrency: 10 }).catch(() => new Map())
         : Promise.resolve(new Map()),
     ]);
@@ -1155,7 +1192,7 @@ export default function App() {
     // Crypto has no earnings concept — don't waste 10 Finnhub calls per
     // session on BTC-USD etc (they'd fail silently anyway). When universe
     // is crypto, PEAD features stay at zero.
-    if (universe === "crypto") {
+    if (isCryptoUniverse(universe)) {
       setEarningsMap({});
       return;
     }
@@ -1175,16 +1212,21 @@ export default function App() {
     // computed from its own bars with no external API. Feeds the TS_mom_z
     // feature slot (which equity mode uses for VIX_term).
     const selectedQuote = quotes[selected];
-    const cryptoCtx = (universe === "crypto" && selectedQuote?.closes) ? {
+    const isCryptoUni = isCryptoUniverse(universe);
+    // On btc single-asset universe, xsMomRank is structurally undefined
+    // (n=1 has no cross-section) so always 0. tsMom + fundingZ are still
+    // computed from BTC's own data.
+    const cryptoCtx = (isCryptoUni && selectedQuote?.closes) ? {
       ...(macro?.cryptoContext || {}),
       tsMom: timeSeriesMomentum(selectedQuote.closes),
-      xsMomRank: xsMomRankLive(selected, quotes),
+      xsMomRank: universe === "btc" ? 0 : xsMomRankLive(selected, quotes),
       fundingZ: fundingZLive(fundingMap.get(selected)),
     } : macro?.cryptoContext;
     const modelCtx = {
       macro: macro ? { ...macro, cryptoContext: cryptoCtx } : null,
       calendar: calendarFeatures(),
-      pead: universe === "crypto" ? null : computePeadFeatures(earningsMap[selected]),
+      // No earnings on any crypto asset (multi or btc).
+      pead: isCryptoUni ? null : computePeadFeatures(earningsMap[selected]),
       universe,
     };
     const context = buildContext(quotes, selected, news, modelCtx);
@@ -1202,11 +1244,13 @@ export default function App() {
     // Universe prefix tells Claude which panel is answering. System prompt
     // already routed (equity SYSTEM_PROMPT vs CRYPTO_SYSTEM_PROMPT); this
     // preamble reinforces + adds horizon-specific persona weighting.
-    const universePreamble = universe === "crypto"
+    const universePreamble = universe === "btc"
+      ? `\n═══ ASSET UNIVERSE: BTC (single-asset) ═══\nThis session is a BTC-focused analysis. No cross-asset rotation to reason about; every frame is about Bitcoin specifically. The five analysts are Pal / Woo / Brandt / Hayes / Cowen. Reference: funding rates, halving-cycle phase, realized-cap cohort behavior, DVOL/IV, macro liquidity. BTC dominance is not useful as a signal here (BTC IS the reference). Do NOT compare to altcoin performance unless specifically asked.\n`
+      : universe === "crypto"
       ? `\n═══ ASSET UNIVERSE: CRYPTO ═══\n${selected} is a cryptocurrency traded 24/7. No earnings concept, no FOMC calendar, no equity VIX. The five analysts are Pal / Woo / Brandt / Hayes / Cowen — NONE of the equity legends. Reference: BTC dominance, funding rates, halving-cycle phase, on-chain cohort positioning, DXY as macro backdrop (but not equity-centric technicals like VIX term structure).\n`
       : "";
     const horizonPreamble = isSwing
-      ? (universe === "crypto"
+      ? (isCryptoUniverse(universe)
         ? `\n═══ INTENDED HORIZON: SWING (1-5 DAYS) ═══
 Use SWING level set (2× daily-ATR stop, 6× daily-ATR target${dailyAtrEstimate ? ` — roughly $${(dailyAtrEstimate * 2).toFixed(2)} away for stop` : ""}). Weekly/daily chart structure, not 5-min chop. Entry timing can still be intraday but the trade is multi-day.
 
@@ -1227,7 +1271,7 @@ PERSONA WEIGHTING AT THIS HORIZON:
   SIMONS — SECONDARY. Adaptable. Speak to statistical divergences at the daily scale.
   WILLIAMS — SECONDARY. A daytrader by specialty. Compress his short-term ideas to "is the crowd wrong at this daily inflection?"
 `)
-      : (universe === "crypto"
+      : (isCryptoUniverse(universe)
         ? `\n═══ INTENDED HORIZON: INTRADAY (1-3 HOURS) ═══
 Use INTRADAY level set (1.5× 5-min ATR stop). Session-scale action — recent 4h structure, hourly levels, funding flips, liquidation zones.
 
@@ -1268,7 +1312,7 @@ PERSONA WEIGHTING AT THIS HORIZON:
           // (Pal/Woo/Brandt/Hayes/Cowen); equity keeps the original legends.
           // Both share the same output format so parseTradeData regexes work
           // unchanged.
-          system: universe === "crypto" ? CRYPTO_SYSTEM_PROMPT : SYSTEM_PROMPT,
+          system: isCryptoUniverse(universe) ? CRYPTO_SYSTEM_PROMPT : SYSTEM_PROMPT,
           messages: newHistory,
         }),
       });
@@ -1329,7 +1373,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         body: JSON.stringify({
           model:"claude-opus-4-5",
           max_tokens:4096,
-          system: universe === "crypto" ? CRYPTO_SYSTEM_PROMPT : SYSTEM_PROMPT,
+          system: isCryptoUniverse(universe) ? CRYPTO_SYSTEM_PROMPT : SYSTEM_PROMPT,
           messages:newHistory,
         }),
       });
@@ -1488,7 +1532,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
           // folds over-fits noise into systematic anti-signal; GBM with
           // val-loss early stopping stays near the prior on signal-free
           // folds, giving an honest null AUC 0.50 instead of 0.44.
-          modelKind: universe === "crypto" ? "gbm" : "nn",
+          modelKind: isCryptoUniverse(universe) ? "gbm" : "nn",
         });
         setWfResult(out);
       } catch (err) {
@@ -1570,7 +1614,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         await new Promise(r => setTimeout(r, 30));
         const wf = runWalkForward(res.trades, {
           folds: 5, epochs: 60,
-          modelKind: universe === "crypto" ? "gbm" : "nn",
+          modelKind: isCryptoUniverse(universe) ? "gbm" : "nn",
         });
         if (wf.overall?.oosAUC != null) {
           aucs.push(wf.overall.oosAUC);
@@ -1771,19 +1815,26 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
             new watchlist, and disables equity-only features (PEAD, crisis
             analogue, Buffett persona) for crypto. One knob propagates. */}
         <button onClick={()=>{
-          const nextU = universe === "crypto" ? "equities" : "crypto";
+          // 3-way cycle: equities → crypto → btc → equities. BTC mode is
+          // single-asset focus for the Phase 4 pivot after the 40-coin
+          // crypto universe landed three diagnostics at coin flip.
+          const cycle = { equities: "crypto", crypto: "btc", btc: "equities" };
+          const nextU = cycle[universe] || "equities";
           setUniverse(nextU);
-          // Auto-select first symbol in new universe — otherwise the
-          // previously-selected ticker stays on-screen even when it's no
-          // longer in the live fetch loop.
           const newList = watchlistFor(nextU);
           if (!newList.includes(selected)) setSelected(newList[0]);
-          // Research-recommended defaults per universe:
-          //   crypto → daily horizon, 30 bps cost (research Tier A evidence)
-          //   equities → 5-min horizon, 15 bps cost (already-tuned default)
+          // Per-universe defaults:
+          //   equities → 5m + 15 bps (US-session, tight stops, tuned)
+          //   crypto   → 1d + 30 bps (24/7, research-Tier-A evidence)
+          //   btc      → 1d + 18 bps (single-asset, top-tier venue costs)
           if (nextU === "crypto") {
             setSimInterval("1d");
             setCostBps(30);
+            if (simDaysAgo < 90) setSimDaysAgo(polygonKey ? 180 : 7);
+            if (maxHoldHours < 24) setMaxHoldHours(5);
+          } else if (nextU === "btc") {
+            setSimInterval("1d");
+            setCostBps(18);
             if (simDaysAgo < 90) setSimDaysAgo(polygonKey ? 180 : 7);
             if (maxHoldHours < 24) setMaxHoldHours(5);
           } else {
@@ -1791,12 +1842,12 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
             setCostBps(15);
           }
         }}
-          title="Swap asset universe. Crypto uses 24/7 markets, higher cost defaults (30 bps), daily horizon, and disables equity-only features (earnings drift, crisis analogue, Buffett). Equities: US+UK stocks + ETFs."
-          style={{background:universe === "crypto" ? "#1A140F" : "#0F1A0F",
-            border:`1px solid ${universe === "crypto" ? "#C97A2A" : "#2A6A4A"}`,
-            color:universe === "crypto" ? "#FFB07A" : "#7FD8A6",
+          title="Cycle asset universe: equities → crypto (40 symbols) → btc (single-asset focus) → equities. BTC mode isolates training on Bitcoin only — fresh storage keys, xsMomRank disabled (structurally undefined on n=1), dominance proxy disabled (redundant with TS momentum on self)."
+          style={{background: universe === "btc" ? "#14141F" : universe === "crypto" ? "#1A140F" : "#0F1A0F",
+            border:`1px solid ${universe === "btc" ? "#6A6AC9" : universe === "crypto" ? "#C97A2A" : "#2A6A4A"}`,
+            color: universe === "btc" ? "#B0B0FF" : universe === "crypto" ? "#FFB07A" : "#7FD8A6",
             fontFamily:"inherit",fontSize:9,padding:"3px 10px",cursor:"pointer",letterSpacing:2,fontWeight:700,marginRight:6}}>
-          UNIVERSE: {universe === "crypto" ? "CRYPTO" : "EQUITIES"}
+          UNIVERSE: {universe === "btc" ? "BTC (1-asset)" : universe === "crypto" ? "CRYPTO (40)" : "EQUITIES"}
         </button>
         <button onClick={()=>setSimInterval(simInterval === "1d" ? "5m" : "1d")}
           title="Global horizon — switches the entire app between intraday (tight stops, short holds) and swing (wider stops, multi-day holds). Set here or in the SIM card's HORIZON dropdown; they share state."
@@ -1807,7 +1858,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
           HORIZON: {simInterval === "1d" ? "SWING (1-5d)" : "INTRADAY (1-3h)"}
         </button>
         <div style={{flex:1,fontSize:9,color:"#555",letterSpacing:2,marginLeft:12}}>
-          {universe === "crypto"
+          {isCryptoUniverse(universe)
             ? "Raoul Pal · Willy Woo · Peter Brandt · Arthur Hayes · Benjamin Cowen"
             : "Livermore · Tudor Jones · Dennis · Simons · Williams"}
         </div>
@@ -1853,7 +1904,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         {/* Watchlist */}
         <div style={{width:200,background:"#0C0C0C",borderRight:"1px solid #1A1A1A",overflowY:"auto",flexShrink:0}}>
           <div style={{padding:"8px 10px",fontSize:8,color:"#444",letterSpacing:2,borderBottom:"1px solid #1A1A1A"}}>
-            {universe === "crypto" ? "CRYPTO" : "EQUITIES"} · {loadedCount}/{activeWatchlist.length}
+            {universe === "btc" ? "BTC" : universe === "crypto" ? "CRYPTO" : "EQUITIES"} · {loadedCount}/{activeWatchlist.length}
           </div>
           {activeWatchlist.map(sym=>{
             const q=quotes[sym]; const up=q?q.changePct>=0:null; const isSel=sym===selected;
@@ -1993,16 +2044,16 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
           {tab==="model"&&(()=>{
             const q = quotes[selected];
             // Crypto: augment with per-symbol TS momentum before scoring
-            const cryptoCtx = (universe === "crypto" && q?.closes) ? {
+            const cryptoCtx = (isCryptoUniverse(universe) && q?.closes) ? {
               ...(macro?.cryptoContext || {}),
               tsMom: timeSeriesMomentum(q.closes),
-              xsMomRank: xsMomRankLive(selected, quotes),
+              xsMomRank: universe === "btc" ? 0 : xsMomRankLive(selected, quotes),
               fundingZ: fundingZLive(fundingMap.get(selected)),
             } : macro?.cryptoContext;
             const m = q ? scoreSetup(q, {
               macro: macro ? { ...macro, cryptoContext: cryptoCtx } : null,
               calendar: calendarFeatures(),
-              pead: universe === "crypto" ? null : computePeadFeatures(earningsMap[selected]),
+              pead: isCryptoUniverse(universe) ? null : computePeadFeatures(earningsMap[selected]),
               universe,
             }) : null;
             return (
@@ -2214,7 +2265,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                         </div>
                       </div>
                       <div style={{fontSize:10,color:"#888",lineHeight:1.6,marginBottom:10}}>
-                        Fetches real {simInterval === "1d" ? "daily" : "5-min"} candles for {activeBacktestSymbols.length} {universe === "crypto" ? "crypto pairs (24/7 markets)" : "US-session symbols (non-US skipped)"},
+                        Fetches real {simInterval === "1d" ? "daily" : "5-min"} candles for {activeBacktestSymbols.length} {universe === "btc" ? "BTC bars (single-asset focus)" : universe === "crypto" ? "crypto pairs (24/7 markets)" : "US-session symbols (non-US skipped)"},
                         samples random entries per symbol, runs the current model verdict at each, then walks
                         forward bar-by-bar. <b style={{color:"#5AACDF"}}>Stop or target exits the trade IMMEDIATELY</b> on
                         the first bar that touches them — max-hold is only the <i>timeout</i> for trades that
