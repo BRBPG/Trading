@@ -1941,31 +1941,33 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
   }
 
   // ─── Adaptive continuous training loop ───────────────────────────────────
-  // Automates N sim → train → walk-forward cycles AND periodically re-tests
-  // which features contribute. This is the right design for a backtest
-  // harness where regime matters: a static feature prune based on one
-  // ablation is brittle — the model should KEEP EXPERIMENTING and adapt
-  // its active-feature set as the signal landscape shifts.
+  // Principled Thompson-sampling bandit over feature inclusion decisions.
+  // Replaces the earlier heuristic "drop if median < threshold / add back
+  // if median > threshold" which mixed arbitrary thresholds with ad-hoc
+  // probe cycles. The bandit approach has theoretical backing (Agrawal &
+  // Goyal 2012, "Analysis of Thompson Sampling for the Multi-Armed Bandit
+  // Problem", COLT): provably optimal regret for Bernoulli arms. Balances
+  // exploitation (converges to best features) with exploration (never
+  // permanently drops a feature — low-evidence slots get re-sampled in
+  // proportion to their Beta-posterior variance).
   //
-  // Loop structure per cycle:
-  //   1. Fresh sim (new random entry sampling)
-  //   2. Train GBM on sim trades (persisted to localStorage)
-  //   3. Walk-forward evaluation with CURRENT feature mask
-  //   4. Record AUC, log-loss, train/test gap into history
-  //   5. Every ABLATE_EVERY cycles: re-ablate features and update mask
-  //      based on rolling-median Δ per feature
-  //   6. Every PROBE_EVERY cycles: re-test ALL features (empty mask) to
-  //      catch features that previously looked dead but are now helpful
-  //      in the current regime
+  // Algorithm per feature i:
+  //   Beta(α_i, β_i) posterior of "feature i is beneficial"
+  //     α_i = 1 + count of positive Δ observations (Δ > +0.002 in ablation)
+  //     β_i = 1 + count of negative Δ observations (Δ < -0.002)
+  //   Per-cycle mask: sample p_i ~ Beta(α_i, β_i); include feature if
+  //     p_i ≥ 0.5, drop otherwise.
   //
-  // Adaptive mask rule:
-  //   median(last HISTORY_WINDOW Δs for slot) < DROP_THRESHOLD → disable
-  //   median > KEEP_THRESHOLD                                  → re-enable
-  //   in between (noise band)                                  → unchanged
+  // Loop per cycle:
+  //   1. Sample mask via Thompson
+  //   2. Fresh sim → train GBM
+  //   3. Every 3rd cycle: ablation (updates Beta posteriors)
+  //      Other cycles: single walk-forward
+  //   4. Best-AUC GBM auto-preserved
+  //   5. Sleep INTER_CYCLE_SLEEP_MS — respects fetch rate limits and
+  //      lets UI breathe
   //
-  // Best-model preservation: if a cycle's AUC improves on best-so-far,
-  // the GBM is kept. Otherwise it's rolled back so noise-cycles don't
-  // overwrite good weights.
+  // Abort checks at every await-point so STOP responds within ~500ms.
   async function runContinuousTrain() {
     if (continuousRunning) return;
     setContinuousRunning(true);
@@ -1978,14 +1980,17 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
       : activeBacktestSymbols;
     const nSyms = Math.max(1, symsForRun.length);
 
-    // Adaptive config
-    const ABLATE_EVERY = 3;          // re-ablate every 3 cycles
-    const PROBE_EVERY  = 9;          // probe all features every 9 cycles
-    const HISTORY_WINDOW = 5;        // rolling Δ history per feature
-    const DROP_THRESHOLD = -0.01;    // median Δ below this → drop feature
-    const KEEP_THRESHOLD = 0.005;    // median Δ above this → re-enable
+    // Config
+    const ABLATE_EVERY = 3;
+    const POS_THRESHOLD = 0.002;
+    const NEG_THRESHOLD = -0.002;
+    const PRIOR_ALPHA = 1;
+    const PRIOR_BETA = 1;
+    // 7s pacing prevents saturating CoinGecko/Binance/Deribit rate
+    // limits AND lets the UI repaint reliably between cycles — user
+    // explicitly asked for this.
+    const INTER_CYCLE_SLEEP_MS = 7000;
 
-    // Feature targets (same taxonomy as ablation button)
     const btcTargets = [
       { slot: 7,  name: "BTC dominance z" },
       { slot: 8,  name: "TS momentum z" },
@@ -2009,12 +2014,34 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
       { slot: 15, name: "Top L/S contrarian z" },
     ];
     const targets = universe === "btc" ? btcTargets
-                  : universe === "crypto" ? cryptoTargets
-                  : [];
+                  : universe === "crypto" ? cryptoTargets : [];
 
-    // Adaptive state
-    const featureMask = new Set();        // currently-disabled slots
-    const deltaHistory = {};              // slot → rolling array of Δs
+    // Beta posteriors per feature
+    const posteriors = {};
+    for (const t of targets) {
+      posteriors[t.slot] = { alpha: PRIOR_ALPHA, beta: PRIOR_BETA };
+    }
+
+    // Beta sampler via Gamma ratio (exact for integer shape params).
+    const sampleGamma = (shape) => {
+      let sum = 0;
+      for (let i = 0; i < shape; i++) sum += -Math.log(1 - Math.random());
+      return sum;
+    };
+    const sampleBeta = (a, b) => {
+      const x = sampleGamma(a), y = sampleGamma(b);
+      return x / (x + y);
+    };
+    // Sample mask from current posteriors: drop feature if p_i < 0.5.
+    const thompsonMask = () => {
+      const dropped = [];
+      for (const t of targets) {
+        const p = sampleBeta(posteriors[t.slot].alpha, posteriors[t.slot].beta);
+        if (p < 0.5) dropped.push(t.slot);
+      }
+      return dropped;
+    };
+
     const gbmKey = universe === "btc" ? "trader_gbm_v3_btc"
                  : universe === "crypto" ? "trader_gbm_v2_crypto"
                  : "trader_gbm_v1";
@@ -2027,7 +2054,11 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
       for (let cycle = 0; cycle < N; cycle++) {
         if (continuousAbortRef.current) break;
 
-        // Fresh sim with current calibrated sample count.
+        // Cycles 1-2 run unmasked to prime the Beta posteriors with a
+        // baseline measurement. From cycle 3 onwards Thompson sampling
+        // takes over.
+        const activeMask = cycle < 2 ? [] : thompsonMask();
+
         const baseSamples = simInterval === "1d"
           ? Math.min(30, Math.max(5, Math.floor(simDaysAgo / 10)))
           : (simDaysAgo <= 7 ? 10 : simDaysAgo <= 30 ? 20 : 40);
@@ -2044,30 +2075,25 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
           universe,
           onProgress: () => {},
         });
+        if (continuousAbortRef.current) break;
         if (!res.trades.length) {
           results.push({
             cycle: cycle + 1, auc: null, logLoss: null, gap: null,
-            trades: 0, mask: Array.from(featureMask), error: "no trades",
+            trades: 0, mask: activeMask, error: "no trades",
           });
           setContinuousResults([...results]);
+          await new Promise(r => setTimeout(r, 500));
           continue;
         }
 
-        // Increment-train GBM. trainGBMFromSim persists to localStorage
-        // so cycles accumulate training data naturally.
         trainGBMFromSim(res.trades, universe);
-
-        // Decide the mask for this cycle. Probe cycles run unmasked to
-        // re-test dropped features in current conditions.
-        const isProbeCycle = (cycle + 1) % PROBE_EVERY === 0;
-        const isAblationCycle = (cycle + 1) % ABLATE_EVERY === 0 && targets.length > 0;
-        const activeMask = isProbeCycle ? [] : Array.from(featureMask);
+        if (continuousAbortRef.current) break;
 
         await new Promise(r => setTimeout(r, 30));
+        if (continuousAbortRef.current) break;
 
-        // On ablation cycles, runAblationStudy provides both the baseline
-        // AUC AND per-feature Δs from one computation pass. On plain
-        // cycles, just runWalkForward for the baseline AUC.
+        const isAblationCycle = (cycle + 1) % ABLATE_EVERY === 0 && targets.length > 0;
+
         let aucNow = null, logLossNow = null, gapNow = null;
         let ablationDeltas = null;
         if (isAblationCycle) {
@@ -2092,37 +2118,25 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
           gapNow = (wf.overall?.avgTestLoss != null && wf.overall?.avgTrainLoss != null)
             ? wf.overall.avgTestLoss - wf.overall.avgTrainLoss : null;
         }
+        if (continuousAbortRef.current) break;
 
-        // Update feature mask based on ablation results. Use median of
-        // rolling HISTORY_WINDOW Δs per feature so single-cycle outliers
-        // don't flip the mask — requires consistent evidence.
-        const maskChanges = [];
+        // Update Beta posteriors from deltas.
+        const posteriorUpdates = [];
         if (ablationDeltas) {
-          for (const r of ablationDeltas) {
-            if (r.delta == null) continue;
-            if (!deltaHistory[r.slot]) deltaHistory[r.slot] = [];
-            deltaHistory[r.slot].push(r.delta);
-            if (deltaHistory[r.slot].length > HISTORY_WINDOW) {
-              deltaHistory[r.slot].shift();
-            }
-          }
-          for (const [slotStr, deltas] of Object.entries(deltaHistory)) {
-            if (deltas.length < 2) continue;
-            const slot = Number(slotStr);
-            const sorted = [...deltas].sort((a, b) => a - b);
-            const median = sorted[Math.floor(sorted.length / 2)];
-            const wasIn = featureMask.has(slot);
-            if (median < DROP_THRESHOLD && !wasIn) {
-              featureMask.add(slot);
-              maskChanges.push({ slot, action: "drop", median });
-            } else if (median > KEEP_THRESHOLD && wasIn) {
-              featureMask.delete(slot);
-              maskChanges.push({ slot, action: "keep", median });
+          for (const d of ablationDeltas) {
+            if (d.delta == null) continue;
+            const post = posteriors[d.slot];
+            if (!post) continue;
+            if (d.delta > POS_THRESHOLD) {
+              post.alpha += 1;
+              posteriorUpdates.push({ slot: d.slot, verdict: "helpful", delta: d.delta });
+            } else if (d.delta < NEG_THRESHOLD) {
+              post.beta += 1;
+              posteriorUpdates.push({ slot: d.slot, verdict: "harmful", delta: d.delta });
             }
           }
         }
 
-        // Best-model preservation.
         if (aucNow != null && aucNow > bestAUC) {
           bestAUC = aucNow;
           bestGBM = loadGBM(universe);
@@ -2130,22 +2144,32 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
           localStorage.setItem(gbmKey, JSON.stringify(bestGBM));
         }
 
+        // E[Beta(α,β)] = α/(α+β) — feature's posterior mean usefulness
+        const posteriorSnapshot = Object.fromEntries(
+          Object.entries(posteriors).map(([s, p]) => [s, p.alpha / (p.alpha + p.beta)])
+        );
+
         results.push({
           cycle: cycle + 1,
           auc: aucNow,
           logLoss: logLossNow,
           gap: gapNow,
           trades: res.trades.length,
-          mask: Array.from(featureMask),
-          maskChanges,
+          mask: activeMask,
+          posteriorUpdates,
+          posteriors: posteriorSnapshot,
           ablationCycle: isAblationCycle,
-          probeCycle: isProbeCycle,
           bestSoFar: bestAUC,
           timestamp: Date.now(),
         });
         setContinuousResults([...results]);
 
-        await new Promise(r => setTimeout(r, 100));
+        // Inter-cycle sleep in 500ms increments for prompt abort.
+        const sleepIncrements = Math.ceil(INTER_CYCLE_SLEEP_MS / 500);
+        for (let k = 0; k < sleepIncrements; k++) {
+          if (continuousAbortRef.current) break;
+          await new Promise(r => setTimeout(r, 500));
+        }
       }
     } catch (err) {
       results.push({ cycle: results.length + 1, auc: null, error: err.message || String(err) });
@@ -3240,32 +3264,37 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                                   </div>
                                 </div>
 
-                                {/* Per-cycle history table */}
-                                <div style={{maxHeight:200,overflowY:"auto",padding:"4px 8px",background:"#080808",border:"1px solid #1A1A1A",fontSize:9}}>
-                                  <div style={{display:"grid",gridTemplateColumns:"0.5fr 1fr 1fr 1fr 1.5fr 1fr",gap:6,fontSize:8,color:"#555",marginBottom:4,position:"sticky",top:0,background:"#080808"}}>
-                                    <div>#</div>
-                                    <div>AUC</div>
-                                    <div>GAP</div>
-                                    <div>LOG-LOSS</div>
-                                    <div>MASK</div>
-                                    <div>TYPE</div>
+                                {/* Per-cycle history table. SINGLE grid
+                                    container for header+body so rows lay
+                                    out as columns. Previously the header
+                                    was its own grid and body rows stacked
+                                    as vertical blocks — fixed here. */}
+                                <div style={{maxHeight:220,overflowY:"auto",padding:"4px 8px",background:"#080808",border:"1px solid #1A1A1A",fontSize:9}}>
+                                  <div style={{display:"grid",gridTemplateColumns:"0.5fr 1fr 1fr 1fr 1.5fr 1fr",gap:6,rowGap:3}}>
+                                    <div style={{fontSize:8,color:"#555",position:"sticky",top:0,background:"#080808"}}>#</div>
+                                    <div style={{fontSize:8,color:"#555",position:"sticky",top:0,background:"#080808"}}>AUC</div>
+                                    <div style={{fontSize:8,color:"#555",position:"sticky",top:0,background:"#080808"}}>GAP</div>
+                                    <div style={{fontSize:8,color:"#555",position:"sticky",top:0,background:"#080808"}}>LOG-LOSS</div>
+                                    <div style={{fontSize:8,color:"#555",position:"sticky",top:0,background:"#080808"}}>MASK</div>
+                                    <div style={{fontSize:8,color:"#555",position:"sticky",top:0,background:"#080808"}}>TYPE</div>
+                                    {continuousResults.slice().reverse().map(r => {
+                                      const aucCol = r.auc == null ? "#666" : r.auc >= 0.55 ? "#2ECC71" : r.auc >= 0.52 ? "#C9A84C" : "#E74C3C";
+                                      const type = r.error ? `err` : r.probeCycle ? "probe" : r.ablationCycle ? "ablation" : "standard";
+                                      const isLatest = r.cycle === continuousResults.length;
+                                      return (
+                                        <React.Fragment key={r.cycle}>
+                                          <div style={{color:isLatest?"#CCC":"#888"}}>{r.cycle}</div>
+                                          <div style={{color:aucCol,fontWeight:isLatest?700:400}}>{r.auc != null ? r.auc.toFixed(3) : "—"}</div>
+                                          <div style={{color: r.gap != null && r.gap > 0.10 ? "#C9A84C" : "#888"}}>{r.gap != null ? r.gap.toFixed(3) : "—"}</div>
+                                          <div style={{color:"#888"}}>{r.logLoss != null ? r.logLoss.toFixed(3) : "—"}</div>
+                                          <div style={{color:r.mask?.length ? "#C97A7A" : "#666",fontSize:8}}>
+                                            {r.mask?.length ? r.mask.map(s=>`[${s}]`).join(" ") : "all active"}
+                                          </div>
+                                          <div style={{color: r.error ? "#E74C3C" : r.probeCycle ? "#7FD8A6" : r.ablationCycle ? "#6A9FDF" : "#666",fontSize:8}}>{type}</div>
+                                        </React.Fragment>
+                                      );
+                                    })}
                                   </div>
-                                  {continuousResults.slice().reverse().map(r => {
-                                    const aucCol = r.auc == null ? "#E74C3C" : r.auc >= 0.55 ? "#2ECC71" : r.auc >= 0.52 ? "#C9A84C" : "#E74C3C";
-                                    const type = r.error ? `err: ${r.error}` : r.probeCycle ? "probe (no mask)" : r.ablationCycle ? "ablation" : "standard";
-                                    return (
-                                      <React.Fragment key={r.cycle}>
-                                        <div style={{color:"#888"}}>{r.cycle}</div>
-                                        <div style={{color:aucCol,fontWeight:r.cycle===continuousResults.length?700:400}}>{r.auc != null ? r.auc.toFixed(3) : "—"}</div>
-                                        <div style={{color: r.gap != null && r.gap > 0.10 ? "#C9A84C" : "#888"}}>{r.gap != null ? r.gap.toFixed(3) : "—"}</div>
-                                        <div style={{color:"#888"}}>{r.logLoss != null ? r.logLoss.toFixed(3) : "—"}</div>
-                                        <div style={{color:r.mask?.length ? "#C97A7A" : "#666"}}>
-                                          {r.mask?.length ? r.mask.map(s=>`[${s}]`).join(" ") : "all active"}
-                                        </div>
-                                        <div style={{color: r.probeCycle ? "#7FD8A6" : r.ablationCycle ? "#6A9FDF" : "#666"}}>{type}</div>
-                                      </React.Fragment>
-                                    );
-                                  })}
                                 </div>
                               </div>
                             );
