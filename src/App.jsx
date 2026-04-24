@@ -1526,6 +1526,14 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
     const aucsTop50 = [], aucsTop30 = [], aucsTop10 = [];
     const lossesTop50 = [], lossesTop30 = [], lossesTop10 = [];
     const thrTop50 = [], thrTop30 = [], thrTop10 = [];
+    // Meta-labeling arrays (AFML Ch.4). Per-run: meta AUC, and primary
+    // AUC/log-loss on the subset where meta ≥ threshold (0.50/0.55/0.60).
+    // If gated AUC substantially exceeds ungated, the meta model IS the
+    // edge — trading filter becomes "take the trade only if meta ≥ X".
+    const metaAUCs = [], metaLosses = [];
+    const gatedAUC50 = [], gatedAUC55 = [], gatedAUC60 = [];
+    const gatedLoss50 = [], gatedLoss55 = [], gatedLoss60 = [];
+    const gatedKept50 = [], gatedKept55 = [], gatedKept60 = [];
     // Track per-symbol aggregated stats across all runs to find which
     // names are carrying vs dragging the multi-sim AUC.
     const perSymbolStats = {};  // symbol → { total: n, wins: n, pnl: sum }
@@ -1575,6 +1583,15 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
           if (bc?.top50?.auc != null) { aucsTop50.push(bc.top50.auc); lossesTop50.push(bc.top50.logLoss); thrTop50.push(bc.top50.threshold); }
           if (bc?.top30?.auc != null) { aucsTop30.push(bc.top30.auc); lossesTop30.push(bc.top30.logLoss); thrTop30.push(bc.top30.threshold); }
           if (bc?.top10?.auc != null) { aucsTop10.push(bc.top10.auc); lossesTop10.push(bc.top10.logLoss); thrTop10.push(bc.top10.threshold); }
+          // Meta-labeling aggregation
+          const meta = wf.overall.meta;
+          if (meta?.metaAUC != null) {
+            metaAUCs.push(meta.metaAUC);
+            metaLosses.push(meta.metaLogLoss);
+            if (meta.gated?.t50?.auc != null) { gatedAUC50.push(meta.gated.t50.auc); gatedLoss50.push(meta.gated.t50.logLoss); gatedKept50.push(meta.gated.t50.kept); }
+            if (meta.gated?.t55?.auc != null) { gatedAUC55.push(meta.gated.t55.auc); gatedLoss55.push(meta.gated.t55.logLoss); gatedKept55.push(meta.gated.t55.kept); }
+            if (meta.gated?.t60?.auc != null) { gatedAUC60.push(meta.gated.t60.auc); gatedLoss60.push(meta.gated.t60.logLoss); gatedKept60.push(meta.gated.t60.kept); }
+          }
         }
         // Aggregate per-symbol trade stats across this run for the summary.
         for (const t of res.trades) {
@@ -1675,6 +1692,16 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
           top30: bucket(aucsTop30, lossesTop30, thrTop30),
           top10: bucket(aucsTop10, lossesTop10, thrTop10),
         },
+        meta: metaAUCs.length >= 3 ? {
+          runs: metaAUCs.length,
+          meanMetaAUC: meanOrNull(metaAUCs),
+          meanMetaLogLoss: meanOrNull(metaLosses),
+          gated: {
+            t50: { meanAUC: meanOrNull(gatedAUC50), meanLogLoss: meanOrNull(gatedLoss50), meanKept: meanOrNull(gatedKept50), threshold: 0.50 },
+            t55: { meanAUC: meanOrNull(gatedAUC55), meanLogLoss: meanOrNull(gatedLoss55), meanKept: meanOrNull(gatedKept55), threshold: 0.55 },
+            t60: { meanAUC: meanOrNull(gatedAUC60), meanLogLoss: meanOrNull(gatedLoss60), meanKept: meanOrNull(gatedKept60), threshold: 0.60 },
+          },
+        } : null,
         symbolBreakdown,
         fetchLog: firstRunFetchLog,
       });
@@ -2738,6 +2765,62 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                                   you'd use as a trading filter — e.g. 0.08 means "only trade when
                                   composite ≥ 0.58 or ≤ 0.42". If all rows land at 0.50, no amount of
                                   selectivity rescues the model — features genuinely carry no signal.
+                                </div>
+                              </div>
+                            )}
+
+                            {/* META-LABELING (López de Prado AFML Ch. 4).
+                                A SECOND GBM trained on each fold learns
+                                "when is the primary model right?" from
+                                the same features. If meta-AUC clearly
+                                exceeds 0.5, the meta has found feature-
+                                patterns that predict primary-correctness.
+                                The gated rows show primary AUC on just
+                                the samples where meta ≥ threshold —
+                                "only trade when meta endorses". */}
+                            {r.meta && (
+                              <div style={{padding:"6px 10px",background:"#080808",border:"1px solid #1A1A1A",fontSize:9,color:"#888",marginBottom:10}}>
+                                <div style={{fontSize:8,color:"#555",letterSpacing:2,marginBottom:6}}>
+                                  🎯 META-LABELING — secondary model predicts primary-correctness (AFML Ch.4)
+                                </div>
+                                <div style={{fontSize:9,color:"#CCC",marginBottom:6}}>
+                                  META AUC: <span style={{color: r.meta.meanMetaAUC > 0.55 ? "#2ECC71" : r.meta.meanMetaAUC > 0.52 ? "#C9A84C" : "#E74C3C", fontWeight:700}}>
+                                    {r.meta.meanMetaAUC?.toFixed(3) ?? "—"}
+                                  </span>
+                                  {" "}— can the meta model predict "was primary right?" ({r.meta.runs} runs)
+                                </div>
+                                <div style={{display:"grid",gridTemplateColumns:"1.3fr 0.9fr 0.9fr 0.9fr 1.3fr",gap:4,fontSize:9,marginBottom:4}}>
+                                  <div style={{color:"#555"}}>META GATE</div>
+                                  <div style={{color:"#555"}}>PRIMARY AUC</div>
+                                  <div style={{color:"#555"}}>LOG-LOSS</div>
+                                  <div style={{color:"#555"}}>% KEPT</div>
+                                  <div style={{color:"#555"}}>POLICY</div>
+                                  {["t50","t55","t60"].map(key => {
+                                    const b = r.meta.gated[key];
+                                    if (!b || b.meanAUC == null) return null;
+                                    const col = b.meanAUC >= 0.55 ? "#2ECC71" : b.meanAUC >= 0.52 ? "#C9A84C" : "#E74C3C";
+                                    const label = key === "t50" ? "meta ≥ 0.50" : key === "t55" ? "meta ≥ 0.55" : "meta ≥ 0.60";
+                                    return (
+                                      <React.Fragment key={key}>
+                                        <div style={{color:"#CCC"}}>{label}</div>
+                                        <div style={{color:col,fontWeight:700}}>{b.meanAUC.toFixed(3)}</div>
+                                        <div style={{color: b.meanLogLoss != null && b.meanLogLoss < 0.69 ? "#2ECC71" : "#888"}}>
+                                          {b.meanLogLoss != null ? b.meanLogLoss.toFixed(3) : "—"}
+                                        </div>
+                                        <div style={{color:"#888"}}>{b.meanKept != null ? (b.meanKept * 100).toFixed(0)+"%" : "—"}</div>
+                                        <div style={{color:"#666",fontSize:8}}>trade if meta ≥ {b.threshold.toFixed(2)}</div>
+                                      </React.Fragment>
+                                    );
+                                  })}
+                                </div>
+                                <div style={{fontSize:8,color:"#555",marginTop:6,lineHeight:1.5}}>
+                                  Meta-labeling differs from conviction-stratified: conviction trusts
+                                  |prob−0.5| as confidence. Meta LEARNS from features when the primary
+                                  is trustworthy — can find regime-specific signal (e.g. "primary
+                                  reliable when funding-z &gt; 0 AND TS-mom &gt; 0, noise elsewhere").
+                                  If META AUC &gt; 0.55 AND gated primary AUC &gt; ungated, the meta
+                                  filter IS the edge. If META AUC ≈ 0.50, primary errors are
+                                  unstructured noise with no feature-regime to learn from.
                                 </div>
                               </div>
                             )}

@@ -120,6 +120,13 @@ export function runWalkForward(simTrades, opts = {}) {
   const foldSize = Math.floor(all.length / folds);
   const foldResults = [];
   const allPreds = [];
+  // Pooled meta-predictions across folds — shape:
+  //   { y, yHat, metaYHat, metaTruth }
+  //   y         = ground-truth direction (1=up)
+  //   yHat      = primary model's direction prob
+  //   metaYHat  = meta model's "primary-is-trustworthy" prob
+  //   metaTruth = did primary actually get this direction right (0/1)
+  const allMetaPreds = [];
   let totalPurged = 0;
 
   // Fold i: train on [0 .. i*foldSize), test on [i*foldSize .. (i+1)*foldSize),
@@ -138,24 +145,79 @@ export function runWalkForward(simTrades, opts = {}) {
     totalPurged += rawTrain.length - trainSet.length;
     if (trainSet.length < 8) continue;
 
-    let preds, foldMeta;
+    let preds, foldMeta, primaryModel;
     if (modelKind === "gbm") {
       // Slightly more conservative defaults for small-sample crypto folds.
-      const model = trainGBM(trainSet, {
+      primaryModel = trainGBM(trainSet, {
         nRounds: 100,
         maxDepth: 3,             // shallower than default 4
         learningRate: 0.08,
         earlyStopRounds: 8,
       });
-      if (!model?.trees) continue;
-      preds = testSet.map(s => ({ y: s.y, yHat: predictGBM(model, s.x) }));
-      foldMeta = { epochs: model.rounds, trainLoss: model.finalLoss, valSize: model.valSize };
+      if (!primaryModel?.trees) continue;
+      preds = testSet.map(s => ({ y: s.y, yHat: predictGBM(primaryModel, s.x) }));
+      foldMeta = { epochs: primaryModel.rounds, trainLoss: primaryModel.finalLoss, valSize: primaryModel.valSize };
     } else {
       const t = trainNNRaw(trainSet, { isolated: true, epochs });
       if (!t.weights) continue;
       preds = scoreWithWeights(t.weights, testSet);
+      primaryModel = t.weights;  // stored for meta step below (NN weight set)
       foldMeta = { epochs: t.epochs, trainLoss: t.loss, valSize: t.valSize };
     }
+
+    // ─── META-LABELING (AFML Ch. 4) ─────────────────────────────────
+    // Decouple direction from bet-sizing. The PRIMARY model has already
+    // predicted direction. The META model learns, from the SAME features,
+    // whether the primary is trustworthy ON THIS SETUP — i.e. "would the
+    // primary have been right?"
+    //
+    //   y_meta[s] = 1 if primary_dir(s) === actual_dir(s), else 0
+    //   meta model:  features → P(primary will be right)
+    //
+    // In deployment: take the trade only when meta > threshold. Unlike the
+    // conviction filter (which just trusts |prob−0.5| as a confidence
+    // proxy), the meta model can learn regime-specific trustworthiness —
+    // e.g. "primary is reliable when funding-z > 0 AND TS-mom > 0,
+    // noise elsewhere". If THAT pattern exists, meta-labeling finds it.
+    let metaPreds = null;
+    const primPredOnTrain = trainSet.map(s =>
+      modelKind === "gbm"
+        ? predictGBM(primaryModel, s.x)
+        : scoreWithWeights(primaryModel, [s])[0].yHat);
+    const metaTrainSet = trainSet.map((s, idx) => {
+      const pDir = primPredOnTrain[idx] > 0.5 ? 1 : 0;
+      return {
+        x: s.x,
+        y: pDir === s.y ? 1 : 0,   // 1 = primary got this right
+        ageDays: s.ageDays,
+        timestamp: s.timestamp,
+      };
+    });
+    // Only train meta if train set has both classes (primary wasn't uniformly
+    // right or wrong — otherwise there's nothing to learn).
+    const metaPos = metaTrainSet.filter(s => s.y === 1).length;
+    const metaMix = metaPos > 2 && metaPos < metaTrainSet.length - 2;
+    if (metaMix) {
+      // Meta always uses GBM regardless of primary — small footprint, val-
+      // loss truncation protects against overfit on same fold size.
+      const metaModel = trainGBM(metaTrainSet, {
+        nRounds: 80,
+        maxDepth: 3,
+        learningRate: 0.06,
+        earlyStopRounds: 6,
+      });
+      if (metaModel?.trees) {
+        metaPreds = testSet.map((s, idx) => ({
+          y: s.y,
+          yHat: preds[idx].yHat,                          // primary's output (direction)
+          metaYHat: predictGBM(metaModel, s.x),           // meta's "trust primary" prob
+          // ground truth of "was primary right" for meta-AUC computation
+          metaTruth: (preds[idx].yHat > 0.5 ? 1 : 0) === s.y ? 1 : 0,
+        }));
+      }
+    }
+    if (metaPreds) allMetaPreds.push(...metaPreds);
+
     allPreds.push(...preds);
 
     foldResults.push({
@@ -167,6 +229,7 @@ export function runWalkForward(simTrades, opts = {}) {
       testAccuracy: accuracy(preds),
       testAUC: auc(preds),
       testBrier: brierScore(preds),
+      metaTrained: !!metaPreds,
     });
   }
 
@@ -200,6 +263,56 @@ export function runWalkForward(simTrades, opts = {}) {
     return Math.min(...subset.map(p => Math.abs(p.yHat - 0.5)));
   };
 
+  // ─── Meta-labeling metrics (AFML Ch. 4) ────────────────────────────
+  // Pooled meta-predictions across folds, then evaluate:
+  //
+  // 1. Meta-AUC: can the meta model predict primary-correctness?
+  //    AUC with (y=metaTruth, yHat=metaYHat). If this is substantially
+  //    above 0.5, the meta model has learned to identify setup regimes
+  //    where the primary is reliable. If ~0.5, the primary's errors are
+  //    unstructured noise — meta has nothing to learn.
+  //
+  // 2. Meta-gated primary metrics: primary's AUC/log-loss ONLY on test
+  //    samples where meta > threshold. This is the actionable output —
+  //    "take trades only when meta says primary is trustworthy".
+  //    Compare gated AUC to ungated; if gated >> ungated with tight CI,
+  //    the trading filter IS the edge. Thresholds 0.50, 0.55, 0.60 give
+  //    successively more selective filters.
+  let metaMetrics = null;
+  if (allMetaPreds.length >= 30) {
+    const metaForAUC = allMetaPreds.map(p => ({ y: p.metaTruth, yHat: p.metaYHat }));
+    const metaAUC = auc(metaForAUC);
+
+    const gated = (thr) => {
+      const kept = allMetaPreds.filter(p => p.metaYHat >= thr);
+      if (kept.length < 5) return { n: kept.length, auc: null, logLoss: null, accuracy: null, threshold: thr, kept: kept.length / allMetaPreds.length };
+      const primOnKept = kept.map(p => ({ y: p.y, yHat: p.yHat }));
+      return {
+        n: kept.length,
+        auc: auc(primOnKept),
+        logLoss: logLoss(primOnKept),
+        accuracy: accuracy(primOnKept),
+        threshold: thr,
+        kept: kept.length / allMetaPreds.length,
+      };
+    };
+
+    metaMetrics = {
+      samples: allMetaPreds.length,
+      metaAUC,
+      metaLogLoss: logLoss(metaForAUC),
+      // How often the primary was right at baseline — if this is near 0.5
+      // the meta model is working with minimal class imbalance. Very far
+      // from 0.5 means primary is systematically biased one way.
+      primaryAccuracyBase: allMetaPreds.filter(p => p.metaTruth === 1).length / allMetaPreds.length,
+      gated: {
+        t50: gated(0.50),
+        t55: gated(0.55),
+        t60: gated(0.60),
+      },
+    };
+  }
+
   // Aggregate OOS metrics over all folds' predictions pooled together.
   return {
     samples: all.length,
@@ -224,6 +337,7 @@ export function runWalkForward(simTrades, opts = {}) {
         top30: { n: top30.length, auc: auc(top30), logLoss: logLoss(top30), accuracy: accuracy(top30), threshold: convictionThreshold(top30) },
         top10: { n: top10.length, auc: auc(top10), logLoss: logLoss(top10), accuracy: accuracy(top10), threshold: convictionThreshold(top10) },
       },
+      meta: metaMetrics,
     },
   };
 }
