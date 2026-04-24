@@ -383,31 +383,10 @@ export async function runBacktest(symbols, opts = {}) {
     ]);
   }
 
-  // Phase 4.5: broad-market context for btc universe. Fetches top-150 coin
-  // snapshot from CoinGecko (metadata only — symbols + supplies), then
-  // historical bars for each via the existing Polygon-first pipeline.
-  // Produces three derived signals: XS rank, real dominance z, breadth.
-  // Only on btc daily — on multi-symbol crypto the existing 40-coin
-  // watchlist + approximated dominance are kept (changing them would
-  // require retraining existing trained crypto weights).
+  // Broad-market block moved below — needs symbolBars populated first so
+  // it can read BTC-USD bars for the dominance lookup. Declared here so
+  // it's accessible inside the per-entry loop below.
   let broadMarket = null;
-  if (universe === "btc" && isDaily) {
-    onProgress({ phase: "fetching_broad_market", done: 0, total: 1 });
-    const snapshot = await fetchTopCryptoSnapshot(150);
-    if (snapshot) {
-      const coinBarsMap = await fetchTopCryptoBars(
-        snapshot, fetchHistoricalBars, fetchDaysAgo, polygonKey, interval
-      );
-      const returnsMap = precomputeReturns14d(coinBarsMap);
-      const btcBars = symbolBars.get("BTC-USD");
-      // BTC's own entry for supply lookup. Default to 19.8M (April 2026
-      // ballpark) if CoinGecko didn't return it (highly unlikely but safe).
-      const btcEntry = snapshot.find(s => s.symbol === "BTC")
-        || { circulatingSupply: 19800000 };
-      const dominanceZAt = makeDominanceZLookup(btcBars, btcEntry.circulatingSupply, returnsMap);
-      broadMarket = { returnsMap, dominanceZAt };
-    }
-  }
 
   const trades = [];
   const errors = [];
@@ -460,6 +439,32 @@ export async function runBacktest(symbols, opts = {}) {
         if (prev > 0) ret14[i] = (bars.closes[i] - prev) / prev;
       }
       universeReturns.set(symbol, { timestamps: bars.timestamps, ret14 });
+    }
+  }
+
+  // Phase 4.5: broad-market context for btc universe. Must run AFTER the
+  // symbol fetch loop (needs BTC-USD bars) and AFTER universeReturns
+  // (parallel conceptual phase). Fetches top-150 coin snapshot from
+  // CoinGecko + historical bars via the Polygon-first pipeline. Populates
+  // three derived signals consumed by slots [7][9][14] in the loop below.
+  // Only on btc daily — on multi-symbol crypto the existing 40-coin
+  // watchlist + approximated dominance are kept (changing them would
+  // require retraining existing crypto weights).
+  if (universe === "btc" && isDaily) {
+    onProgress({ phase: "fetching_broad_market", done: 0, total: 1 });
+    const snapshot = await fetchTopCryptoSnapshot(150);
+    if (snapshot) {
+      const coinBarsMap = await fetchTopCryptoBars(
+        snapshot, fetchHistoricalBars, fetchDaysAgo, polygonKey, interval
+      );
+      const returnsMap = precomputeReturns14d(coinBarsMap);
+      const btcBars = symbolBars.get("BTC-USD");
+      if (btcBars) {
+        const btcEntry = snapshot.find(s => s.symbol === "BTC")
+          || { circulatingSupply: 19800000 };
+        const dominanceZAt = makeDominanceZLookup(btcBars, btcEntry.circulatingSupply, returnsMap);
+        broadMarket = { returnsMap, dominanceZAt };
+      }
     }
   }
 
