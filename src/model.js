@@ -149,7 +149,7 @@ function extractFeatures(q, macro = null, calendar = null, pead = null, universe
   //   [9]   DXY momentum            cross-sectional mom rank (btc: 0)
   //   [10]  TNX momentum            perp funding-rate z (Hazel 2021)
   //   [11]  Oil momentum            DVOL-RV spread z (Alexander 2023; BTC-only, daily-only)
-  //   [12]  Gold momentum           (reserved — OI z-score, Commit 4)
+  //   [12]  Gold momentum           BTC perp OI Δlog z (BTC-only, daily-only, ~30d depth)
   //   [13]  TOD edge                RV 5d/30d ratio (Catania 2019)
   //   [14]  PEAD daysSinceEarnings  (reserved — DOW cyclical, Commit 5)
   //   [15]  PEAD surpriseDecayed    (reserved — top L/S ratio z, Commit 6)
@@ -175,7 +175,11 @@ function extractFeatures(q, macro = null, calendar = null, pead = null, universe
   const oil_mom  = isCrypto
     ? clip1(macro?.cryptoContext?.dvolRvZ ?? 0)
     : clip1((macro?.oilMom5  || 0) * 100);
-  const gold_mom = isCrypto ? 0 : clip1((macro?.goldMom5 || 0) * 100);
+  // Slot [12]: crypto = BTC OI Δlog z (Phase 4 Commit 4). BTC-only,
+  // daily-only, last ~30d due to Binance endpoint depth cap. 0 elsewhere.
+  const gold_mom = isCrypto
+    ? clip1(macro?.cryptoContext?.oiZ ?? 0)
+    : clip1((macro?.goldMom5 || 0) * 100);
   // Slot [13]: equity retains time-of-day edge; crypto repurposes for
   // realized-volatility regime (RV 5d/30d ratio, clipped ±1 via
   // (short/long − 1)). Centred so 0 = neutral regime, positive = vol
@@ -208,14 +212,14 @@ export const FEATURE_NAMES = [
 export const FEATURE_NAMES_CRYPTO = [
   "RSI", "MACD", "Mom", "BB", "EMA9/20", "EMA20/50", "Vol",
   "BTC_dom_z", "TS_mom_z",
-  "XS_mom_rank", "Fund_z", "DVOL-RV_z", "—",
+  "XS_mom_rank", "Fund_z", "DVOL-RV_z", "OI_z",
   "RV_ratio",
   "—", "—",
 ];
 export const FEATURE_NAMES_BTC = [
   "RSI", "MACD", "Mom", "BB", "EMA9/20", "EMA20/50", "Vol",
   "— (n/a single-asset)", "TS_mom_z",
-  "— (n/a single-asset)", "Fund_z", "DVOL-RV_z", "—",
+  "— (n/a single-asset)", "Fund_z", "DVOL-RV_z", "OI_z",
   "RV_ratio",
   "—", "—",
 ];

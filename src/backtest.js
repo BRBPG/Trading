@@ -26,6 +26,7 @@ import { computePeadFeatures } from "./earnings";
 import { timeSeriesMomentumAt, approximateDominanceZFromBTCReturns, xsMomRankAt, rvRatioAt } from "./crypto";
 import { fetchFundingForUniverse, fundingZAt } from "./funding";
 import { fetchDvolHistory, dvolRvSpreadAt } from "./dvol";
+import { fetchBtcOIHistory, oiZAt } from "./openInterest";
 
 const YAHOO_PROXIES = [
   u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
@@ -360,6 +361,16 @@ export async function runBacktest(symbols, opts = {}) {
     dvolRecords = await fetchDvolHistory(Math.min(365, fetchDaysAgo + 60));
   }
 
+  // Phase 4 Commit 4: Binance BTCUSDT Open Interest history. Max ~30 days
+  // depth due to Binance's soft cap on /futures/data/openInterestHist.
+  // Feature will be 0 for entries older than 30 days — GBM handles the
+  // 0-padded dead zone with a single split. BTC-specific (like DVOL).
+  let oiRecords = null;
+  if (isCryptoUniverse && isDaily) {
+    onProgress({ phase: "fetching_oi", done: 0, total: 1 });
+    oiRecords = await fetchBtcOIHistory("1d", 30);
+  }
+
   const trades = [];
   const errors = [];
   let barsSource = null;  // "polygon" | "yahoo" | mixed — reported back to UI
@@ -479,6 +490,11 @@ export async function runBacktest(symbols, opts = {}) {
         // IV + 30d RV matching is meaningful. 0 on 5-min sims.
         dvolRvZ:    (dvolRecords && symbol === "BTC-USD")
                       ? dvolRvSpreadAt(bars, i, dvolRecords) : 0,
+        // OI Δlog z — BTC-only, daily-only. Feature is 0 for entries
+        // older than the ~30-day Binance depth; GBM learns to ignore
+        // those rows for slot [12] and use the live-window slice.
+        oiZ:        (oiRecords && symbol === "BTC-USD")
+                      ? oiZAt(oiRecords, bars.timestamps[i], 21) : 0,
       } : null;
       const baseMacro = macroHist?.at(bars.timestamps[i]) || null;
       const modelCtx = {
