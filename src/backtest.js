@@ -25,6 +25,7 @@ import { calendarFeaturesAt } from "./calendar";
 import { computePeadFeatures } from "./earnings";
 import { timeSeriesMomentumAt, approximateDominanceZFromBTCReturns, xsMomRankAt, rvRatioAt } from "./crypto";
 import { fetchFundingForUniverse, fundingZAt } from "./funding";
+import { fetchDvolHistory, dvolRvSpreadAt } from "./dvol";
 
 const YAHOO_PROXIES = [
   u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
@@ -344,6 +345,21 @@ export async function runBacktest(symbols, opts = {}) {
     fundingBySymbol = await fetchFundingForUniverse(symbols, { concurrency: 10 });
   }
 
+  // Phase 4 Commit 3: DVOL history fetch. Only meaningful on DAILY horizon
+  // — the RV annualization in dvol.js uses √365 which assumes daily bars,
+  // and DVOL itself is a 30-day forward-looking IV so matching at daily
+  // granularity is what the literature supports (Bollerslev 2009,
+  // Alexander & Imeraj 2023). On 5-min intraday sims, slot [11] stays 0
+  // and the model has to rely on faster signals.
+  let dvolRecords = null;
+  if (isCryptoUniverse && isDaily) {
+    onProgress({ phase: "fetching_dvol", done: 0, total: 1 });
+    // Fetch enough history to cover our sim window AND the 60-day rolling
+    // baseline that dvolRvSpreadAt uses for the z-score. daysAgo+150
+    // matches WARMUP_FETCH_DAYS. Cap 365 to stay within one API call.
+    dvolRecords = await fetchDvolHistory(Math.min(365, fetchDaysAgo + 60));
+  }
+
   const trades = [];
   const errors = [];
   let barsSource = null;  // "polygon" | "yahoo" | mixed — reported back to UI
@@ -459,6 +475,10 @@ export async function runBacktest(symbols, opts = {}) {
         // clipped centred at 0. Works on both daily and 5-min bars (the
         // ratio is unit-free).
         rvRatio:    rvRatioAt(bars, i, 5, 30),
+        // DVOL-RV spread z — only populated on daily sims where the 30d
+        // IV + 30d RV matching is meaningful. 0 on 5-min sims.
+        dvolRvZ:    (dvolRecords && symbol === "BTC-USD")
+                      ? dvolRvSpreadAt(bars, i, dvolRecords) : 0,
       } : null;
       const baseMacro = macroHist?.at(bars.timestamps[i]) || null;
       const modelCtx = {

@@ -148,7 +148,7 @@ function extractFeatures(q, macro = null, calendar = null, pead = null, universe
   //   [8]   VIX term structure      time-series 14d momentum z
   //   [9]   DXY momentum            cross-sectional mom rank (btc: 0)
   //   [10]  TNX momentum            perp funding-rate z (Hazel 2021)
-  //   [11]  Oil momentum            (reserved — DVOL-RV spread, Commit 3)
+  //   [11]  Oil momentum            DVOL-RV spread z (Alexander 2023; BTC-only, daily-only)
   //   [12]  Gold momentum           (reserved — OI z-score, Commit 4)
   //   [13]  TOD edge                RV 5d/30d ratio (Catania 2019)
   //   [14]  PEAD daysSinceEarnings  (reserved — DOW cyclical, Commit 5)
@@ -169,8 +169,12 @@ function extractFeatures(q, macro = null, calendar = null, pead = null, universe
   const tnx_mom  = isCrypto
     ? clip1(macro?.cryptoContext?.fundingZ ?? 0)
     : clip1((macro?.tnxMom5  || 0) * 100);
-  // Slots 11-15: zeroed in crypto mode (slot 11 reserved for DVOL-RV step 3).
-  const oil_mom  = isCrypto ? 0 : clip1((macro?.oilMom5  || 0) * 100);
+  // Slot [11]: crypto = DVOL−RV spread z (Phase 4 Commit 3). Only
+  // populates on daily-horizon BTC data; stays 0 for 5-min sims, non-BTC
+  // crypto symbols, or if Deribit fetch failed. Equity: Oil momentum.
+  const oil_mom  = isCrypto
+    ? clip1(macro?.cryptoContext?.dvolRvZ ?? 0)
+    : clip1((macro?.oilMom5  || 0) * 100);
   const gold_mom = isCrypto ? 0 : clip1((macro?.goldMom5 || 0) * 100);
   // Slot [13]: equity retains time-of-day edge; crypto repurposes for
   // realized-volatility regime (RV 5d/30d ratio, clipped ±1 via
@@ -204,16 +208,14 @@ export const FEATURE_NAMES = [
 export const FEATURE_NAMES_CRYPTO = [
   "RSI", "MACD", "Mom", "BB", "EMA9/20", "EMA20/50", "Vol",
   "BTC_dom_z", "TS_mom_z",
-  "XS_mom_rank", "Fund_z", "—", "—",
+  "XS_mom_rank", "Fund_z", "DVOL-RV_z", "—",
   "RV_ratio",
   "—", "—",
 ];
-// BTC single-asset: slot [9] dead (no cross-section), slots [11-15] fill
-// incrementally per Phase 4 commit plan (DVOL-RV, OI z, DOW, L/S ratio).
 export const FEATURE_NAMES_BTC = [
   "RSI", "MACD", "Mom", "BB", "EMA9/20", "EMA20/50", "Vol",
   "— (n/a single-asset)", "TS_mom_z",
-  "— (n/a single-asset)", "Fund_z", "—", "—",
+  "— (n/a single-asset)", "Fund_z", "DVOL-RV_z", "—",
   "RV_ratio",
   "—", "—",
 ];
