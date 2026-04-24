@@ -3,7 +3,7 @@ import { generateMockQuote, generateLiveIndicators, computeIndicators } from "./
 import { scoreSetup, logDecision, reviewDecision, getPerformanceStats, getLog, adaptWeights, resetWeights, getCurrentWeights, trainNNFromLog, trainNNFromSim, resetNN, getNNInfo, trainGBMFromSim, trainGBMFromLog, resetGBM, getGBMInfo, trainRegimeFromSim, resetRegime, FEATURE_NAMES } from "./model";
 import { computeSimMetrics, summariseEdge } from "./simMetrics";
 import { runWalkForward, interpretWF, runAblationStudy } from "./walkForward";
-import { runBacktest } from "./backtest";
+import { runBacktest, clearBarsCache, barsCacheSize } from "./backtest";
 import { calcADX, calcWilliamsR, calcStochastic, calcROC, calcZScore,
          calcCMF, calcMaxDrawdown, calcSharpe, calcBeta, engineerFeatures,
          fetchAllNews } from "./quant";
@@ -1676,17 +1676,19 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         tradeCounts.push(res.trades.length);
         pooledTrades.push(...res.trades);
         lastValidRes = res;
-        setMultiSimState({ phase: "wf", run: i + 1, total: N_RUNS, fold: 0, totalFolds: 5 });
+        setMultiSimState({ phase: "wf", run: i + 1, total: N_RUNS });
         // Brief yield so UI repaints between heavy WF runs.
         await new Promise(r => setTimeout(r, 30));
         const wf = await runWalkForward(res.trades, {
           folds: 5, epochs: 60,
           modelKind: isCryptoUniverse(universe) ? "gbm" : "nn",
-          // Fold-level progress — makes slow WF runs visibly progressing
-          // instead of appearing stuck. Updates UI every ~500ms.
-          onFoldProgress: (foldIdx, totalFolds) => {
-            setMultiSimState({ phase: "wf", run: i + 1, total: N_RUNS, fold: foldIdx, totalFolds });
-          },
+          // Per-fold setState was causing too many React re-renders of the
+          // heavy multi-sim panel subtree (~4-5 renders × 20 runs = ~80
+          // render cycles on the same expensive JSX), which manifested as
+          // freezes on slower devices / Codespaces preview. The yield
+          // INSIDE walkForward (via setTimeout(0) between folds) is what
+          // actually keeps the browser responsive — we don't need the
+          // fold counter in the label.
         });
         if (wf.overall?.oosAUC != null) {
           aucs.push(wf.overall.oosAUC);
@@ -2641,6 +2643,20 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                                   style={{background:(nnTrained||gbmTrained)?"#2A0A0A":"#0A0A0A",border:`1px solid ${(nnTrained||gbmTrained)?"#6A1A1A":"#222"}`,color:(nnTrained||gbmTrained)?"#FF8A7A":"#555",fontSize:8,padding:"3px 8px",cursor:(nnTrained||gbmTrained)?"pointer":"not-allowed",fontFamily:"inherit",letterSpacing:1,fontWeight:700}}>
                                   RESET ALL
                                 </button>
+                                {/* Escape-hatch: clear in-memory caches if
+                                    the app is behaving sluggishly after
+                                    many sim runs. Just the bars-cache
+                                    release is usually enough since bars
+                                    hold the largest heap footprint. */}
+                                <button onClick={()=>{
+                                  const n = barsCacheSize();
+                                  clearBarsCache();
+                                  alert(`Cleared ${n} cached bar sets. Next sim will re-fetch.`);
+                                }}
+                                  title="Drop in-memory bar cache. Useful if the app feels sluggish after many runs or to force fresh data on next sim."
+                                  style={{background:"#0A141A",border:"1px solid #2A4A6A",color:"#5AACDF",fontSize:8,padding:"3px 8px",cursor:"pointer",fontFamily:"inherit",letterSpacing:1}}>
+                                  CLEAR CACHE
+                                </button>
                               </>
                             );
                           })()}
@@ -2835,9 +2851,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                           fontSize:11,padding:"8px 14px",cursor:multiSimRunning?"not-allowed":"pointer",
                           fontFamily:"inherit",letterSpacing:2,fontWeight:700,width:"100%"}}>
                         {multiSimRunning
-                          ? (multiSimState.phase === "wf" && multiSimState.fold
-                             ? `wf... run ${multiSimState.run}/${multiSimState.total} · fold ${multiSimState.fold}/${multiSimState.totalFolds}`
-                             : `${multiSimState.phase || "starting"}... run ${multiSimState.run}/${multiSimState.total}`)
+                          ? `${multiSimState.phase || "starting"}... run ${multiSimState.run}/${multiSimState.total}`
                           : `▶ RUN ${multiSimNRuns}-SIM AVERAGE`}
                       </button>
 
