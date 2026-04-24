@@ -1059,6 +1059,7 @@ export default function App() {
   const [training, setTraining] = useState(false);
   const [ablationResult, setAblationResult] = useState(null);
   const [ablationRunning, setAblationRunning] = useState(false);
+  const [ablationProgress, setAblationProgress] = useState({ idx: 0, total: 0, current: "" });
   // Phase 3d step 2: per-symbol perp funding-rate history, fetched in bulk
   // on refresh when universe is crypto. Map<symbol, records[]> where each
   // record is { time, rate }. Consumed by scoreSetup call sites via
@@ -1604,8 +1605,15 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
     const gatedAUC50 = [], gatedAUC55 = [], gatedAUC60 = [];
     const gatedLoss50 = [], gatedLoss55 = [], gatedLoss60 = [];
     const gatedKept50 = [], gatedKept55 = [], gatedKept60 = [];
-    // Track per-symbol aggregated stats across all runs to find which
-    // names are carrying vs dragging the multi-sim AUC.
+    // Pool trades across all runs for ablation. Previously only runSimulation
+    // populated simResult, so users who only did RUN 20-SIM AVERAGE couldn't
+    // use the ABLATE button — it was silently disabled with no feedback.
+    // Multi-sim now aggregates all trades into a single pool and stores that
+    // as simResult.trades so downstream features (training + ablation) work
+    // immediately without requiring a separate single-sim pass.
+    const pooledTrades = [];
+    let lastValidRes = null;
+    // Per-symbol aggregated stats across all runs for the summary table.
     const perSymbolStats = {};  // symbol → { total: n, wins: n, pnl: sum }
     let firstRunFetchLog = null;  // captured from run #1 — bars are cached
                                   // after that, so run #1 shows real fetch sources
@@ -1642,6 +1650,8 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         if (i === 0 && res.fetchLog) firstRunFetchLog = res.fetchLog;
         if (!res.trades.length) continue;
         tradeCounts.push(res.trades.length);
+        pooledTrades.push(...res.trades);
+        lastValidRes = res;
         setMultiSimState({ phase: "wf", run: i + 1, total: N_RUNS });
         // Brief yield so UI repaints between heavy WF runs.
         await new Promise(r => setTimeout(r, 30));
@@ -1752,6 +1762,21 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         meanThreshold: meanOrNull(thrArr),
         runs: aucArr.length,
       });
+      // Populate simResult with the pooled trades from ALL runs so TRAIN
+      // and ABLATE are available immediately after multi-sim — no need for
+      // a separate single-sim pass. Pooling ~N × per-run trades gives
+      // ablation the richest dataset possible (2400 trades at 120/run × 20).
+      if (lastValidRes && pooledTrades.length > 0) {
+        setSimResult({
+          ...lastValidRes,
+          trades: pooledTrades,
+          metrics: null,  // multi-sim metrics are the headline; skip recomputing
+          holdHours: maxHoldHours,
+          costBps,
+          interval: simInterval,
+          source: "multi-sim",  // marker so downstream can distinguish if needed
+        });
+      }
       setMultiSimResult({
         runs: aucs.length,
         aucs,
@@ -1834,18 +1859,25 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
       return;
     }
     try {
-      // Yield once so the UI paints the "running" state before we block.
+      setAblationProgress({ idx: 0, total: targets.length + 1, current: "baseline" });
       await new Promise(r => setTimeout(r, 30));
-      const out = runAblationStudy(tradesSource, {
+      const out = await runAblationStudy(tradesSource, {
         folds: 5,
         epochs: 60,
         modelKind: isCryptoUniverse(universe) ? "gbm" : "nn",
-      }, targets);
+      }, targets, (ev) => {
+        setAblationProgress({
+          idx: ev.idx,
+          total: ev.total,
+          current: ev.phase === "baseline_done" ? "baseline" : ev.name,
+        });
+      });
       setAblationResult(out);
     } catch (err) {
       setAblationResult({ error: err.message || String(err) });
     }
     setAblationRunning(false);
+    setAblationProgress({ idx: 0, total: 0, current: "" });
   }
 
   // ─── Train NN on the most recent sim batch ────────────────────────────────
@@ -2721,16 +2753,26 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                           from the LAST single-sim. Cheap compared to multi-
                           sim (~N+1 walk-forwards), objective measurement
                           of which features actually carry signal. */}
-                      {isCryptoUniverse(universe) && (
+                      {isCryptoUniverse(universe) && (() => {
+                        const hasTrades = simResult?.trades?.length >= 50;
+                        const disabled = ablationRunning || !hasTrades;
+                        const label = ablationRunning
+                          ? `ABLATING ${ablationProgress.current || "…"} (${ablationProgress.idx}/${ablationProgress.total})`
+                          : !hasTrades
+                            ? `🧪 ABLATE FEATURES — NEEDS ≥50 TRADES FIRST (have ${simResult?.trades?.length ?? 0})`
+                            : `🧪 ABLATE FEATURES — uses ${simResult.trades.length} pooled trades`;
+                        return (
                         <div style={{marginTop:10}}>
-                          <button onClick={runAblation} disabled={ablationRunning || !simResult?.trades}
-                            style={{background:ablationRunning?"#111":"#14141F",
-                              border:`1px solid ${ablationRunning?"#2A2A2A":"#6A6AC9"}`,
-                              color:ablationRunning?"#666":"#B0B0FF",
-                              fontSize:10,padding:"6px 12px",cursor:(ablationRunning||!simResult?.trades)?"not-allowed":"pointer",
-                              fontFamily:"inherit",letterSpacing:2,fontWeight:700,width:"100%"}}
-                            title="Leave-one-out feature ablation. Runs walk-forward once per feature slot with that slot zeroed, measures AUC delta vs baseline. Requires a completed sim with ≥50 trades.">
-                            {ablationRunning ? "ABLATING..." : "🧪 ABLATE FEATURES (last sim)"}
+                          <button onClick={runAblation} disabled={disabled}
+                            style={{background: ablationRunning ? "#111" : !hasTrades ? "#1A0F0F" : "#14141F",
+                              border:`1px solid ${ablationRunning?"#2A2A2A":!hasTrades?"#6A2A2A":"#6A6AC9"}`,
+                              color: ablationRunning ? "#666" : !hasTrades ? "#C97A7A" : "#B0B0FF",
+                              fontSize:10,padding:"6px 12px",cursor: disabled ? "not-allowed" : "pointer",
+                              fontFamily:"inherit",letterSpacing:1.5,fontWeight:700,width:"100%"}}
+                            title={hasTrades
+                              ? "Leave-one-out feature ablation. Runs walk-forward once per feature slot with that slot zeroed, measures AUC delta vs baseline."
+                              : "Run RUN SIMULATION or RUN 20-SIM AVERAGE first. Ablation needs ≥50 trades in simResult to work."}>
+                            {label}
                           </button>
                           {ablationResult?.error && (
                             <div style={{marginTop:6,fontSize:9,color:"#E74C3C"}}>⚠ {ablationResult.error}</div>
@@ -2774,7 +2816,8 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                             </div>
                           )}
                         </div>
-                      )}
+                        );
+                      })()}
                       {multiSimResult?.error && (
                         <>
                           <div style={{marginTop:10,fontSize:10,color:"#E74C3C",lineHeight:1.6}}>⚠ {multiSimResult.error}</div>

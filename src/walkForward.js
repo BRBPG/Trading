@@ -380,35 +380,49 @@ export function runWalkForward(simTrades, opts = {}) {
 //
 // targets: array of { slot: number, name: string } — the indices to
 // ablate and human-readable labels for the report.
-export function runAblationStudy(simTrades, baseOpts = {}, targets = []) {
+// onProgress: optional callback (slot, name, idx, total) after each
+// feature finishes — caller can yield between iterations to let the
+// UI repaint. Without this, 9 synchronous walk-forwards block the
+// browser thread for ~20 seconds and the user sees a frozen UI.
+export async function runAblationStudy(simTrades, baseOpts = {}, targets = [], onProgress = null) {
   if (!simTrades?.length) return { error: "no trades provided" };
   // Baseline run — all features active.
   const baseline = runWalkForward(simTrades, baseOpts);
   if (baseline.error) return { error: `baseline: ${baseline.error}` };
   const baseAUC = baseline.overall?.oosAUC;
   if (baseAUC == null) return { error: "baseline produced no AUC" };
+  // Yield to the event loop after baseline so UI can repaint.
+  if (onProgress) {
+    await new Promise(r => setTimeout(r, 0));
+    onProgress({ phase: "baseline_done", idx: 0, total: targets.length + 1 });
+  }
 
   const results = [];
-  for (const t of targets) {
+  for (let ti = 0; ti < targets.length; ti++) {
+    const t = targets[ti];
     const masked = runWalkForward(simTrades, { ...baseOpts, maskSlots: [t.slot] });
     if (masked.error) {
       results.push({ ...t, auc: null, delta: null, error: masked.error });
-      continue;
+    } else {
+      const maskedAUC = masked.overall?.oosAUC;
+      if (maskedAUC == null) {
+        results.push({ ...t, auc: null, delta: null, error: "no auc" });
+      } else {
+        // delta = baseline AUC − masked AUC. Positive delta means removing
+        // the feature HURT the model, so the feature was contributing.
+        results.push({
+          ...t,
+          aucWithout: maskedAUC,
+          aucBaseline: baseAUC,
+          delta: baseAUC - maskedAUC,
+        });
+      }
     }
-    const maskedAUC = masked.overall?.oosAUC;
-    if (maskedAUC == null) {
-      results.push({ ...t, auc: null, delta: null, error: "no auc" });
-      continue;
+    // Yield per feature so the browser can paint the progress indicator.
+    if (onProgress) {
+      await new Promise(r => setTimeout(r, 0));
+      onProgress({ phase: "feature_done", slot: t.slot, name: t.name, idx: ti + 1, total: targets.length + 1 });
     }
-    // delta = baseline AUC − masked AUC. Positive delta means removing
-    // the feature HURT the model, so the feature was contributing. The
-    // bigger the positive delta, the more important the feature.
-    results.push({
-      ...t,
-      aucWithout: maskedAUC,
-      aucBaseline: baseAUC,
-      delta: baseAUC - maskedAUC,
-    });
   }
   // Sort by delta descending — most important features at the top.
   results.sort((a, b) => (b.delta ?? -Infinity) - (a.delta ?? -Infinity));
