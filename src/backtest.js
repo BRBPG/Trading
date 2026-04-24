@@ -23,7 +23,7 @@ import { fetchPolygonBars, hasPolygonKey } from "./polygon";
 import { fetchMacroHistorical } from "./macro";
 import { calendarFeaturesAt } from "./calendar";
 import { computePeadFeatures } from "./earnings";
-import { timeSeriesMomentumAt, approximateDominanceZFromBTCReturns } from "./crypto";
+import { timeSeriesMomentumAt, approximateDominanceZFromBTCReturns, xsMomRankAt } from "./crypto";
 
 const YAHOO_PROXIES = [
   u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
@@ -338,27 +338,53 @@ export async function runBacktest(symbols, opts = {}) {
   // Entries: { symbol, source: "polygon"|"yahoo"|null, cached, bars, skipped }
   const fetchLog = [];
 
+  // ─── PHASE A: fetch all symbols' bars up front ─────────────────────
+  // Required for cross-sectional momentum rank (Phase 3d): to rank the
+  // current symbol's 14-bar return against the active universe's returns
+  // at the same timestamp, we need every symbol's bars in hand before
+  // entering the trade-generation loop. The bars cache makes subsequent
+  // runs free anyway, so the upfront pass costs nothing after warmup.
+  const symbolBars = new Map();  // symbol → bars
   for (let s = 0; s < symbols.length; s++) {
     const symbol = symbols[s];
     onProgress({ phase: "fetching", symbol, done: s, total: symbols.length });
 
     const fetched = await fetchHistoricalBars(symbol, fetchDaysAgo, polygonKey, interval);
     if (!fetched) {
-      // Silent drops are the worst failure mode — record both in the
-      // errors array (for legacy callers) and the fetchLog (for UI).
       console.warn(`[backtest] fetch_failed for ${symbol} — both Polygon and Yahoo returned null.`);
       errors.push({ symbol, reason: "fetch_failed", polygonKeyPresent: !!polygonKey });
       fetchLog.push({ symbol, source: null, bars: 0, trades: 0, reason: "fetch_failed" });
       continue;
     }
     const bars = fetched.bars;
+    symbolBars.set(symbol, bars);
     fetchLog.push({ symbol, source: fetched.source, bars: bars.closes.length, cached: !!fetched.cached, trades: 0 });
-    // Diagnostic: log which source served each symbol on its FIRST fetch
-    // (i.e. not a cache hit), so we can spot unexpected fallbacks (e.g.
-    // Polygon failing silently for BNB and Yahoo picking up the slack).
     if (!fetched.cached) console.info(`[backtest] ${symbol} served from ${fetched.source}`);
     if (barsSource == null) barsSource = fetched.source;
     else if (barsSource !== fetched.source) barsSource = "mixed";
+  }
+
+  // ─── Precompute 14-bar returns + timestamps for each fetched symbol.
+  // Used by xsMomRankAt() to build the cross-section at any timestamp.
+  // Stored as { timestamps, ret14 } so rank lookup is O(log n) via
+  // binary search per symbol (total per entry: O(N_symbols × log bars)).
+  const universeReturns = new Map();
+  if (universe === "crypto") {
+    for (const [symbol, bars] of symbolBars) {
+      const ret14 = new Array(bars.closes.length).fill(null);
+      for (let i = 14; i < bars.closes.length; i++) {
+        const prev = bars.closes[i - 14];
+        if (prev > 0) ret14[i] = (bars.closes[i] - prev) / prev;
+      }
+      universeReturns.set(symbol, { timestamps: bars.timestamps, ret14 });
+    }
+  }
+
+  // ─── PHASE B: generate trades per symbol ────────────────────────────
+  for (let s = 0; s < symbols.length; s++) {
+    const symbol = symbols[s];
+    const bars = symbolBars.get(symbol);
+    if (!bars) continue;  // fetch_failed — already logged
 
     // Reserve +1 bar beyond HOLD_BARS because entry is now at i+1, not i.
     // Entries are confined to the user's INTENDED window (last daysAgo
@@ -390,15 +416,14 @@ export async function runBacktest(symbols, opts = {}) {
       const pead = earningsMap[symbol]
         ? computePeadFeatures(earningsMap[symbol], barTsMs)
         : null;
-      // Crypto context for this entry: dominance proxy (from BTC's own
-      // 14d return at the entry time) + this symbol's time-series momentum.
-      // Both point-in-time from cached bars — no network I/O per entry.
-      // XS momentum rank left for a future commit (needs cross-symbol
-      // coordination which the current loop shape doesn't expose).
+      // Crypto context for this entry: dominance proxy + TS momentum +
+      // cross-sectional 14d return rank (Liu-Tsyvinski 2022 — THE strongest
+      // single documented crypto factor). All point-in-time from cached
+      // bars. No network I/O per entry.
       const cryptoContext = universe === "crypto" ? {
         dominanceZ: btcHistBars ? approximateDominanceZFromBTCReturns(btcHistBars, bars.timestamps[i]) : 0,
         tsMom:      timeSeriesMomentumAt(bars, i, 14, 30),
-        xsMomRank:  0,  // TODO Phase 3d: compute across all symbols at timestamp i
+        xsMomRank:  xsMomRankAt(symbol, bars.timestamps[i], universeReturns),
       } : null;
       const baseMacro = macroHist?.at(bars.timestamps[i]) || null;
       const modelCtx = {

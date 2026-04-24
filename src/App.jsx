@@ -11,7 +11,7 @@ import { BUFFETT_SYSTEM_PROMPT, buildBuffettContext } from "./buffett";
 import { cleanBars, assessQuality, cleaningSummary } from "./cleaning";
 import { downloadExport, importState } from "./persistence";
 import { fetchMacroSnapshot } from "./macro";
-import { fetchBTCDominance, timeSeriesMomentum } from "./crypto";
+import { fetchBTCDominance, timeSeriesMomentum, xsMomRankLive } from "./crypto";
 import { calendarFeatures } from "./calendar";
 import { getEarningsBatch, computePeadFeatures } from "./earnings";
 import { recommendSize } from "./sizing";
@@ -742,11 +742,27 @@ function rankOpportunities(quotes, topN = 3, context = {}) {
   // context.earningsMap is { symbol → earnings[] } — per-symbol PEAD data
   // that needs per-symbol context building. macro/calendar are shared.
   const { earningsMap = {}, ...sharedCtx } = context;
+  const isCrypto = sharedCtx.universe === "crypto";
   return Object.values(quotes)
     .filter(q => q && q.price)
     .map(q => {
       const pead = earningsMap[q.symbol] ? computePeadFeatures(earningsMap[q.symbol]) : null;
-      const m = scoreSetup(q, { ...sharedCtx, pead });
+      // Per-symbol crypto context: swap in this symbol's own tsMom + its
+      // XS rank within the active universe. Without this, all candidates
+      // would share the selected symbol's tsMom and the ranking would
+      // misrepresent each candidate's features.
+      const perSymbolCtx = isCrypto && q.closes ? {
+        ...sharedCtx,
+        macro: sharedCtx.macro ? {
+          ...sharedCtx.macro,
+          cryptoContext: {
+            ...(sharedCtx.macro.cryptoContext || {}),
+            tsMom: timeSeriesMomentum(q.closes),
+            xsMomRank: xsMomRankLive(q.symbol, quotes),
+          },
+        } : null,
+      } : sharedCtx;
+      const m = scoreSetup(q, { ...perSymbolCtx, pead });
       const edge = Math.abs(parseFloat(m.lrProb) - 50); // 0–50, higher = more conviction
       const treeBoost = m.treeSignal === "STRONG_BUY" || m.treeSignal === "STRONG_SELL" ? 8 : 0;
       const volBoost = (q.volRatio ?? 1) > 1.3 ? 4 : 0;
@@ -1108,6 +1124,7 @@ export default function App() {
     const cryptoCtx = (universe === "crypto" && selectedQuote?.closes) ? {
       ...(macro?.cryptoContext || {}),
       tsMom: timeSeriesMomentum(selectedQuote.closes),
+      xsMomRank: xsMomRankLive(selected, quotes),
     } : macro?.cryptoContext;
     const modelCtx = {
       macro: macro ? { ...macro, cryptoContext: cryptoCtx } : null,
@@ -1866,6 +1883,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
             const cryptoCtx = (universe === "crypto" && q?.closes) ? {
               ...(macro?.cryptoContext || {}),
               tsMom: timeSeriesMomentum(q.closes),
+              xsMomRank: xsMomRankLive(selected, quotes),
             } : macro?.cryptoContext;
             const m = q ? scoreSetup(q, {
               macro: macro ? { ...macro, cryptoContext: cryptoCtx } : null,

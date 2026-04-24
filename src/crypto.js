@@ -142,3 +142,84 @@ export function timeSeriesMomentumAt(bars, idx, lookback = 14, zWindow = 30) {
   const slice = bars.closes.slice(0, idx + 1);
   return timeSeriesMomentum(slice, lookback, zWindow);
 }
+
+// ─── Cross-sectional momentum rank (Liu-Tsyvinski 2022) ─────────────────────
+// For the target symbol at a given timestamp, compute its 14-bar return's
+// percentile rank within the active universe's 14-bar returns AT THE SAME
+// TIMESTAMP (nearest bar ≤ t per symbol — handles minor timestamp drift
+// across venues).
+//
+// Liu & Tsyvinski (2022, JFE): XS momentum is the strongest single factor
+// in crypto after size. Sort today's universe by trailing N-day return,
+// long top quintile / short bottom quintile → documented Sharpe > 1 on
+// daily rebalance in the 2014-2020 sample.
+//
+// Returns a ±1-clipped value: +1 = best performer in the universe,
+// -1 = worst. 0 = median. Feeds model slot [9] ("XS_mom_rank") in crypto
+// mode; slot was zeroed placeholder prior to this commit.
+//
+// universeReturns: Map<symbol, { timestamps: number[], ret14: (number|null)[] }>
+//   Caller precomputes once per backtest run — see backtest.js Phase A.
+export function xsMomRankAt(targetSymbol, timestampSec, universeReturns) {
+  if (!universeReturns || universeReturns.size < 3) return 0;
+
+  // Get target's own return at this timestamp
+  const self = universeReturns.get(targetSymbol);
+  if (!self) return 0;
+  const selfIdx = findBarIndex(self.timestamps, timestampSec);
+  if (selfIdx < 14 || self.ret14[selfIdx] == null) return 0;
+  const myRet = self.ret14[selfIdx];
+
+  // Collect peer returns at the same (or nearest-prior) timestamp
+  const peers = [];
+  for (const [symbol, series] of universeReturns) {
+    if (symbol === targetSymbol) continue;
+    const idx = findBarIndex(series.timestamps, timestampSec);
+    if (idx >= 14 && series.ret14[idx] != null) {
+      peers.push(series.ret14[idx]);
+    }
+  }
+  if (peers.length < 2) return 0;
+
+  // Percentile rank of myRet among peers: fraction of peers strictly
+  // below us. 1.0 = best in universe, 0.0 = worst.
+  let below = 0;
+  for (const r of peers) if (r < myRet) below++;
+  const pct = below / peers.length;
+
+  // Map [0,1] percentile to [-1,+1] centred score so positive = top half
+  // of cross-section, negative = bottom. Matches the model's clip1 convention.
+  return Math.max(-1, Math.min(1, 2 * (pct - 0.5)));
+}
+
+// Live-path version — no timestamps needed, just take each quote's most
+// recent 14-bar return from its in-memory closes array.
+// quotes: { [symbol]: { closes: number[] } }
+export function xsMomRankLive(targetSymbol, quotes) {
+  const selfQ = quotes?.[targetSymbol];
+  if (!selfQ?.closes || selfQ.closes.length < 15) return 0;
+  const selfRet = tailReturn(selfQ.closes, 14);
+  if (selfRet == null) return 0;
+
+  const peers = [];
+  for (const [sym, q] of Object.entries(quotes || {})) {
+    if (sym === targetSymbol) continue;
+    if (!q?.closes || q.closes.length < 15) continue;
+    const r = tailReturn(q.closes, 14);
+    if (r != null) peers.push(r);
+  }
+  if (peers.length < 2) return 0;
+
+  let below = 0;
+  for (const r of peers) if (r < selfRet) below++;
+  const pct = below / peers.length;
+  return Math.max(-1, Math.min(1, 2 * (pct - 0.5)));
+}
+
+function tailReturn(closes, lookback) {
+  const n = closes.length;
+  if (n < lookback + 1) return null;
+  const prev = closes[n - 1 - lookback];
+  if (!prev) return null;
+  return (closes[n - 1] - prev) / prev;
+}
