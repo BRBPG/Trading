@@ -26,7 +26,7 @@ import { computePeadFeatures } from "./earnings";
 import { timeSeriesMomentumAt, approximateDominanceZFromBTCReturns, xsMomRankAt, rvRatioAt, dayOfWeekSinAt } from "./crypto";
 import { fetchFundingForUniverse, fundingZAt } from "./funding";
 import { fetchDvolHistory, dvolRvSpreadAt } from "./dvol";
-import { fetchBtcOIHistory, oiZAt } from "./openInterest";
+import { fetchBtcOIHistory, oiZAt, fetchBtcTopLSHistory, topLSZAt } from "./openInterest";
 
 const YAHOO_PROXIES = [
   u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
@@ -366,9 +366,13 @@ export async function runBacktest(symbols, opts = {}) {
   // Feature will be 0 for entries older than 30 days — GBM handles the
   // 0-padded dead zone with a single split. BTC-specific (like DVOL).
   let oiRecords = null;
+  let lsRecords = null;
   if (isCryptoUniverse && isDaily) {
-    onProgress({ phase: "fetching_oi", done: 0, total: 1 });
-    oiRecords = await fetchBtcOIHistory("1d", 30);
+    onProgress({ phase: "fetching_oi", done: 0, total: 2 });
+    [oiRecords, lsRecords] = await Promise.all([
+      fetchBtcOIHistory("1d", 30),
+      fetchBtcTopLSHistory("1d", 30),
+    ]);
   }
 
   const trades = [];
@@ -500,6 +504,11 @@ export async function runBacktest(symbols, opts = {}) {
         // Only meaningful on daily bars; 5-min bars oscillate through
         // DOW faster than trades can react.
         dowSin:     isDaily ? dayOfWeekSinAt(bars.timestamps[i]) : 0,
+        // Top-trader long/short positioning z (Kakinaka & Umeno 2022).
+        // Contrarian framing — sign flipped in topLSZAt so positive
+        // = contrarian-bullish. BTC-only, daily-only, ~30d depth.
+        topLSZ:     (lsRecords && symbol === "BTC-USD")
+                      ? topLSZAt(lsRecords, bars.timestamps[i], 21) : 0,
       } : null;
       const baseMacro = macroHist?.at(bars.timestamps[i]) || null;
       const modelCtx = {

@@ -130,3 +130,91 @@ export function oiZLive(records, window = 21) {
   // so pass latest+1 sec:
   return oiZAt(records, records[records.length - 1].time + 1, window);
 }
+
+// ─── Top-trader long/short ratio (Phase 4 Commit 6) ────────────────────────
+// Binance /futures/data/topLongShortPositionRatio — the aggregated
+// long/short POSITION ratio of accounts in the top 20% by USD margin
+// balance. This is the "sharp money" subset; the global long/short ratio
+// (retail dominant) has been shown to be noise at best. Only the TOP
+// version has contrarian-edge literature:
+//   - Kakinaka & Umeno (2022), "Asymmetric volatility dynamics in
+//     cryptocurrency markets," N. American J. Econ. Finance 62.
+// Top-trader long/short is contrarian at extremes: top positioning
+// skewed heavily long = crowded = reversal risk; heavily short = same
+// in reverse. Middle of the range = no signal.
+//
+// Same 30-day soft cap as OI endpoint. Same CORS behavior.
+// Feature: z-score of log(ratio) against rolling 21-day baseline.
+// Log because ratio is naturally multiplicative (2:1 long vs 1:2 long
+// are equally extreme); the log makes them symmetric around 0.
+
+const BINANCE_LS_BASE = "https://fapi.binance.com/futures/data/topLongShortPositionRatio";
+const lsCache = { records: null, fetchedAt: 0 };
+const LS_TTL_MS = 10 * 60 * 1000;
+
+export async function fetchBtcTopLSHistory(period = "1d", limit = 30) {
+  const now = Date.now();
+  if (lsCache.records && now - lsCache.fetchedAt < LS_TTL_MS) {
+    return lsCache.records;
+  }
+  try {
+    const url = `${BINANCE_LS_BASE}?symbol=BTCUSDT&period=${period}&limit=${limit}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    if (!res.ok) return null;
+    const raw = await res.json();
+    if (!Array.isArray(raw) || raw.length < 5) return null;
+    // Response shape: [{ symbol, longAccount, shortAccount, longShortRatio, timestamp }]
+    // We want longShortRatio (already derived) — it's a string.
+    const records = raw
+      .map(d => ({
+        time: Math.floor(d.timestamp / 1000),
+        ratio: parseFloat(d.longShortRatio),
+      }))
+      .filter(r => r.time > 0 && Number.isFinite(r.ratio) && r.ratio > 0)
+      .sort((a, b) => a.time - b.time);
+    if (records.length < 5) return null;
+    lsCache.records = records;
+    lsCache.fetchedAt = now;
+    return records;
+  } catch {
+    return null;
+  }
+}
+
+// Point-in-time z-score of log(ratio) against rolling baseline.
+// Strict < timestamp for same reason as OI — bucket-start timestamps.
+export function topLSZAt(records, timestampSec, window = 21) {
+  if (!records?.length) return 0;
+  // Reuse findOIBefore behavior inline — identical logic, different data.
+  let idx = -1;
+  {
+    if (timestampSec <= records[0].time) return 0;
+    let lo = 0, hi = records.length - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (records[mid].time < timestampSec) { idx = mid; lo = mid + 1; }
+      else hi = mid - 1;
+    }
+  }
+  if (idx < 0) return 0;
+
+  const currLog = Math.log(records[idx].ratio);
+
+  // Rolling history of log(ratio) up to but not including idx.
+  const history = [];
+  const loBound = Math.max(0, idx - window);
+  for (let k = loBound; k < idx; k++) {
+    if (records[k].ratio > 0) history.push(Math.log(records[k].ratio));
+  }
+  if (history.length < Math.min(8, window - 2)) return 0;
+
+  const mean = history.reduce((a, b) => a + b, 0) / history.length;
+  const variance = history.reduce((a, b) => a + (b - mean) ** 2, 0) / history.length;
+  const sd = Math.sqrt(variance);
+  if (sd < 1e-9) return 0;
+  const z = (currLog - mean) / sd;
+  // Contrarian framing: positive z (crowded long) → we expect REVERSAL
+  // (negative directional signal). Flip sign so feature aligns with
+  // P(bullish) — positive value of slot [15] suggests bullish.
+  return Math.max(-1, Math.min(1, -z / 2));
+}
