@@ -192,8 +192,14 @@ export function trainGBM(samples, opts = {}) {
   let stagnantRounds = 0;
 
   for (let round = 0; round < nRounds; round++) {
-    // Row subsample for this round
-    const subN = Math.max(20, Math.floor(n * subsample));
+    // Row subsample for this round. CRITICAL: subN must never exceed n.
+    // Previously `Math.max(20, floor(n*subsample))` could exceed n on
+    // small training sets (e.g. n=17, subN=20) and the while-loop below
+    // would coupon-collector infinite-loop trying to find unique indices
+    // that don't exist. Caused silent fold hangs at walkForward folds
+    // with <20 samples — which is routine on 88-trade sims split into
+    // 5 expanding-window folds (fold 1 = ~17 samples).
+    const subN = Math.min(n, Math.max(20, Math.floor(n * subsample)));
     const subIdx = [];
     const seen = new Set();
     while (subIdx.length < subN) {
