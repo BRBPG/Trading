@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
 import { generateMockQuote, generateLiveIndicators, computeIndicators } from "./mockData";
-import { scoreSetup, logDecision, reviewDecision, getPerformanceStats, getLog, adaptWeights, resetWeights, getCurrentWeights, trainNNFromLog, trainNNFromSim, resetNN, getNNInfo, trainGBMFromSim, trainGBMFromLog, trainRegimeFromSim, FEATURE_NAMES } from "./model";
+import { scoreSetup, logDecision, reviewDecision, getPerformanceStats, getLog, adaptWeights, resetWeights, getCurrentWeights, trainNNFromLog, trainNNFromSim, resetNN, getNNInfo, trainGBMFromSim, trainGBMFromLog, resetGBM, getGBMInfo, trainRegimeFromSim, resetRegime, FEATURE_NAMES } from "./model";
 import { computeSimMetrics, summariseEdge } from "./simMetrics";
 import { runWalkForward, interpretWF, runAblationStudy } from "./walkForward";
 import { runBacktest } from "./backtest";
@@ -2580,14 +2580,53 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
 
                     {/* ═══ TRAIN NN ON SIM ═══ (separate, sim-only training) */}
                     <div style={{background:"#0A140E",border:"1px solid #2A6A4F",padding:12}}>
-                      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
-                        <div style={{fontSize:9,color:"#7FD8A6",letterSpacing:2}}>🧠 TRAIN NN ON SIMULATED TRADES</div>
-                        {(() => { const info = getNNInfo(); return info.trainedOn > 0 && (
-                          <button onClick={()=>{resetNN(universe);setTrainResult(null);}}
-                            style={{background:"#1A0808",border:"1px solid #4A1A1A",color:"#E74C3C",fontSize:8,padding:"3px 8px",cursor:"pointer",fontFamily:"inherit",letterSpacing:1}}>
-                            RESET NN
-                          </button>
-                        ); })()}
+                      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8,gap:6,flexWrap:"wrap"}}>
+                        <div style={{fontSize:9,color:"#7FD8A6",letterSpacing:2}}>🧠 TRAIN NN / GBM ON SIMULATED TRADES</div>
+                        {/* Universe-aware reset buttons. Previously the NN
+                            reset button was hidden because getNNInfo() was
+                            called without a universe arg, defaulting to
+                            equities — so on btc universe the check read
+                            the wrong NN state and hid the button forever.
+                            Now always-visible per-universe reset controls
+                            so the user can clear any model state without
+                            trying to guess which tier they're on. */}
+                        <div style={{display:"flex",gap:4}}>
+                          {(() => {
+                            const nnInfo = getNNInfo(universe);
+                            const gbmInfo = getGBMInfo(universe);
+                            const nnTrained = (nnInfo?.trainedOn || 0) > 0;
+                            const gbmTrained = (gbmInfo?.trainedOn || 0) > 0;
+                            const resetAll = () => {
+                              if (!confirm(`Reset ALL trained models for ${universe.toUpperCase()} universe? (NN + GBM + regime). LR weights stay.`)) return;
+                              resetNN(universe);
+                              resetGBM(universe);
+                              resetRegime(universe);
+                              setTrainResult(null);
+                            };
+                            return (
+                              <>
+                                <button onClick={()=>{resetNN(universe);setTrainResult(null);}}
+                                  disabled={!nnTrained}
+                                  title={nnTrained ? `Reset NN weights for ${universe}` : `NN not trained on ${universe}`}
+                                  style={{background:nnTrained?"#1A0808":"#0A0A0A",border:`1px solid ${nnTrained?"#4A1A1A":"#222"}`,color:nnTrained?"#E74C3C":"#555",fontSize:8,padding:"3px 8px",cursor:nnTrained?"pointer":"not-allowed",fontFamily:"inherit",letterSpacing:1}}>
+                                  RESET NN{nnTrained ? "" : " (untrained)"}
+                                </button>
+                                <button onClick={()=>{resetGBM(universe);setTrainResult(null);}}
+                                  disabled={!gbmTrained}
+                                  title={gbmTrained ? `Reset GBM weights for ${universe}` : `GBM not trained on ${universe}`}
+                                  style={{background:gbmTrained?"#1A0808":"#0A0A0A",border:`1px solid ${gbmTrained?"#4A1A1A":"#222"}`,color:gbmTrained?"#E74C3C":"#555",fontSize:8,padding:"3px 8px",cursor:gbmTrained?"pointer":"not-allowed",fontFamily:"inherit",letterSpacing:1}}>
+                                  RESET GBM{gbmTrained ? "" : " (untrained)"}
+                                </button>
+                                <button onClick={resetAll}
+                                  disabled={!nnTrained && !gbmTrained}
+                                  title={`Reset NN + GBM + regime for ${universe}`}
+                                  style={{background:(nnTrained||gbmTrained)?"#2A0A0A":"#0A0A0A",border:`1px solid ${(nnTrained||gbmTrained)?"#6A1A1A":"#222"}`,color:(nnTrained||gbmTrained)?"#FF8A7A":"#555",fontSize:8,padding:"3px 8px",cursor:(nnTrained||gbmTrained)?"pointer":"not-allowed",fontFamily:"inherit",letterSpacing:1,fontWeight:700}}>
+                                  RESET ALL
+                                </button>
+                              </>
+                            );
+                          })()}
+                        </div>
                       </div>
                       <div style={{fontSize:10,color:"#888",lineHeight:1.6,marginBottom:10}}>
                         Backprops the neural network on the {simResult?.trades?.length || 0} sim-labelled trades above
