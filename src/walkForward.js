@@ -17,6 +17,7 @@
 // training window forward and collect OOS predictions from folds 2..K.
 
 import { trainNN as trainNNRaw, scoreWithWeights } from "./nn";
+import { trainGBM, predictGBM } from "./gbm";
 
 // Convert sim trades to the {x, y, ageDays} shape expected by the NN.
 // Mirrors trainNNFromSim in model.js — direction-based labels (labelBullish
@@ -88,7 +89,17 @@ function auc(preds) {
 }
 
 export function runWalkForward(simTrades, opts = {}) {
-  const { folds = 5, epochs = 80, embargoSec = 3 * 60 * 60 } = opts;
+  const { folds = 5, epochs = 80, embargoSec = 3 * 60 * 60, modelKind = "nn" } = opts;
+  // modelKind: "nn" (default, equity) or "gbm" (crypto sanity check).
+  //   425-param NN on 24-sample folds is massively over-parameterised and
+  //   will reliably memorise noise, which — combined with near-zero crypto
+  //   feature signal — shows up as confidently-anti-predictive AUC (0.44
+  //   instead of 0.50 on the null). GBM with val-loss early stopping
+  //   truncates the tree list back to bestRound when val loss stops
+  //   improving, so on signal-free folds it emits ~0 trees and outputs
+  //   the prior ≈ 0.5 everywhere — honest null AUC 0.50 ± sampling noise
+  //   rather than the NN's systematic anti-prediction.
+  //
   // embargoSec: gap in seconds between the LAST timestamp in the train set and
   // the FIRST allowed timestamp in the test set. This plugs a subtle leak:
   // our trades have 3-hour holds, so two entries 30 minutes apart have
@@ -127,18 +138,31 @@ export function runWalkForward(simTrades, opts = {}) {
     totalPurged += rawTrain.length - trainSet.length;
     if (trainSet.length < 8) continue;
 
-    const t = trainNNRaw(trainSet, { isolated: true, epochs });
-    if (!t.weights) continue;
-
-    const preds = scoreWithWeights(t.weights, testSet);
+    let preds, foldMeta;
+    if (modelKind === "gbm") {
+      // Slightly more conservative defaults for small-sample crypto folds.
+      const model = trainGBM(trainSet, {
+        nRounds: 100,
+        maxDepth: 3,             // shallower than default 4
+        learningRate: 0.08,
+        earlyStopRounds: 8,
+      });
+      if (!model?.trees) continue;
+      preds = testSet.map(s => ({ y: s.y, yHat: predictGBM(model, s.x) }));
+      foldMeta = { epochs: model.rounds, trainLoss: model.finalLoss, valSize: model.valSize };
+    } else {
+      const t = trainNNRaw(trainSet, { isolated: true, epochs });
+      if (!t.weights) continue;
+      preds = scoreWithWeights(t.weights, testSet);
+      foldMeta = { epochs: t.epochs, trainLoss: t.loss, valSize: t.valSize };
+    }
     allPreds.push(...preds);
 
     foldResults.push({
       fold: i,
       trainSize: trainSet.length,
       testSize: testSet.length,
-      epochs: t.epochs,
-      trainLoss: t.loss,
+      ...foldMeta,
       testLoss: logLoss(preds),
       testAccuracy: accuracy(preds),
       testAUC: auc(preds),

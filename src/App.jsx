@@ -1410,7 +1410,14 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
     // Heavy CPU work — defer so the "running..." UI state paints first.
     setTimeout(() => {
       try {
-        const out = runWalkForward(simResult.trades, { folds: 5, epochs: 80 });
+        const out = runWalkForward(simResult.trades, {
+          folds: 5, epochs: 80,
+          // Crypto: GBM-based walk-forward. 425-param NN on 24-sample
+          // folds over-fits noise into systematic anti-signal; GBM with
+          // val-loss early stopping stays near the prior on signal-free
+          // folds, giving an honest null AUC 0.50 instead of 0.44.
+          modelKind: universe === "crypto" ? "gbm" : "nn",
+        });
         setWfResult(out);
       } catch (err) {
         setWfResult({ error: err.message || String(err) });
@@ -1474,7 +1481,10 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         setMultiSimState({ phase: "wf", run: i + 1, total: N_RUNS });
         // Brief yield so UI repaints between heavy WF runs.
         await new Promise(r => setTimeout(r, 30));
-        const wf = runWalkForward(res.trades, { folds: 5, epochs: 60 });
+        const wf = runWalkForward(res.trades, {
+          folds: 5, epochs: 60,
+          modelKind: universe === "crypto" ? "gbm" : "nn",
+        });
         if (wf.overall?.oosAUC != null) {
           aucs.push(wf.overall.oosAUC);
           accs.push(wf.overall.oosAccuracy);

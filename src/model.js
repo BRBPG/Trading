@@ -440,11 +440,17 @@ export function scoreSetup(q, context = {}) {
   // specific rules can be layered back in Phase 3c+ with learned rather
   // than hand-coded thresholds.
   const treeWeight = isCrypto ? 0 : (0.20 + 0.20 * (tree.strength ?? 0.5));
-  const nnWeight   = nnReady  ? Math.min(0.30, nnInfo.trainedOn  / 150) : 0;
+  // NN weight muted in crypto. At current data scales (~20-run × 8-symbol
+  // sims → ~120 trades → 24 per walk-forward fold) a 425-param NN has
+  // ~18:1 param-to-sample ratio and memorises noise into systematic
+  // anti-signal (observed multi-sim AUC 0.446 below random). GBM with
+  // val-loss truncation stays near the prior on signal-free folds
+  // (honest AUC 0.50). Rehabilitate if/when Phase 3d features push us
+  // past that baseline AND sample count grows.
+  const nnWeight   = (nnReady && !isCrypto) ? Math.min(0.30, nnInfo.trainedOn  / 150) : 0;
   const gbmWeight  = gbmReady ? Math.min(0.45, gbmInfo.trainedOn / 100) : 0;
-  // Bump LR weight in crypto to 0.60 (from 0.40) to fill the capacity
-  // freed by zeroing the tree. LR with neutral crypto priors (zeros) now
-  // acts as the primary linear signal carrier until GBM/NN are trained.
+  // Crypto LR weight bumped to 0.60 (from 0.40) to fill the capacity
+  // freed by zeroing tree + NN. LR + GBM carry production in crypto.
   const lrWeight   = isCrypto ? 0.60 : 0.40;
   const totalRaw   = lrWeight + treeWeight + nnWeight + gbmWeight;
 
@@ -483,11 +489,11 @@ export function scoreSetup(q, context = {}) {
   const treeDir = treeScore > 0.5 ? 1 : -1;
   const nnDir   = nnReady  ? (nnProb  > 0.5 ? 1 : -1) : null;
   const gbmDir  = gbmReady ? (gbmProb > 0.5 ? 1 : -1) : null;
-  // Exclude the tree from agreement counting in crypto mode for the same
-  // reason we zeroed its weight — its directional call is equity-pattern
-  // driven and would pollute the "consensus" metric with backwards signal.
+  // Tree and NN both excluded from crypto agreement counting — tree for
+  // equity-mean-reversion calibration, NN for systematic overfit on
+  // small folds. Only LR + GBM count toward crypto consensus.
   const dirs = isCrypto ? [lrDir] : [lrDir, treeDir];
-  if (nnReady)  dirs.push(nnDir);
+  if (nnReady && !isCrypto) dirs.push(nnDir);
   if (gbmReady) dirs.push(gbmDir);
   let agreeCount = 0, agreeTotal = 0;
   for (let i = 0; i < dirs.length; i++) {
