@@ -984,6 +984,11 @@ function parseTradeData(reply, q, symbol, context = {}) {
   };
 }
 
+// Feature flag: archive legacy single-purpose panels (TRAIN NN, MULTI-SIM,
+// ABLATE) that are now subsumed by the adaptive continuous-training cycle.
+// Set to true temporarily if a legacy flow needs to be exercised.
+const SHOW_LEGACY_PANELS = false;
+
 export default function App() {
   const [quotes, setQuotes] = useState({});
   // Default selected symbol must be in the current watchlist. Previously
@@ -2956,10 +2961,14 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                       })()}
                     </div>
 
-                    {/* ═══ TRAIN NN ON SIM ═══ (separate, sim-only training) */}
+                    {/* ═══ MODEL MANAGEMENT ═══
+                        Was: standalone TRAIN NN panel. Now: utility row
+                        for RESET buttons + CLEAR CACHE. Training happens
+                        inside the adaptive continuous cycle — TRAIN button
+                        hidden under SHOW_LEGACY_PANELS flag. */}
                     <div style={{background:"#0A140E",border:"1px solid #2A6A4F",padding:12}}>
                       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8,gap:6,flexWrap:"wrap"}}>
-                        <div style={{fontSize:9,color:"#7FD8A6",letterSpacing:2}}>🧠 TRAIN NN / GBM ON SIMULATED TRADES</div>
+                        <div style={{fontSize:9,color:"#7FD8A6",letterSpacing:2}}>🧠 MODEL MANAGEMENT</div>
                         {/* Universe-aware reset buttons. Previously the NN
                             reset button was hidden because getNNInfo() was
                             called without a universe arg, defaulting to
@@ -3020,7 +3029,14 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                           })()}
                         </div>
                       </div>
-                      <div style={{fontSize:10,color:"#888",lineHeight:1.6,marginBottom:10}}>
+                      <div style={{fontSize:9,color:"#888",lineHeight:1.5}}>
+                        Training happens automatically inside the <b style={{color:"#6A9FDF"}}>Adaptive Continuous
+                        Training</b> cycle below — no need to press a standalone train button. Use the
+                        buttons above to wipe weights or clear the in-memory fetch cache.
+                      </div>
+                      {SHOW_LEGACY_PANELS && (
+                      <>
+                      <div style={{fontSize:10,color:"#888",lineHeight:1.6,marginTop:10,marginBottom:10}}>
                         Backprops the neural network on the {simResult?.trades?.length || 0} sim-labelled trades above
                         (L2 regularisation, time-decay weighting, early stopping). Run a sim first, then train.
                         Training is independent of the user-reviewed log — that's a separate training source.
@@ -3039,8 +3055,10 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                               ? `▷ TRAIN NN ON SIM (need ≥8 trades, have ${simResult.trades.length})`
                               : `▶ TRAIN NN ON ${simResult.trades.length} SIM TRADES`}
                       </button>
+                      </>
+                      )}
 
-                      {trainResult && !trainResult.error && (
+                      {SHOW_LEGACY_PANELS && trainResult && !trainResult.error && (
                         <div style={{marginTop:10,fontSize:10,color:"#888",lineHeight:1.7}}>
                           <div>✓ NN trained on <b style={{color:"#FFF"}}>{trainResult.trained}</b> samples
                             for <b style={{color:"#FFF"}}>{trainResult.epochs}</b> epochs
@@ -3083,7 +3101,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                           )}
                         </div>
                       )}
-                      {trainResult?.error && (
+                      {SHOW_LEGACY_PANELS && trainResult?.error && (
                         <div style={{marginTop:10,fontSize:10,color:"#E74C3C"}}>⚠ {trainResult.error}</div>
                       )}
                     </div>
@@ -3153,7 +3171,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                               </div>
                             )}
 
-                            <div style={{padding:"8px 10px",background:"#080808",border:"1px solid #1A1A1A"}}>
+                            <div style={{padding:"8px 10px",background:"#080808",border:"1px solid #1A1A1A",marginBottom:10}}>
                               <div style={{fontSize:9,color:"#555",letterSpacing:2,marginBottom:6}}>PER-FOLD BREAKDOWN</div>
                               <div style={{display:"grid",gridTemplateColumns:"30px 1fr 1fr 1fr 1fr",gap:4,fontSize:9}}>
                                 <div style={{color:"#555"}}>FOLD</div>
@@ -3172,13 +3190,111 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                                 ))}
                               </div>
                             </div>
+
+                            {/* ═══ CONVICTION-STRATIFIED ═══ Previously only
+                                rendered in multi-sim; data's always in
+                                overall.byConviction so hoisted to the
+                                single-sim WF display where it's actually
+                                more useful (one run per click → faster). */}
+                            {O.byConviction && (
+                              <div style={{padding:"6px 10px",background:"#080808",border:"1px solid #1A1A1A",fontSize:9,color:"#888",marginBottom:10}}>
+                                <div style={{fontSize:8,color:"#555",letterSpacing:2,marginBottom:6}}>
+                                  📈 CONVICTION-STRATIFIED — where the edge actually lives (meta-labeling)
+                                </div>
+                                <div style={{display:"grid",gridTemplateColumns:"1.2fr 1fr 1fr 1.2fr 1.2fr",gap:4,fontSize:9,marginBottom:4}}>
+                                  <div style={{color:"#555"}}>SUBSET</div>
+                                  <div style={{color:"#555"}}>AUC</div>
+                                  <div style={{color:"#555"}}>LOG-LOSS</div>
+                                  <div style={{color:"#555"}}>THRESHOLD |p−0.5|</div>
+                                  <div style={{color:"#555"}}>POLICY</div>
+                                  {["all","top50","top30","top10"].map(key => {
+                                    const b = O.byConviction[key];
+                                    if (!b || b.auc == null) return null;
+                                    const col = b.auc >= 0.55 ? "#2ECC71" : b.auc >= 0.52 ? "#C9A84C" : "#E74C3C";
+                                    const label = key === "all" ? "ALL trades" :
+                                                  key === "top50" ? "Top 50%" :
+                                                  key === "top30" ? "Top 30%" : "Top 10%";
+                                    const thr = b.threshold != null ? b.threshold.toFixed(3) : "—";
+                                    const policy = key === "all"
+                                      ? "baseline"
+                                      : `trade only if |prob−0.5| ≥ ${thr}`;
+                                    return (
+                                      <React.Fragment key={key}>
+                                        <div style={{color:"#CCC"}}>{label}</div>
+                                        <div style={{color:col,fontWeight:700}}>{b.auc.toFixed(3)}</div>
+                                        <div style={{color: b.logLoss != null && b.logLoss < 0.69 ? "#2ECC71" : "#888"}}>
+                                          {b.logLoss != null ? b.logLoss.toFixed(3) : "—"}
+                                        </div>
+                                        <div style={{color:"#888"}}>{thr}</div>
+                                        <div style={{color:"#666",fontSize:8}}>{policy}</div>
+                                      </React.Fragment>
+                                    );
+                                  })}
+                                </div>
+                                <div style={{fontSize:8,color:"#555",marginTop:6,lineHeight:1.5}}>
+                                  If TOP-10 AUC ≫ ALL AUC, the model's edge is concentrated in high-conviction
+                                  setups — trade only when |prob−0.5| clears the threshold column.
+                                </div>
+                              </div>
+                            )}
+
+                            {/* ═══ META-LABELING (AFML Ch.4) ═══ */}
+                            {O.meta && (
+                              <div style={{padding:"6px 10px",background:"#080808",border:"1px solid #1A1A1A",fontSize:9,color:"#888",marginBottom:10}}>
+                                <div style={{fontSize:8,color:"#555",letterSpacing:2,marginBottom:6}}>
+                                  🎯 META-LABELING — secondary model predicts primary-correctness
+                                </div>
+                                <div style={{fontSize:9,color:"#CCC",marginBottom:6}}>
+                                  META AUC: <span style={{color: O.meta.metaAUC > 0.55 ? "#2ECC71" : O.meta.metaAUC > 0.52 ? "#C9A84C" : "#E74C3C", fontWeight:700}}>
+                                    {O.meta.metaAUC?.toFixed(3) ?? "—"}
+                                  </span>
+                                  {" "}— can the meta model predict "was primary right?"
+                                </div>
+                                <div style={{display:"grid",gridTemplateColumns:"1.3fr 0.9fr 0.9fr 0.9fr 1.3fr",gap:4,fontSize:9,marginBottom:4}}>
+                                  <div style={{color:"#555"}}>META GATE</div>
+                                  <div style={{color:"#555"}}>PRIMARY AUC</div>
+                                  <div style={{color:"#555"}}>LOG-LOSS</div>
+                                  <div style={{color:"#555"}}>% KEPT</div>
+                                  <div style={{color:"#555"}}>POLICY</div>
+                                  {["t50","t55","t60"].map(key => {
+                                    const b = O.meta.gated?.[key];
+                                    if (!b || b.auc == null) return null;
+                                    const col = b.auc >= 0.55 ? "#2ECC71" : b.auc >= 0.52 ? "#C9A84C" : "#E74C3C";
+                                    const label = key === "t50" ? "meta ≥ 0.50" : key === "t55" ? "meta ≥ 0.55" : "meta ≥ 0.60";
+                                    return (
+                                      <React.Fragment key={key}>
+                                        <div style={{color:"#CCC"}}>{label}</div>
+                                        <div style={{color:col,fontWeight:700}}>{b.auc.toFixed(3)}</div>
+                                        <div style={{color: b.logLoss != null && b.logLoss < 0.69 ? "#2ECC71" : "#888"}}>
+                                          {b.logLoss != null ? b.logLoss.toFixed(3) : "—"}
+                                        </div>
+                                        <div style={{color:"#888"}}>{b.kept != null ? (b.kept * 100).toFixed(0)+"%" : "—"}</div>
+                                        <div style={{color:"#666",fontSize:8}}>trade if meta ≥ {b.threshold.toFixed(2)}</div>
+                                      </React.Fragment>
+                                    );
+                                  })}
+                                </div>
+                                <div style={{fontSize:8,color:"#555",marginTop:6,lineHeight:1.5}}>
+                                  If META AUC &gt; 0.55 AND gated primary AUC &gt; ungated, meta-gate IS the edge.
+                                  % KEPT shows how much of the trade universe passes the filter — tighter gates
+                                  keep fewer trades but with higher win rate.
+                                </div>
+                              </div>
+                            )}
                           </div>
                         );
                       })()}
                     </div>
 
-                    {/* ═══ MULTI-SIM AVERAGING ═══ */}
+                    {/* ═══ TRAINING & VALIDATION ═══
+                        Container preserved so the ADAPTIVE CONTINUOUS
+                        TRAINING panel (below) continues to render in its
+                        correct position. The legacy MULTI-SIM AVERAGING
+                        button + ABLATION button are archived under
+                        SHOW_LEGACY_PANELS — their work is subsumed by
+                        the continuous cycle. */}
                     <div style={{background:"#0A140F",border:"1px solid #2A6A4F",padding:12}}>
+                      {SHOW_LEGACY_PANELS && (<>
                       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8,flexWrap:"wrap",gap:6}}>
                         <div style={{fontSize:9,color:"#7FD8A6",letterSpacing:2}}>📊 MULTI-SIM AVERAGING — statistical edge test</div>
                         <div style={{display:"flex",alignItems:"center",gap:6}}
@@ -3283,6 +3399,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                         </div>
                         );
                       })()}
+                      </>)}
 
                       {/* ═══ ADAPTIVE CONTINUOUS TRAINING (Phase 6 prelude) ═══
                           Runs N sim → train → walk-forward cycles. Every 3rd
@@ -3480,7 +3597,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                           )}
                         </div>
                       )}
-                      {multiSimResult?.error && (
+                      {SHOW_LEGACY_PANELS && multiSimResult?.error && (
                         <>
                           <div style={{marginTop:10,fontSize:10,color:"#E74C3C",lineHeight:1.6}}>⚠ {multiSimResult.error}</div>
                           {/* Render fetch diagnostics even in the error case —
@@ -3522,7 +3639,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                           })()}
                         </>
                       )}
-                      {multiSimResult && !multiSimResult.error && (() => {
+                      {SHOW_LEGACY_PANELS && multiSimResult && !multiSimResult.error && (() => {
                         const r = multiSimResult;
                         // ─── POOLED AUC is the honest headline ────────────
                         // Trimmed-mean-AUC averages 20 walk-forwards each on
