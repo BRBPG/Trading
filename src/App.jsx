@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
 import { generateMockQuote, generateLiveIndicators, computeIndicators } from "./mockData";
 import { scoreSetup, logDecision, reviewDecision, getPerformanceStats, getLog, adaptWeights, resetWeights, getCurrentWeights, trainNNFromLog, trainNNFromSim, resetNN, getNNInfo, trainGBMFromSim, trainGBMFromLog, resetGBM, getGBMInfo, trainRegimeFromSim, resetRegime, FEATURE_NAMES } from "./model";
+import { loadGBM } from "./gbm";
 import { computeSimMetrics, summariseEdge } from "./simMetrics";
 import { runWalkForward, interpretWF, runAblationStudy } from "./walkForward";
 import { runBacktest, clearBarsCache, barsCacheSize } from "./backtest";
@@ -1061,6 +1062,20 @@ export default function App() {
   const [ablationResult, setAblationResult] = useState(null);
   const [ablationRunning, setAblationRunning] = useState(false);
   const [ablationProgress, setAblationProgress] = useState({ idx: 0, total: 0, current: "" });
+  // Continuous training — run N sim→train→WF cycles back-to-back.
+  // Each cycle generates fresh sim trades, trains GBM, and measures
+  // pooled AUC via walk-forward. Produces a history of per-cycle AUCs
+  // so the user can see whether the model STABILISES across fresh
+  // random samples of the entry distribution. Stable high AUC = real
+  // signal; wild swings = regime-dependent or sample-noise-dominant.
+  // Auto-saves weights from the HIGHEST-AUC cycle.
+  const [continuousRunning, setContinuousRunning] = useState(false);
+  const [continuousResults, setContinuousResults] = useState([]);
+  const [continuousTargetCycles, setContinuousTargetCycles] = useState(10);
+  // Abort flag uses ref (not state) so the running loop can read current
+  // value between iterations without stale-closure issues. Set by the
+  // STOP button.
+  const continuousAbortRef = useRef(false);
   // Phase 3d step 2: per-symbol perp funding-rate history, fetched in bulk
   // on refresh when universe is crypto. Map<symbol, records[]> where each
   // record is { time, rate }. Consumed by scoreSetup call sites via
@@ -1923,6 +1938,221 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
     }
     setAblationRunning(false);
     setAblationProgress({ idx: 0, total: 0, current: "" });
+  }
+
+  // ─── Adaptive continuous training loop ───────────────────────────────────
+  // Automates N sim → train → walk-forward cycles AND periodically re-tests
+  // which features contribute. This is the right design for a backtest
+  // harness where regime matters: a static feature prune based on one
+  // ablation is brittle — the model should KEEP EXPERIMENTING and adapt
+  // its active-feature set as the signal landscape shifts.
+  //
+  // Loop structure per cycle:
+  //   1. Fresh sim (new random entry sampling)
+  //   2. Train GBM on sim trades (persisted to localStorage)
+  //   3. Walk-forward evaluation with CURRENT feature mask
+  //   4. Record AUC, log-loss, train/test gap into history
+  //   5. Every ABLATE_EVERY cycles: re-ablate features and update mask
+  //      based on rolling-median Δ per feature
+  //   6. Every PROBE_EVERY cycles: re-test ALL features (empty mask) to
+  //      catch features that previously looked dead but are now helpful
+  //      in the current regime
+  //
+  // Adaptive mask rule:
+  //   median(last HISTORY_WINDOW Δs for slot) < DROP_THRESHOLD → disable
+  //   median > KEEP_THRESHOLD                                  → re-enable
+  //   in between (noise band)                                  → unchanged
+  //
+  // Best-model preservation: if a cycle's AUC improves on best-so-far,
+  // the GBM is kept. Otherwise it's rolled back so noise-cycles don't
+  // overwrite good weights.
+  async function runContinuousTrain() {
+    if (continuousRunning) return;
+    setContinuousRunning(true);
+    setContinuousResults([]);
+    continuousAbortRef.current = false;
+
+    const N = continuousTargetCycles;
+    const symsForRun = excludeHighVol
+      ? activeBacktestSymbols.filter(s => !activeHighVolSymbols.includes(s))
+      : activeBacktestSymbols;
+    const nSyms = Math.max(1, symsForRun.length);
+
+    // Adaptive config
+    const ABLATE_EVERY = 3;          // re-ablate every 3 cycles
+    const PROBE_EVERY  = 9;          // probe all features every 9 cycles
+    const HISTORY_WINDOW = 5;        // rolling Δ history per feature
+    const DROP_THRESHOLD = -0.01;    // median Δ below this → drop feature
+    const KEEP_THRESHOLD = 0.005;    // median Δ above this → re-enable
+
+    // Feature targets (same taxonomy as ablation button)
+    const btcTargets = [
+      { slot: 7,  name: "BTC dominance z" },
+      { slot: 8,  name: "TS momentum z" },
+      { slot: 9,  name: "XS momentum rank" },
+      { slot: 10, name: "Perp funding z" },
+      { slot: 11, name: "DVOL-RV spread z" },
+      { slot: 12, name: "BTC OI Δlog z" },
+      { slot: 13, name: "RV 5d/30d ratio" },
+      { slot: 14, name: "Parkinson 5d/30d" },
+      { slot: 15, name: "Breakout flag (20d)" },
+    ];
+    const cryptoTargets = [
+      { slot: 7,  name: "BTC dominance z" },
+      { slot: 8,  name: "TS momentum z" },
+      { slot: 9,  name: "XS momentum rank" },
+      { slot: 10, name: "Perp funding z" },
+      { slot: 11, name: "DVOL-RV spread z" },
+      { slot: 12, name: "BTC OI Δlog z" },
+      { slot: 13, name: "RV 5d/30d ratio" },
+      { slot: 14, name: "DOW sin" },
+      { slot: 15, name: "Top L/S contrarian z" },
+    ];
+    const targets = universe === "btc" ? btcTargets
+                  : universe === "crypto" ? cryptoTargets
+                  : [];
+
+    // Adaptive state
+    const featureMask = new Set();        // currently-disabled slots
+    const deltaHistory = {};              // slot → rolling array of Δs
+    const gbmKey = universe === "btc" ? "trader_gbm_v3_btc"
+                 : universe === "crypto" ? "trader_gbm_v2_crypto"
+                 : "trader_gbm_v1";
+
+    const results = [];
+    let bestAUC = -Infinity;
+    let bestGBM = loadGBM(universe);
+
+    try {
+      for (let cycle = 0; cycle < N; cycle++) {
+        if (continuousAbortRef.current) break;
+
+        // Fresh sim with current calibrated sample count.
+        const baseSamples = simInterval === "1d"
+          ? Math.min(30, Math.max(5, Math.floor(simDaysAgo / 10)))
+          : (simDaysAgo <= 7 ? 10 : simDaysAgo <= 30 ? 20 : 40);
+        const samples = Math.max(baseSamples, Math.ceil(120 / nSyms));
+
+        const res = await runBacktest(symsForRun, {
+          interval: simInterval,
+          daysAgo: simDaysAgo,
+          holdHours: maxHoldHours,
+          samplesPerSymbol: samples,
+          costBps,
+          polygonKey: polygonKey || null,
+          earningsMap,
+          universe,
+          onProgress: () => {},
+        });
+        if (!res.trades.length) {
+          results.push({
+            cycle: cycle + 1, auc: null, logLoss: null, gap: null,
+            trades: 0, mask: Array.from(featureMask), error: "no trades",
+          });
+          setContinuousResults([...results]);
+          continue;
+        }
+
+        // Increment-train GBM. trainGBMFromSim persists to localStorage
+        // so cycles accumulate training data naturally.
+        trainGBMFromSim(res.trades, universe);
+
+        // Decide the mask for this cycle. Probe cycles run unmasked to
+        // re-test dropped features in current conditions.
+        const isProbeCycle = (cycle + 1) % PROBE_EVERY === 0;
+        const isAblationCycle = (cycle + 1) % ABLATE_EVERY === 0 && targets.length > 0;
+        const activeMask = isProbeCycle ? [] : Array.from(featureMask);
+
+        await new Promise(r => setTimeout(r, 30));
+
+        // On ablation cycles, runAblationStudy provides both the baseline
+        // AUC AND per-feature Δs from one computation pass. On plain
+        // cycles, just runWalkForward for the baseline AUC.
+        let aucNow = null, logLossNow = null, gapNow = null;
+        let ablationDeltas = null;
+        if (isAblationCycle) {
+          const ablation = await runAblationStudy(res.trades, {
+            folds: 5, epochs: 60,
+            modelKind: isCryptoUniverse(universe) ? "gbm" : "nn",
+            maskSlots: activeMask,
+          }, targets);
+          if (!ablation.error) {
+            aucNow = ablation.baselineAUC;
+            logLossNow = ablation.baselineLogLoss;
+            ablationDeltas = ablation.results;
+          }
+        } else {
+          const wf = await runWalkForward(res.trades, {
+            folds: 5, epochs: 60,
+            modelKind: isCryptoUniverse(universe) ? "gbm" : "nn",
+            maskSlots: activeMask,
+          });
+          aucNow = wf.overall?.oosAUC ?? null;
+          logLossNow = wf.overall?.oosLogLoss ?? null;
+          gapNow = (wf.overall?.avgTestLoss != null && wf.overall?.avgTrainLoss != null)
+            ? wf.overall.avgTestLoss - wf.overall.avgTrainLoss : null;
+        }
+
+        // Update feature mask based on ablation results. Use median of
+        // rolling HISTORY_WINDOW Δs per feature so single-cycle outliers
+        // don't flip the mask — requires consistent evidence.
+        const maskChanges = [];
+        if (ablationDeltas) {
+          for (const r of ablationDeltas) {
+            if (r.delta == null) continue;
+            if (!deltaHistory[r.slot]) deltaHistory[r.slot] = [];
+            deltaHistory[r.slot].push(r.delta);
+            if (deltaHistory[r.slot].length > HISTORY_WINDOW) {
+              deltaHistory[r.slot].shift();
+            }
+          }
+          for (const [slotStr, deltas] of Object.entries(deltaHistory)) {
+            if (deltas.length < 2) continue;
+            const slot = Number(slotStr);
+            const sorted = [...deltas].sort((a, b) => a - b);
+            const median = sorted[Math.floor(sorted.length / 2)];
+            const wasIn = featureMask.has(slot);
+            if (median < DROP_THRESHOLD && !wasIn) {
+              featureMask.add(slot);
+              maskChanges.push({ slot, action: "drop", median });
+            } else if (median > KEEP_THRESHOLD && wasIn) {
+              featureMask.delete(slot);
+              maskChanges.push({ slot, action: "keep", median });
+            }
+          }
+        }
+
+        // Best-model preservation.
+        if (aucNow != null && aucNow > bestAUC) {
+          bestAUC = aucNow;
+          bestGBM = loadGBM(universe);
+        } else if (bestGBM?.trees) {
+          localStorage.setItem(gbmKey, JSON.stringify(bestGBM));
+        }
+
+        results.push({
+          cycle: cycle + 1,
+          auc: aucNow,
+          logLoss: logLossNow,
+          gap: gapNow,
+          trades: res.trades.length,
+          mask: Array.from(featureMask),
+          maskChanges,
+          ablationCycle: isAblationCycle,
+          probeCycle: isProbeCycle,
+          bestSoFar: bestAUC,
+          timestamp: Date.now(),
+        });
+        setContinuousResults([...results]);
+
+        await new Promise(r => setTimeout(r, 100));
+      }
+    } catch (err) {
+      results.push({ cycle: results.length + 1, auc: null, error: err.message || String(err) });
+      setContinuousResults([...results]);
+    }
+    setContinuousRunning(false);
+    continuousAbortRef.current = false;
   }
 
   // ─── Train NN on the most recent sim batch ────────────────────────────────
@@ -2925,6 +3155,123 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                         </div>
                         );
                       })()}
+
+                      {/* ═══ ADAPTIVE CONTINUOUS TRAINING (Phase 6 prelude) ═══
+                          Runs N sim → train → walk-forward cycles. Every 3rd
+                          cycle re-ablates to update an adaptive feature mask.
+                          Every 9th cycle probes all features (empty mask) in
+                          case a dropped feature has regained signal. Shows
+                          per-cycle history + current active-feature mask so
+                          the user can see the model self-tuning over time. */}
+                      {isCryptoUniverse(universe) && (
+                        <div style={{marginTop:12,padding:10,background:"#090C12",border:"1px solid #1A2A3A"}}>
+                          <div style={{fontSize:9,color:"#6A9FDF",letterSpacing:2,marginBottom:8}}>
+                            🔁 ADAPTIVE CONTINUOUS TRAINING — auto-tunes feature mask across cycles
+                          </div>
+                          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8,flexWrap:"wrap"}}>
+                            <span style={{fontSize:9,color:"#888"}}>CYCLES</span>
+                            <select value={continuousTargetCycles}
+                              onChange={e=>setContinuousTargetCycles(Number(e.target.value))}
+                              disabled={continuousRunning}
+                              style={{background:"#080808",border:"1px solid #2A2A2A",color:"#6A9FDF",fontFamily:"inherit",fontSize:9,padding:"2px 6px"}}>
+                              <option value={5}>5 (quick, ~1-2 min)</option>
+                              <option value={10}>10 (standard, ~3-5 min)</option>
+                              <option value={20}>20 (thorough, ~6-10 min)</option>
+                              <option value={50}>50 (overnight, ~15-25 min)</option>
+                              <option value={100}>100 (long-run, ~30-50 min)</option>
+                            </select>
+                            <button onClick={runContinuousTrain} disabled={continuousRunning}
+                              style={{background:continuousRunning?"#111":"#0A1422",
+                                border:`1px solid ${continuousRunning?"#2A2A2A":"#3A6AAA"}`,
+                                color:continuousRunning?"#666":"#6A9FDF",
+                                fontSize:10,padding:"6px 12px",cursor:continuousRunning?"not-allowed":"pointer",
+                                fontFamily:"inherit",letterSpacing:1.5,fontWeight:700}}>
+                              {continuousRunning
+                                ? `RUNNING... cycle ${continuousResults.length}/${continuousTargetCycles}`
+                                : "▶ START ADAPTIVE TRAIN"}
+                            </button>
+                            {continuousRunning && (
+                              <button onClick={()=>{continuousAbortRef.current = true;}}
+                                style={{background:"#1F0A0A",border:"1px solid #6A2A2A",color:"#FF8A7A",fontSize:9,padding:"4px 10px",cursor:"pointer",fontFamily:"inherit",letterSpacing:1,fontWeight:700}}>
+                                ⏹ STOP
+                              </button>
+                            )}
+                          </div>
+                          <div style={{fontSize:8,color:"#666",lineHeight:1.5,marginBottom:6}}>
+                            Each cycle: fresh sim → train GBM → walk-forward measurement.
+                            Every 3rd cycle re-ablates and updates the feature mask based on
+                            rolling-median Δ per feature (drops features that consistently hurt,
+                            re-enables ones that start helping again). Every 9th cycle probes
+                            all features with empty mask to catch regime-shift recoveries.
+                            Best-AUC GBM is auto-preserved across cycles.
+                          </div>
+                          {continuousResults.length > 0 && (() => {
+                            const valid = continuousResults.filter(r => r.auc != null);
+                            const aucs = valid.map(r => r.auc);
+                            const meanAUC = aucs.length ? aucs.reduce((a,b)=>a+b,0)/aucs.length : null;
+                            const bestAUC = aucs.length ? Math.max(...aucs) : null;
+                            const latest = continuousResults[continuousResults.length - 1];
+                            const activeMask = latest?.mask ?? [];
+                            return (
+                              <div>
+                                {/* Summary stats */}
+                                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:6,fontSize:9,marginBottom:8}}>
+                                  <div style={{padding:"4px 8px",background:"#080808",border:"1px solid #1A1A1A"}}>
+                                    <div style={{fontSize:7,color:"#555"}}>CYCLES</div>
+                                    <div style={{color:"#CCC",fontWeight:700}}>{continuousResults.length} / {continuousTargetCycles}</div>
+                                  </div>
+                                  <div style={{padding:"4px 8px",background:"#080808",border:"1px solid #1A1A1A"}}>
+                                    <div style={{fontSize:7,color:"#555"}}>MEAN AUC</div>
+                                    <div style={{color:meanAUC!=null && meanAUC>=0.55?"#2ECC71":meanAUC!=null && meanAUC>=0.52?"#C9A84C":"#E74C3C",fontWeight:700}}>
+                                      {meanAUC != null ? meanAUC.toFixed(3) : "—"}
+                                    </div>
+                                  </div>
+                                  <div style={{padding:"4px 8px",background:"#080808",border:"1px solid #1A1A1A"}}>
+                                    <div style={{fontSize:7,color:"#555"}}>BEST AUC</div>
+                                    <div style={{color:bestAUC!=null && bestAUC>=0.55?"#2ECC71":"#C9A84C",fontWeight:700}}>
+                                      {bestAUC != null ? bestAUC.toFixed(3) : "—"}
+                                    </div>
+                                  </div>
+                                  <div style={{padding:"4px 8px",background:"#080808",border:"1px solid #1A1A1A"}}>
+                                    <div style={{fontSize:7,color:"#555"}}>DROPPED SLOTS</div>
+                                    <div style={{color:"#C97A7A",fontWeight:700}}>
+                                      {activeMask.length ? activeMask.map(s => `[${s}]`).join(" ") : "none"}
+                                    </div>
+                                  </div>
+                                </div>
+
+                                {/* Per-cycle history table */}
+                                <div style={{maxHeight:200,overflowY:"auto",padding:"4px 8px",background:"#080808",border:"1px solid #1A1A1A",fontSize:9}}>
+                                  <div style={{display:"grid",gridTemplateColumns:"0.5fr 1fr 1fr 1fr 1.5fr 1fr",gap:6,fontSize:8,color:"#555",marginBottom:4,position:"sticky",top:0,background:"#080808"}}>
+                                    <div>#</div>
+                                    <div>AUC</div>
+                                    <div>GAP</div>
+                                    <div>LOG-LOSS</div>
+                                    <div>MASK</div>
+                                    <div>TYPE</div>
+                                  </div>
+                                  {continuousResults.slice().reverse().map(r => {
+                                    const aucCol = r.auc == null ? "#E74C3C" : r.auc >= 0.55 ? "#2ECC71" : r.auc >= 0.52 ? "#C9A84C" : "#E74C3C";
+                                    const type = r.error ? `err: ${r.error}` : r.probeCycle ? "probe (no mask)" : r.ablationCycle ? "ablation" : "standard";
+                                    return (
+                                      <React.Fragment key={r.cycle}>
+                                        <div style={{color:"#888"}}>{r.cycle}</div>
+                                        <div style={{color:aucCol,fontWeight:r.cycle===continuousResults.length?700:400}}>{r.auc != null ? r.auc.toFixed(3) : "—"}</div>
+                                        <div style={{color: r.gap != null && r.gap > 0.10 ? "#C9A84C" : "#888"}}>{r.gap != null ? r.gap.toFixed(3) : "—"}</div>
+                                        <div style={{color:"#888"}}>{r.logLoss != null ? r.logLoss.toFixed(3) : "—"}</div>
+                                        <div style={{color:r.mask?.length ? "#C97A7A" : "#666"}}>
+                                          {r.mask?.length ? r.mask.map(s=>`[${s}]`).join(" ") : "all active"}
+                                        </div>
+                                        <div style={{color: r.probeCycle ? "#7FD8A6" : r.ablationCycle ? "#6A9FDF" : "#666"}}>{type}</div>
+                                      </React.Fragment>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+                            );
+                          })()}
+                        </div>
+                      )}
                       {multiSimResult?.error && (
                         <>
                           <div style={{marginTop:10,fontSize:10,color:"#E74C3C",lineHeight:1.6}}>⚠ {multiSimResult.error}</div>
@@ -2986,24 +3333,42 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                         const pooledAUC = ablationResult && !ablationResult.error
                           ? ablationResult.baselineAUC
                           : null;
-                        const hasPooled = pooledAUC != null;
+                        // Meta-gated headline: when the meta-model (AFML
+                        // Ch.4 secondary classifier) finds a trust threshold
+                        // that meaningfully improves primary's AUC, THAT's
+                        // the actionable model — not the ungated primary.
+                        // User specifically flagged: "when meta gets bigger
+                        // this specific model does very well."
+                        //
+                        // Pick the highest-AUC gated threshold that kept
+                        // ≥15% of trades (thinner subsets aren't reliable).
+                        const gatedCandidates = ["t50","t55","t60"]
+                          .map(k => r.meta?.gated?.[k])
+                          .filter(b => b && b.meanAUC != null && (b.meanKept ?? 0) >= 0.15);
+                        const bestGated = gatedCandidates.length
+                          ? gatedCandidates.reduce((a,b) => a.meanAUC > b.meanAUC ? a : b)
+                          : null;
+                        const useGated = pooledAUC != null && bestGated
+                          && bestGated.meanAUC > pooledAUC + 0.02;
+                        const headlineAUC = useGated ? bestGated.meanAUC : pooledAUC;
+                        const hasPooled = headlineAUC != null;
                         const HIGH_VARIANCE = r.stdAUC > 0.10;
                         const MED_VARIANCE  = r.stdAUC > 0.06;
-                        // Verdict prefers pooled AUC when available; only
-                        // falls back to trimmed mean if ablation hasn't run.
                         let verdict;
                         if (hasPooled) {
-                          // Pooled AUC is the trained-model truth. At
-                          // N≈2200 trades SE is ~0.011, so thresholds can
-                          // be tighter than the trimmed-mean versions.
-                          if (pooledAUC >= 0.56) {
-                            verdict = { label: "Real signal on pooled data — train and deploy", color: "#2ECC71" };
-                          } else if (pooledAUC >= 0.53) {
-                            verdict = { label: "Marginal edge on pooled data — train, watch variance", color: "#C9A84C" };
-                          } else if (pooledAUC >= 0.50) {
+                          // Headline AUC is the trained-model truth (pooled
+                          // or meta-gated, whichever is larger by ≥0.02).
+                          const srcLabel = useGated
+                            ? ` via meta-gate @ ${bestGated.threshold.toFixed(2)} (${Math.round((bestGated.meanKept ?? 0) * 100)}% trades)`
+                            : "";
+                          if (headlineAUC >= 0.56) {
+                            verdict = { label: `Real signal${srcLabel} — train and deploy`, color: "#2ECC71" };
+                          } else if (headlineAUC >= 0.53) {
+                            verdict = { label: `Marginal edge${srcLabel} — train, watch variance`, color: "#C9A84C" };
+                          } else if (headlineAUC >= 0.50) {
                             verdict = { label: "Near-coin-flip even on pooled data — feature set needs work", color: "#C9A84C" };
                           } else {
-                            verdict = { label: "Inverted — pooled AUC below 0.50, features anti-signal", color: "#E74C3C" };
+                            verdict = { label: "Inverted — AUC below 0.50, features anti-signal", color: "#E74C3C" };
                           }
                         } else if (HIGH_VARIANCE) {
                           verdict = { label: "Unstable — fragile / regime-dependent, don't train", color: "#E74C3C" };
@@ -3027,16 +3392,21 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                             {hasPooled && (
                               <div style={{padding:"10px 12px",background:"#080810",border:`2px solid ${verdict.color}`,marginBottom:10}}>
                                 <div style={{fontSize:9,color:"#555",letterSpacing:2,marginBottom:4}}>
-                                  🎯 POOLED AUC — trained-model measurement ({ablationResult.baselineSamples ?? "?"} trades in walk-forward)
+                                  🎯 HEADLINE AUC — {useGated ? `meta-gated measurement (${Math.round((bestGated.meanKept ?? 0)*100)}% of trades pass the gate)` : `pooled trained-model measurement (${ablationResult.baselineSamples ?? "?"} trades)`}
                                 </div>
                                 <div style={{display:"flex",alignItems:"baseline",gap:12,marginBottom:4}}>
                                   <div style={{fontSize:32,color:verdict.color,fontWeight:900,fontFamily:"inherit"}}>
-                                    {pooledAUC.toFixed(3)}
+                                    {headlineAUC.toFixed(3)}
                                   </div>
                                   <div style={{fontSize:11,color:verdict.color,fontWeight:700}}>
                                     {verdict.label}
                                   </div>
                                 </div>
+                                {useGated && (
+                                  <div style={{fontSize:9,color:"#7FD8A6",marginBottom:4}}>
+                                    (pooled-all AUC {pooledAUC.toFixed(3)} → meta-gated AUC {bestGated.meanAUC.toFixed(3)} when filter ≥ {bestGated.threshold.toFixed(2)}. Trading policy: only take signals where meta-trust prob ≥ {bestGated.threshold.toFixed(2)}.)
+                                  </div>
+                                )}
                                 <div style={{fontSize:8,color:"#666",lineHeight:1.5}}>
                                   This is the honest trained-model AUC. The per-run trimmed
                                   mean below is a VARIANCE DIAGNOSTIC — it measures how the

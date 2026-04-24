@@ -442,7 +442,13 @@ export async function runAblationStudy(simTrades, baseOpts = {}, targets = [], o
   const results = [];
   for (let ti = 0; ti < targets.length; ti++) {
     const t = targets[ti];
-    const masked = await runWalkForward(simTrades, { ...baseOpts, maskSlots: [t.slot] });
+    // If baseOpts already masks some slots, the ablation target's mask
+    // is the UNION — we're measuring "marginal Δ of adding t.slot to
+    // the already-masked baseline". Important for adaptive training
+    // which passes an evolving mask across cycles.
+    const base = baseOpts.maskSlots || [];
+    const unioned = Array.from(new Set([...base, t.slot]));
+    const masked = await runWalkForward(simTrades, { ...baseOpts, maskSlots: unioned });
     if (masked.error) {
       results.push({ ...t, auc: null, delta: null, error: masked.error });
     } else {
