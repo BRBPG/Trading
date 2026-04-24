@@ -714,7 +714,14 @@ export function trainGBMFromLog(reviewedLog, universe = "equities") {
   return result;
 }
 
-export function trainGBMFromSim(simTrades, universe = "equities") {
+// Sim-trade training with WARM-START by default. Loads the saved GBM
+// and continues boosting from there — trees accumulate across calls,
+// genuine incremental learning. Pass opts.coldStart:true to skip the
+// warm-start (used by the final masked-feature retrain in runContinuous
+// so the deployed model doesn't inherit trees that split on features
+// now being masked to zero).
+export function trainGBMFromSim(simTrades, universe = "equities", opts = {}) {
+  const { coldStart = false, maxTreesTotal = 300, ...gbmOpts } = opts;
   const samples = simTrades
     .filter(d => d.outcome && d.features)
     .map(d => ({
@@ -724,7 +731,8 @@ export function trainGBMFromSim(simTrades, universe = "equities") {
   if (samples.length < 20) {
     return { trained: 0, rounds: 0, reason: `Need ≥20 sim samples, got ${samples.length}` };
   }
-  const result = trainGBMRaw(samples);
+  const continueFrom = coldStart ? null : loadGBM(universe);
+  const result = trainGBMRaw(samples, { ...gbmOpts, continueFrom, maxTreesTotal });
   if (result.trees) saveGBM(result, universe);
   return result;
 }

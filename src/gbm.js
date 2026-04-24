@@ -136,6 +136,17 @@ export function trainGBM(samples, opts = {}) {
     colsample = COLSAMPLE_DEFAULT,
     earlyStopRounds = 10,
     verbose = false,
+    // Warm-start options — for true incremental continuous learning.
+    // continueFrom: existing trained GBM (from loadGBM). Its trees stay,
+    //   prior + learningRate are reused, and boosting continues adding
+    //   new trees on top trained on fresh samples. Model evolves across
+    //   cycles instead of being rebuilt from scratch each cycle.
+    // maxTreesTotal: hard cap on the tree list. When exceeded, OLDEST
+    //   trees are evicted (FIFO). Gives the model a sliding window of
+    //   tree "generations" — oldest reflect stale regimes, newest reflect
+    //   current. 300 is a good default for our scale (3-5 cycles' worth).
+    continueFrom = null,
+    maxTreesTotal = null,
   } = opts;
 
   // Lower bound at 12 samples (was 20) — with val-loss truncation doing
@@ -175,20 +186,45 @@ export function trainGBM(samples, opts = {}) {
   const wNeg = neg > 0 ? n / (2 * neg) : 1;
   const sampleW = y.map(v => v === 1 ? wPos : wNeg);
 
-  // Predictions start at log-odds of prior (class-balanced so ~0)
-  const prior = Math.log((pos + 1) / (neg + 1));
-  const predictions = new Array(n).fill(prior);
-  // Maintain parallel val-set logits so we can track val loss per round
-  // without re-running the full forest each round.
-  const valPreds = useValSplit ? new Array(Xval.length).fill(prior) : null;
+  // Warm-start: reuse the saved model's trees, prior, and learning rate
+  // so new boosting rounds build on top of existing structure instead of
+  // starting from scratch. Model genuinely accumulates learning across
+  // cycles — a key change from the previous pool-based design which just
+  // retrained on a sliding window and ended up converging to a fixed
+  // point after pool saturation.
+  const warmStart = continueFrom?.trees?.length > 0;
+  const prior = warmStart ? continueFrom.prior : Math.log((pos + 1) / (neg + 1));
+  const effectiveLR = warmStart ? continueFrom.learningRate : learningRate;
 
-  const trees = [];
+  // Initialize predictions — from existing model on warm-start, else prior.
+  const predictions = new Array(n);
+  const valPreds = useValSplit ? new Array(Xval.length) : null;
+  if (warmStart) {
+    for (let i = 0; i < n; i++) {
+      let logOdds = prior;
+      for (const tree of continueFrom.trees) logOdds += effectiveLR * predictTree(tree, X[i]);
+      predictions[i] = logOdds;
+    }
+    if (useValSplit) {
+      for (let i = 0; i < Xval.length; i++) {
+        let logOdds = prior;
+        for (const tree of continueFrom.trees) logOdds += effectiveLR * predictTree(tree, Xval[i]);
+        valPreds[i] = logOdds;
+      }
+    }
+  } else {
+    for (let i = 0; i < n; i++) predictions[i] = prior;
+    if (useValSplit) for (let i = 0; i < Xval.length; i++) valPreds[i] = prior;
+  }
+
+  // Trees array seeded with existing model's trees on warm-start.
+  const trees = warmStart ? [...continueFrom.trees] : [];
   const history = [];
   let bestLoss = Infinity;
-  // Track round index of best val loss so we can TRUNCATE the tree list
-  // back to the best checkpoint at the end — GBMs are additive so
-  // rolling back is just slicing trees[].
-  let bestRound = 0;
+  // bestRound tracks ABSOLUTE tree count at best val-loss checkpoint.
+  // On warm-start this starts at the existing tree count so we never
+  // accidentally truncate away pre-existing trees at the end.
+  let bestRound = trees.length;
   let stagnantRounds = 0;
 
   for (let round = 0; round < nRounds; round++) {
@@ -231,12 +267,12 @@ export function trainGBM(samples, opts = {}) {
 
     // Update predictions on ALL train samples (not just subsample)
     for (let i = 0; i < n; i++) {
-      predictions[i] += learningRate * predictTree(tree, X[i]);
+      predictions[i] += effectiveLR * predictTree(tree, X[i]);
     }
     // ...and on the val set too, so valLoss is O(1) per round.
     if (useValSplit) {
       for (let i = 0; i < Xval.length; i++) {
-        valPreds[i] += learningRate * predictTree(tree, Xval[i]);
+        valPreds[i] += effectiveLR * predictTree(tree, Xval[i]);
       }
     }
 
@@ -281,22 +317,44 @@ export function trainGBM(samples, opts = {}) {
   }
 
   // Truncate trees back to the best-val-loss checkpoint. Any trees added
-  // after that point were overfitting noise.
+  // after that point were overfitting noise. On warm-start, bestRound
+  // started at the existing tree count so we preserve those.
   if (useValSplit && bestRound < trees.length) {
     trees.length = bestRound;
   }
 
+  // Tree-count cap: when warm-starting repeatedly, trees accumulate
+  // until we hit the cap. Then oldest trees get evicted (FIFO). Gives
+  // the model a sliding window of tree generations — oldest reflect
+  // stale regimes, newest reflect current. 300 is a good default for
+  // our scale (3-5 cycles' worth of fresh trees per cap).
+  let evicted = 0;
+  if (maxTreesTotal && trees.length > maxTreesTotal) {
+    evicted = trees.length - maxTreesTotal;
+    trees.splice(0, evicted);
+  }
+
+  // Accumulate across warm-starts: how many total trades this GBM has
+  // been trained on over its life, and how many cycles contributed.
+  const totalTrainedOn = (continueFrom?.totalTrainedOn || 0) + n;
+  const cyclesTrainedOn = (continueFrom?.cyclesTrainedOn || 0) + 1;
+
   return {
     trees,
     prior,
-    learningRate,
-    trainedOn: n,
+    learningRate: effectiveLR,
+    trainedOn: n,                   // latest cycle's samples
+    totalTrainedOn,                 // cumulative across warm-starts
+    cyclesTrainedOn,                // number of warm-start iterations
     valSize,
     rounds: trees.length,
+    addedThisCall: Math.max(0, trees.length - (warmStart ? continueFrom.trees.length - evicted : 0)),
+    evicted,
     finalLoss: bestLoss,
     lossType: useValSplit ? "val" : "train",
     history,
-    reason: trees.length === nRounds ? "completed all rounds" : "early stop (loss plateau)",
+    reason: trees.length === (warmStart ? nRounds + continueFrom.trees.length - evicted : nRounds)
+      ? "completed all rounds" : "early stop (loss plateau)",
   };
 }
 

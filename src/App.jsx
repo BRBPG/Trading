@@ -2077,19 +2077,16 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
     const allDeltasPerSlot = {};
     for (const t of targets) allDeltasPerSlot[t.slot] = [];
 
-    // TRAINING-TRADE POOL — accumulates trades across cycles so each
-    // cycle's GBM is trained on the GROWING corpus, not just that cycle's
-    // ~55-100 trades. User's earlier complaint: TRAINED ON count bounced
-    // around per cycle instead of growing because we'd been discarding
-    // prior cycles' data. With pool accumulation:
-    //   cycle 1: pool = cycle-1 trades                   (~80)
-    //   cycle 2: pool = cycle-1 + cycle-2                (~160)
-    //   ...
-    //   cycle N: pool = concatenation of all cycles'     (~80 * N)
-    // Capped at POOL_CAP to keep GBM training tractable; oldest trades
-    // are evicted first (time-ordered FIFO).
-    const POOL_CAP = 1000;
-    const tradePool = [];
+    // Accumulated last-cycle trades — kept only for the final masked
+    // retrain at run end. NOT used for per-cycle training: that uses
+    // warm-start (each cycle's trainGBMFromSim loads the saved GBM and
+    // continues boosting on top, so trees accumulate across cycles
+    // without needing a trade pool). User's feedback was that a capped
+    // pool would just become the same ~1000 trades in steady state —
+    // warm-start sidesteps that by carrying model STATE across cycles
+    // rather than trade DATA.
+    const recentTradesForFinalRetrain = [];
+    const RECENT_CAP = 500;
 
     const results = [];
     let bestAUC = -Infinity;
@@ -2131,17 +2128,19 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
           continue;
         }
 
-        // Grow the pool with this cycle's fresh trades. FIFO cap at
-        // POOL_CAP — oldest trades drop off when we hit the ceiling.
-        // Each trade keeps its original ageDays, so trainGBM's internal
-        // time-ordered train/val split still works correctly on the pool.
-        tradePool.push(...res.trades);
-        while (tradePool.length > POOL_CAP) tradePool.shift();
-        // Train on the FULL pool — not just this cycle's trades. This is
-        // what makes cycles genuinely accumulate learning instead of
-        // treating each cycle in isolation. trainedOn in the saved GBM
-        // now grows cycle-over-cycle (capped at POOL_CAP).
-        trainGBMFromSim(tradePool, universe);
+        // Warm-start training: trainGBMFromSim loads the saved GBM and
+        // CONTINUES boosting on top. Each cycle ADDS trees trained on
+        // fresh data to the existing model. Oldest trees get evicted
+        // when the total hits maxTreesTotal (300). True incremental
+        // learning — model state accumulates across cycles.
+        trainGBMFromSim(res.trades, universe);
+        // Keep the recent trades for the final feature-mask retrain at
+        // run end (500-trade sliding window; we specifically want RECENT
+        // data there, not historical, so FIFO is correct for this use).
+        recentTradesForFinalRetrain.push(...res.trades);
+        while (recentTradesForFinalRetrain.length > RECENT_CAP) {
+          recentTradesForFinalRetrain.shift();
+        }
         if (continuousAbortRef.current) break;
 
         await new Promise(r => setTimeout(r, 30));
@@ -2312,21 +2311,27 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
     // "it should be implementing whatever features it chooses by the
     // end of the model". The saved GBM post-run reflects the verdict.
     const dropSlots = new Set(verdicts.filter(v => v.verdict === "DROP").map(v => v.slot));
-    if (tradePool.length >= 20 && dropSlots.size > 0) {
-      const maskedPool = tradePool.map(t => {
+    if (recentTradesForFinalRetrain.length >= 20 && dropSlots.size > 0) {
+      const maskedRecent = recentTradesForFinalRetrain.map(t => {
         if (!t.features) return t;
         const x = [...t.features];
         for (const s of dropSlots) if (s < x.length) x[s] = 0;
         return { ...t, features: x };
       });
-      trainGBMFromSim(maskedPool, universe);
+      // Cold-start the retrain: existing warm-started trees may have
+      // splits on features we're now masking to zero, which creates
+      // awkward tree paths (zeroed feature always takes one branch).
+      // Cleaner to train a fresh GBM on recent masked data and REPLACE
+      // the saved model — loss of accumulated tree structure, gain of
+      // a model that genuinely doesn't depend on the dropped features.
+      trainGBMFromSim(maskedRecent, universe, { coldStart: true });
     }
 
     setContinuousVerdicts({
       verdicts,
       totalCycles: results.filter(r => r.auc != null).length,
       bestAUC,
-      finalPoolSize: tradePool.length,
+      finalPoolSize: recentTradesForFinalRetrain.length,
       droppedSlots: Array.from(dropSlots),
       timestamp: Date.now(),
     });
@@ -3492,26 +3497,34 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                             const savedGBM = loadGBM(universe);
                             const treeCount = savedGBM?.trees?.length ?? 0;
                             const trainedOn = savedGBM?.trainedOn ?? 0;
+                            const totalTrainedOn = savedGBM?.totalTrainedOn ?? trainedOn;
+                            const cyclesTrainedOn = savedGBM?.cyclesTrainedOn ?? 0;
                             const savedUpdatedAt = savedGBM?.updatedAt
                               ? new Date(savedGBM.updatedAt).toLocaleTimeString() : null;
                             return (
                               <div>
-                                {/* Proof-of-training panel. Shows the
-                                    actual persisted GBM state so the user
-                                    can SEE that weights are updating and
-                                    not just simulating. */}
+                                {/* Proof-of-training panel — reads the
+                                    actual persisted GBM from localStorage.
+                                    With warm-start, TOTAL TRAINED ON grows
+                                    cumulatively across cycles. TREES grows
+                                    up to the cap then holds steady (oldest
+                                    evicted as new ones added). */}
                                 <div style={{padding:"6px 10px",background:"#0A0F18",border:"1px solid #1A2A4A",marginBottom:8,fontSize:9}}>
                                   <div style={{fontSize:7,color:"#6A9FDF",letterSpacing:2,marginBottom:4}}>
-                                    🧠 MODEL STATE — persisted {universe.toUpperCase()} GBM (trained on growing pool)
+                                    🧠 MODEL STATE — {universe.toUpperCase()} GBM (warm-start continuous learning)
                                   </div>
-                                  <div style={{display:"grid",gridTemplateColumns:"1fr 1.3fr 1.3fr",gap:6}}>
+                                  <div style={{display:"grid",gridTemplateColumns:"0.8fr 1.3fr 1.2fr 1.2fr",gap:6}}>
                                     <div>
                                       <span style={{color:"#555"}}>TREES </span>
                                       <span style={{color:treeCount>0?"#2ECC71":"#888",fontWeight:700}}>{treeCount}</span>
                                     </div>
                                     <div>
-                                      <span style={{color:"#555"}}>TRAINED ON </span>
-                                      <span style={{color:trainedOn>100?"#2ECC71":"#CCC",fontWeight:700}}>{trainedOn} pooled trades</span>
+                                      <span style={{color:"#555"}}>TOTAL TRADES </span>
+                                      <span style={{color:totalTrainedOn>200?"#2ECC71":"#CCC",fontWeight:700}}>{totalTrainedOn}</span>
+                                    </div>
+                                    <div>
+                                      <span style={{color:"#555"}}>CYCLES </span>
+                                      <span style={{color:cyclesTrainedOn>0?"#7FD8A6":"#888",fontWeight:700}}>{cyclesTrainedOn} · last {trainedOn}</span>
                                     </div>
                                     <div>
                                       <span style={{color:"#555"}}>UPDATED </span>
