@@ -28,7 +28,7 @@ const BINANCE_OI_BASE = "https://fapi.binance.com/futures/data/openInterestHist"
 
 // 10-min session cache — OI history doesn't revise.
 const oiCache = { records: null, fetchedAt: 0 };
-const OI_TTL_MS = 10 * 60 * 1000;
+const OI_TTL_MS = 60 * 60 * 1000;  // 60 min — matches bars cache
 
 // Fetch daily OI history for BTCUSDT. 30 records is the max daily depth
 // Binance provides on this endpoint (documented soft-30d cap). Returns
@@ -150,7 +150,7 @@ export function oiZLive(records, window = 21) {
 
 const BINANCE_LS_BASE = "https://fapi.binance.com/futures/data/topLongShortPositionRatio";
 const lsCache = { records: null, fetchedAt: 0 };
-const LS_TTL_MS = 10 * 60 * 1000;
+const LS_TTL_MS = 60 * 60 * 1000;  // 60 min — matches bars cache (top L/S)
 
 export async function fetchBtcTopLSHistory(period = "1d", limit = 30) {
   const now = Date.now();

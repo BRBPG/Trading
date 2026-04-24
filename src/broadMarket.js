@@ -24,7 +24,9 @@
 //   not a price layer — no downgrade from Polygon-paid fetching.
 
 const COINGECKO_BASE = "https://api.coingecko.com/api/v3";
-const CACHE_TTL_MS = 10 * 60 * 1000;
+const CACHE_TTL_MS = 60 * 60 * 1000;  // 60 min — matches bars cache
+// so the snapshot + its derived rank history stay consistent within a
+// session.
 const snapshotCache = { data: null, fetchedAt: 0 };
 
 // Stablecoins + wrapped tokens to exclude from the cross-section. These

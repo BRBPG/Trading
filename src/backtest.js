@@ -56,7 +56,11 @@ const YAHOO_PROXIES = [
 // from already-fetched bars — near-zero network cost. Can comfortably run
 // 20+ sims where 5 was the previous practical ceiling.
 const barsCache = new Map();  // key → { bars, source, fetchedAt }
-const BARS_CACHE_TTL_MS = 10 * 60 * 1000;
+const BARS_CACHE_TTL_MS = 60 * 60 * 1000;  // 60 min — covers a full
+// session of sim iterations without re-fetching. Daily bars don't revise
+// intraday so a 60-min TTL is safe for backtest. The previous 10-min
+// value was too tight; users running sims over 10+ min hit full
+// re-fetches of all symbols (150-coin broad market on btc especially).
 
 // ─── Unbiased coin flip via OS-level entropy ───────────────────────────────
 // Math.random() is a deterministic PRNG (xorshift/LCG variant per engine).

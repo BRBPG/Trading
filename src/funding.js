@@ -80,7 +80,7 @@ export function toBinancePerp(symbol) {
 // Session-scoped cache — funding doesn't change retroactively so once
 // fetched the history is good for the session.
 const fundingCache = new Map();  // binanceSym → { records: [{time, rate}], fetchedAt }
-const FUNDING_CACHE_TTL_MS = 10 * 60 * 1000;
+const FUNDING_CACHE_TTL_MS = 60 * 60 * 1000;  // 60 min, matches bars cache
 
 // Fetch up to 1000 most recent funding records (≈333 days at 3/day).
 // Returns array of { time: seconds, rate: number } sorted ascending.

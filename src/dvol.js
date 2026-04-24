@@ -24,7 +24,7 @@ const DVOL_BASE = "https://www.deribit.com/api/v2/public";
 // Session-scoped cache — DVOL history 10-min TTL. Historical values
 // don't change retroactively so stale-but-recent is fine.
 const dvolCache = { records: null, fetchedAt: 0 };
-const DVOL_TTL_MS = 10 * 60 * 1000;
+const DVOL_TTL_MS = 60 * 60 * 1000;  // 60 min — matches bars cache
 
 // Fetch daily DVOL history from Deribit public REST. The index name
 // changed to "btc_dvol_usdc" around 2023 after USDC-settled rollout —
