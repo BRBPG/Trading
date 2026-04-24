@@ -479,6 +479,11 @@ export async function runAblationStudy(simTrades, baseOpts = {}, targets = [], o
     baselineAUC: baseAUC,
     baselineLogLoss: baseline.overall?.oosLogLoss,
     baselineSamples: baseline.overall?.oosSamples,
+    // Generalization gap — avgTestLoss - avgTrainLoss. > 0.15 = severe
+    // overfit per AFML Ch.7. Exposed on the return so adaptive-training
+    // cycles can track it alongside AUC without re-computing.
+    baselineGap: (baseline.overall?.avgTestLoss != null && baseline.overall?.avgTrainLoss != null)
+      ? baseline.overall.avgTestLoss - baseline.overall.avgTrainLoss : null,
     results,
   };
 }
