@@ -6,7 +6,7 @@ import { computeSimMetrics, summariseEdge } from "./simMetrics";
 import { runWalkForward, interpretWF, runAblationStudy } from "./walkForward";
 import { runBacktest, clearBarsCache, barsCacheSize } from "./backtest";
 import { calcADX, calcWilliamsR, calcStochastic, calcROC, calcZScore,
-         calcCMF, calcMaxDrawdown, calcSharpe, calcBeta, engineerFeatures,
+         calcCMF, calcMaxDrawdown, calcSharpe, engineerFeatures,
          fetchAllNews } from "./quant";
 import { BUFFETT_SYSTEM_PROMPT, buildBuffettContext } from "./buffett";
 import { cleanBars, assessQuality, cleaningSummary } from "./cleaning";
@@ -931,7 +931,6 @@ ${(()=>{ const f=engineerFeatures(q, quotes); return [
   `Momentum Composite: ${f.momentumComposite}% — ${f.momentumLabel}`,
   `Volatility Regime: ${f.volRegime}  ATR%: ${f.atrPct}%`,
   `BB State: ${f.bbState||"N/A"}  Bandwidth: ${f.bbBandwidth||"?"}%`,
-  `Relative Strength vs SPY: ${f.relStrVsSpy!=null?(f.relStrVsSpy>=0?"+":"")+f.relStrVsSpy+"%":"N/A"}`,
   `VWAP Deviation: ${f.vwapDev!=null?(f.vwapDev>=0?"+":"")+f.vwapDev+"%":"N/A"}`,
   `Volume Trend: ${f.volTrendLabel||"N/A"} (${f.volTrend||"?"}x recent vs prior)`,
 ].join("\n"); })()}
@@ -987,7 +986,12 @@ function parseTradeData(reply, q, symbol, context = {}) {
 
 export default function App() {
   const [quotes, setQuotes] = useState({});
-  const [selected, setSelected] = useState("SPY");
+  // Default selected symbol must be in the current watchlist. Previously
+  // this was "SPY" which worked when the universe was equities. Post-btc
+  // archive it was leaving quotes[selected] = undefined on first load
+  // because we only fetch BTC-USD — every panel that read quotes[selected]
+  // ("No data") blanked. Default to BTC-USD.
+  const [selected, setSelected] = useState("BTC-USD");
   const [messages, setMessages] = useState([]);
   const [chatHistory, setChatHistory] = useState([]);
   const [input, setInput] = useState("");
@@ -3981,7 +3985,29 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
             if (!q) return <div style={{padding:14,color:"#333"}}>No data</div>;
             const qt = q.quant||{};
             const f = engineerFeatures(q, quotes);
-            const beta = calcBeta(q.closes||[], quotes.SPY?.closes||[]);
+            // BTC universe: "Beta vs SPY" and "Rel Strength vs SPY" are
+            // equity-carryover metrics that don't apply. Replaced with
+            // BTC-native measures:
+            //   - Funding z (current perp-futures positioning)
+            //   - Dominance z from the 150-coin snapshot
+            //   - BTC 14d return rank vs top-150
+            // These read from the same state we already maintain for the
+            // MODEL tab's feature vector, so no new fetches.
+            const fundingRecs = fundingMap.get(selected);
+            const fundingNow = fundingRecs && fundingRecs.length
+              ? fundingRecs[fundingRecs.length - 1].rate : null;
+            const fundingZ = fundingRecs ? fundingZLive(fundingRecs) : null;
+            const btcRank = broadMarketSnapshot && broadMarketSnapshot.length
+              ? (() => {
+                  const my = broadMarketSnapshot.find(c => c.symbol === "BTC");
+                  if (!my || my.ret14dPct == null) return null;
+                  const rets = broadMarketSnapshot
+                    .filter(c => c.symbol !== "BTC" && Number.isFinite(c.ret14dPct))
+                    .map(c => c.ret14dPct);
+                  if (!rets.length) return null;
+                  const below = rets.filter(r => r < my.ret14dPct).length;
+                  return below / rets.length;
+                })() : null;
             const rows = [
               ["ADX(14)", qt.adx?.adx?.toFixed(1)||"—", qt.adx?.adx>25?"TRENDING":"WEAK", qt.adx?.adx>50?"#E74C3C":qt.adx?.adx>25?"#C9A84C":"#555"],
               ["DI+ / DI−", `${qt.adx?.diPlus?.toFixed(1)||"?"}  /  ${qt.adx?.diMinus?.toFixed(1)||"?"}`, qt.adx?.diPlus>qt.adx?.diMinus?"BULL DI":"BEAR DI", qt.adx?.diPlus>qt.adx?.diMinus?"#2ECC71":"#E74C3C"],
@@ -3992,7 +4018,10 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
               ["CMF(20)", qt.cmf?.toFixed(3)||"—", qt.cmf>0.1?"BUYING":qt.cmf<-0.1?"SELLING":"NEUTRAL", qt.cmf>0.1?"#2ECC71":qt.cmf<-0.1?"#E74C3C":"#888"],
               ["Max Drawdown", qt.maxDrawdown?.toFixed(2)+"%"||"—", "from peak", qt.maxDrawdown>20?"#E74C3C":"#888"],
               ["Sharpe (ann.)", qt.sharpe?.toFixed(2)||"—", qt.sharpe>1?"GOOD":qt.sharpe>0?"POSITIVE":qt.sharpe!=null?"NEGATIVE":"—", qt.sharpe>1?"#2ECC71":qt.sharpe>0?"#C9A84C":"#E74C3C"],
-              ["Beta vs SPY", beta?.toFixed(2)||"—", beta>1.5?"HIGH BETA":beta<0.5?"LOW BETA":"MODERATE", beta>1.5?"#E74C3C":"#888"],
+              // BTC-native replacements for SPY beta/rel-strength.
+              ["Perp Funding (8h)", fundingNow!=null?((fundingNow*100).toFixed(4)+"%"):"—", fundingNow>0.0005?"LONGS CROWDED":fundingNow<-0.0005?"SHORTS CROWDED":"BALANCED", fundingNow>0.0005?"#E74C3C":fundingNow<-0.0005?"#2ECC71":"#888"],
+              ["Funding z (21-period)", fundingZ!=null?fundingZ.toFixed(3):"—", Math.abs(fundingZ||0)>0.5?"EXTREME":"NORMAL", Math.abs(fundingZ||0)>0.5?"#C9A84C":"#888"],
+              ["BTC Rank (top-150 14d)", btcRank!=null?(btcRank*100).toFixed(0)+"th%ile":"—", btcRank>0.7?"OUTPERFORMING":btcRank<0.3?"LAGGING":"MIDDLE", btcRank>0.7?"#2ECC71":btcRank<0.3?"#E74C3C":"#888"],
             ];
             return (
               <div style={{flex:1,overflowY:"auto",padding:14}}>
@@ -4013,7 +4042,9 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                   ["Momentum Composite",`${f.momentumComposite}% — ${f.momentumLabel}`],
                   ["Volatility Regime",f.volRegime],
                   ["BB State",`${f.bbState||"N/A"}  bw=${f.bbBandwidth||"?"}%`],
-                  ["Rel. Strength vs SPY",`${f.relStrVsSpy!=null?(f.relStrVsSpy>=0?"+":"")+f.relStrVsSpy+"%":"N/A"}`],
+                  // SPY-relative strength is meaningless on btc universe.
+                  // Dropped in favour of the BTC-vs-top-150 rank we already
+                  // compute above.
                   ["VWAP Deviation",`${f.vwapDev!=null?(f.vwapDev>=0?"+":"")+f.vwapDev+"%":"N/A"}`],
                   ["Volume Trend",`${f.volTrendLabel||"N/A"} (${f.volTrend||"?"}x)`],
                 ].map(([l,v])=>(
