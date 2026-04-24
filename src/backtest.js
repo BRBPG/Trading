@@ -317,12 +317,25 @@ export async function runBacktest(symbols, opts = {}) {
   // "90d sim returns 0 trades" because Yahoo returned only ~90 daily
   // bars for daysAgo=90 and every candidate was < 100 bars in.
   const WARMUP_BARS = 100;
-  // Extra days of history to pull beyond the user's requested window so
-  // there's room for the warmup AND the forward-hold window. Daily:
-  // WARMUP_BARS days of trading calendar ≈ 140 real days (5/7 trading).
-  // Intraday: 100 bars × 5 min ≈ 8 hours ≈ ~1 extra trading day, so bump
-  // by 2 days to be safe. HOLD_BARS additionally clipped inside the loop.
-  const WARMUP_FETCH_DAYS = isDaily ? 150 : 2;
+  // Extra days of history to pull beyond the user's requested window.
+  // Two roles:
+  //   1. Warmup buffer for indicators (EMA50 / BB20 need ≥100 bars).
+  //   2. Baseline history for z-score computations (RV regime, funding,
+  //      DVOL, OI — the longer the baseline, the more stable the z).
+  //
+  // BTC SINGLE-ASSET + POLYGON: maximise the baseline since Polygon
+  // Currencies Standard has unlimited historical daily bars. Fetch up
+  // to 5 years of warmup — that's ~1825 extra bars on top of the user's
+  // entry window, giving RV/TS-momentum/funding z-score baselines a
+  // properly long rolling window. Bars cache means this is paid once
+  // per session.
+  //
+  // Other universes keep the 150-day default to avoid blowing up the
+  // fan-out on 40-coin crypto (40 × 2000-bar fetches would hurt).
+  const isBtcWithPoly = universe === "btc" && hasPolygonKey(polygonKey);
+  const WARMUP_FETCH_DAYS = isDaily
+    ? (isBtcWithPoly ? 1825 : 150)
+    : 2;
   const fetchDaysAgo = daysAgo + WARMUP_FETCH_DAYS;
 
   // Pre-fetch macro history ONCE per backtest run — the at(t) helper does
@@ -363,10 +376,16 @@ export async function runBacktest(symbols, opts = {}) {
   let dvolRecords = null;
   if (isCryptoUniverse && isDaily) {
     onProgress({ phase: "fetching_dvol", done: 0, total: 1 });
-    // Fetch enough history to cover our sim window AND the 60-day rolling
-    // baseline that dvolRvSpreadAt uses for the z-score. daysAgo+150
-    // matches WARMUP_FETCH_DAYS. Cap 365 to stay within one API call.
-    dvolRecords = await fetchDvolHistory(Math.min(365, fetchDaysAgo + 60));
+    // Deribit DVOL was launched 2021-03-24 — hard floor for historical
+    // lookback. At 5000-candle cap per daily call we can theoretically
+    // pull ~13 years of 1D data in one request, but the actual history
+    // caps at ~1500 days (today). For BTC+Polygon, match the bars
+    // fetch horizon to get the longest-possible DVOL baseline for
+    // z-score stability. Other universes keep the 365-day cap.
+    const dvolHorizon = isBtcWithPoly
+      ? Math.min(1500, fetchDaysAgo + 60)
+      : Math.min(365, fetchDaysAgo + 60);
+    dvolRecords = await fetchDvolHistory(dvolHorizon);
   }
 
   // Phase 4 Commit 4: Binance BTCUSDT Open Interest history. Max ~30 days

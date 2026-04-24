@@ -2372,6 +2372,8 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                                 <option value={180}>180d (~130 trades)</option>
                                 <option value={365}>1y (~250 trades)</option>
                                 <option value={730} disabled={!polygonKey}>2y {polygonKey?"":"(Polygon)"}</option>
+                                <option value={1095} disabled={!polygonKey}>3y {polygonKey?"":"(Polygon)"}</option>
+                                <option value={1825} disabled={!polygonKey}>5y {polygonKey?"":"(Polygon)"}</option>
                               </>}
                             </select>
                           </div>
