@@ -53,21 +53,37 @@ const EQUITY_WATCHLIST = ["SPY","QQQ","AAPL","MSFT","AMZN","NVDA","AMD","TSM","T
 // migrated the native token. Polygon.io's ticker is now X:POLUSD and Yahoo
 // has migrated to POL-USD.
 const CRYPTO_WATCHLIST = [
-  // Top 10 by market cap / liquidity (original 3a universe)
+  // ─── Tier 1: Top 10 by market cap / liquidity (original 3a universe) ───
   "BTC-USD","ETH-USD","SOL-USD","BNB-USD","XRP-USD",
   "ADA-USD","AVAX-USD","LINK-USD","DOGE-USD","POL-USD",
-  // Expansion: large-cap alts with multi-year history
-  "TRX-USD",  // Tron — L1, ~5y history
-  "LTC-USD",  // Litecoin — legacy major, ~14y history
-  "DOT-USD",  // Polkadot — L0/interop, ~5y history
-  "ATOM-USD", // Cosmos — IBC hub, ~6y
-  "UNI-USD",  // Uniswap — DeFi bluechip, ~5y
-  // Expansion: mid-cap L1s/L2s with ≥2y history
-  "NEAR-USD", // Near Protocol — L1
-  "APT-USD",  // Aptos — Move-based L1, launched Oct 2022
-  "ARB-USD",  // Arbitrum — L2, launched Mar 2023
-  "OP-USD",   // Optimism — L2, launched May 2022
-  "AAVE-USD", // Aave — DeFi lending bluechip
+  // ─── Tier 2: Large-cap alts, multi-year history (3d step 1 expansion) ─
+  "TRX-USD","LTC-USD","DOT-USD","ATOM-USD","UNI-USD",
+  "NEAR-USD","APT-USD","ARB-USD","OP-USD","AAVE-USD",
+  // ─── Tier 3: Further expansion to ~40 symbols for XS-rank resolution ──
+  // Targeting ~2.5% percentile granularity which is where XS-momentum
+  // genuinely resolves in the literature (Liu-Tsyvinski used 1800+; we
+  // can't get there on a retail data plan, but 40 is the next meaningful
+  // step up from 20). All covered by Polygon Currencies Standard.
+  "BCH-USD",   // Bitcoin Cash — legacy fork, ~8y
+  "ETC-USD",   // Ethereum Classic — legacy fork, ~9y
+  "XLM-USD",   // Stellar — payments L1, ~11y
+  "HBAR-USD",  // Hedera — hashgraph L1, ~5y
+  "ICP-USD",   // Internet Computer — ~5y, Dfinity
+  "FIL-USD",   // Filecoin — decentralised storage, ~5y
+  "ALGO-USD",  // Algorand — L1, ~6y
+  "VET-USD",   // VeChain — supply-chain L1, ~7y
+  "STX-USD",   // Stacks — Bitcoin L2, ~4y
+  "IMX-USD",   // Immutable X — gaming L2, ~5y
+  "MKR-USD",   // Maker — CDP/DAI, DeFi bluechip, ~8y
+  "CRV-USD",   // Curve — stableswap AMM, ~5y
+  "LDO-USD",   // Lido — liquid staking, ~5y
+  "SNX-USD",   // Synthetix — synthetic assets, ~6y
+  "COMP-USD",  // Compound — DeFi lending, ~5y
+  "GRT-USD",   // The Graph — decentralised indexing, ~5y
+  "SUI-USD",   // Sui — Move-based L1, ~2.5y
+  "SEI-USD",   // Sei — trading L1, ~2.5y
+  "TIA-USD",   // Celestia — modular DA, ~2.5y
+  "RUNE-USD",  // THORChain — cross-chain AMM, ~5y
 ];
 
 // Keep the legacy WATCHLIST symbol exported for anywhere that needs a
@@ -1486,6 +1502,13 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
     const accs = [];
     const losses = [];
     const tradeCounts = [];
+    // Conviction-stratified arrays — per-run AUC/log-loss at top-50/30/10
+    // percentile of |yHat − 0.5|. If top-10% AUC materially exceeds the
+    // overall AUC, the model HAS edge on high-conviction setups — the
+    // user should trade only those, not every signal.
+    const aucsTop50 = [], aucsTop30 = [], aucsTop10 = [];
+    const lossesTop50 = [], lossesTop30 = [], lossesTop10 = [];
+    const thrTop50 = [], thrTop30 = [], thrTop10 = [];
     // Track per-symbol aggregated stats across all runs to find which
     // names are carrying vs dragging the multi-sim AUC.
     const perSymbolStats = {};  // symbol → { total: n, wins: n, pnl: sum }
@@ -1528,6 +1551,13 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
           aucs.push(wf.overall.oosAUC);
           accs.push(wf.overall.oosAccuracy);
           losses.push(wf.overall.oosLogLoss);
+          // Capture conviction-stratified metrics so we can aggregate across
+          // runs. If a bucket is absent (edge case: too few OOS preds) the
+          // push is skipped and means are computed over available runs.
+          const bc = wf.overall.byConviction;
+          if (bc?.top50?.auc != null) { aucsTop50.push(bc.top50.auc); lossesTop50.push(bc.top50.logLoss); thrTop50.push(bc.top50.threshold); }
+          if (bc?.top30?.auc != null) { aucsTop30.push(bc.top30.auc); lossesTop30.push(bc.top30.logLoss); thrTop30.push(bc.top30.threshold); }
+          if (bc?.top10?.auc != null) { aucsTop10.push(bc.top10.auc); lossesTop10.push(bc.top10.logLoss); thrTop10.push(bc.top10.threshold); }
         }
         // Aggregate per-symbol trade stats across this run for the summary.
         for (const t of res.trades) {
@@ -1593,6 +1623,17 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         }))
         .sort((a, b) => b.winRate - a.winRate);
 
+      // Conviction-stratified summary: mean AUC + mean log-loss + mean
+      // threshold at each quantile. The threshold is the |yHat − 0.5|
+      // floor that reproduces the bucket in production — "only trade
+      // when compositeProb > 0.5 + threshold or < 0.5 − threshold".
+      const meanOrNull = arr => arr.length ? mean(arr) : null;
+      const bucket = (aucArr, lossArr, thrArr) => ({
+        meanAUC: meanOrNull(aucArr),
+        meanLogLoss: meanOrNull(lossArr),
+        meanThreshold: meanOrNull(thrArr),
+        runs: aucArr.length,
+      });
       setMultiSimResult({
         runs: aucs.length,
         aucs,
@@ -1611,6 +1652,12 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         maxAUC: Math.max(...aucs),
         meanAccuracy: mean(accs),
         meanLogLoss: mean(losses),
+        conviction: {
+          all:   { meanAUC: muAUC, meanLogLoss: mean(losses), meanThreshold: 0, runs: aucs.length },
+          top50: bucket(aucsTop50, lossesTop50, thrTop50),
+          top30: bucket(aucsTop30, lossesTop30, thrTop30),
+          top10: bucket(aucsTop10, lossesTop10, thrTop10),
+        },
         symbolBreakdown,
         fetchLog: firstRunFetchLog,
       });
@@ -2623,6 +2670,59 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                                 })}
                               </div>
                             </div>
+
+                            {/* CONVICTION-STRATIFIED METRICS — the answer to
+                                "is there edge hiding in high-conviction
+                                setups?" (meta-labeling, López de Prado
+                                AFML Ch.3). If the overall AUC is 0.50 but
+                                TOP-10 is 0.60+ with tight CI, the policy
+                                "only trade when |prob − 0.5| > threshold"
+                                IS the edge. Shown to green when AUC ≥ 0.55,
+                                amber 0.52-0.55, red below 0.52. */}
+                            {r.conviction && (
+                              <div style={{padding:"6px 10px",background:"#080808",border:"1px solid #1A1A1A",fontSize:9,color:"#888",marginBottom:10}}>
+                                <div style={{fontSize:8,color:"#555",letterSpacing:2,marginBottom:6}}>
+                                  📈 CONVICTION-STRATIFIED — where the edge actually lives (meta-labeling)
+                                </div>
+                                <div style={{display:"grid",gridTemplateColumns:"1.2fr 1fr 1fr 1.2fr 1.2fr",gap:4,fontSize:9,marginBottom:4}}>
+                                  <div style={{color:"#555"}}>SUBSET</div>
+                                  <div style={{color:"#555"}}>MEAN AUC</div>
+                                  <div style={{color:"#555"}}>LOG-LOSS</div>
+                                  <div style={{color:"#555"}}>THRESHOLD |p−0.5|</div>
+                                  <div style={{color:"#555"}}>POLICY</div>
+                                  {["all","top50","top30","top10"].map(key => {
+                                    const b = r.conviction[key];
+                                    if (!b || b.meanAUC == null) return null;
+                                    const col = b.meanAUC >= 0.55 ? "#2ECC71" : b.meanAUC >= 0.52 ? "#C9A84C" : "#E74C3C";
+                                    const label = key === "all" ? "ALL trades" :
+                                                  key === "top50" ? "Top 50%" :
+                                                  key === "top30" ? "Top 30%" : "Top 10%";
+                                    const thr = b.meanThreshold != null ? b.meanThreshold.toFixed(3) : "—";
+                                    const policy = key === "all"
+                                      ? "baseline (every setup)"
+                                      : `trade only if |prob−0.5| ≥ ${thr}`;
+                                    return (
+                                      <React.Fragment key={key}>
+                                        <div style={{color:"#CCC"}}>{label}</div>
+                                        <div style={{color:col,fontWeight:700}}>{b.meanAUC.toFixed(3)}</div>
+                                        <div style={{color: b.meanLogLoss != null && b.meanLogLoss < 0.69 ? "#2ECC71" : "#888"}}>
+                                          {b.meanLogLoss != null ? b.meanLogLoss.toFixed(3) : "—"}
+                                        </div>
+                                        <div style={{color:"#888"}}>{thr}</div>
+                                        <div style={{color:"#666",fontSize:8}}>{policy}</div>
+                                      </React.Fragment>
+                                    );
+                                  })}
+                                </div>
+                                <div style={{fontSize:8,color:"#555",marginTop:6,lineHeight:1.5}}>
+                                  If TOP-10% AUC ≫ ALL AUC with tight CI, the model has real edge on
+                                  high-conviction setups. The THRESHOLD column gives the |p−0.5| floor
+                                  you'd use as a trading filter — e.g. 0.08 means "only trade when
+                                  composite ≥ 0.58 or ≤ 0.42". If all rows land at 0.50, no amount of
+                                  selectivity rescues the model — features genuinely carry no signal.
+                                </div>
+                              </div>
+                            )}
 
                             {/* FETCH DIAGNOSTICS — which data source served
                                 each symbol on the first run. Essential on

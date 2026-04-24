@@ -174,6 +174,32 @@ export function runWalkForward(simTrades, opts = {}) {
     return { error: "No evaluable folds (train or test sets empty). Increase samples.", samples: all.length };
   }
 
+  // ─── Conviction-stratified metrics (meta-labeling, López de Prado AFML §3) ─
+  // A forced-trade backtest dilutes measurable edge: if the model has real
+  // signal on only the top X% most-confident predictions and is near-random
+  // on the rest, overall AUC collapses toward 0.5 even when the policy
+  // "trade only the high-conviction subset" has a genuine edge. Stratifying
+  // by |yHat − 0.5| tells you exactly where the signal lives and gives the
+  // user an actionable selectivity threshold.
+  //
+  // Percentiles computed on the pooled OOS prediction set (not per fold —
+  // fold-level top-10% of 5 preds is too noisy to be meaningful).
+  const topByConviction = (preds, q) => {
+    const sorted = [...preds].sort((a, b) =>
+      Math.abs(b.yHat - 0.5) - Math.abs(a.yHat - 0.5));
+    const take = Math.max(1, Math.floor(preds.length * q));
+    return sorted.slice(0, take);
+  };
+  const top50 = topByConviction(allPreds, 0.50);
+  const top30 = topByConviction(allPreds, 0.30);
+  const top10 = topByConviction(allPreds, 0.10);
+  const convictionThreshold = (subset) => {
+    // Minimum |yHat − 0.5| in the subset — the "clear this line to take
+    // a trade" threshold that reproduces this AUC in production.
+    if (!subset.length) return null;
+    return Math.min(...subset.map(p => Math.abs(p.yHat - 0.5)));
+  };
+
   // Aggregate OOS metrics over all folds' predictions pooled together.
   return {
     samples: all.length,
@@ -190,6 +216,14 @@ export function runWalkForward(simTrades, opts = {}) {
       // lower than test loss, the model is OVERFITTING.
       avgTrainLoss: foldResults.reduce((a, f) => a + (f.trainLoss || 0), 0) / foldResults.length,
       avgTestLoss:  foldResults.reduce((a, f) => a + (f.testLoss  || 0), 0) / foldResults.length,
+      // Conviction-stratified — where the signal actually lives.
+      // Each entry: { n, auc, logLoss, accuracy, threshold }
+      byConviction: {
+        all:   { n: allPreds.length, auc: auc(allPreds), logLoss: logLoss(allPreds), accuracy: accuracy(allPreds), threshold: 0 },
+        top50: { n: top50.length, auc: auc(top50), logLoss: logLoss(top50), accuracy: accuracy(top50), threshold: convictionThreshold(top50) },
+        top30: { n: top30.length, auc: auc(top30), logLoss: logLoss(top30), accuracy: accuracy(top30), threshold: convictionThreshold(top30) },
+        top10: { n: top10.length, auc: auc(top10), logLoss: logLoss(top10), accuracy: accuracy(top10), threshold: convictionThreshold(top10) },
+      },
     },
   };
 }
