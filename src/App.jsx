@@ -2068,22 +2068,31 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
       return dropped;
     };
 
-    const gbmKey = universe === "btc" ? "trader_gbm_v3_btc"
-                 : universe === "crypto" ? "trader_gbm_v2_crypto"
-                 : "trader_gbm_v1";
 
     // Accumulate all observed deltas per slot across the run. Feeds the
-    // post-run Wilcoxon signed-rank test that produces the principled
-    // "keep / drop / uncertain" verdict. Separate from the Thompson
-    // posteriors (which drive cycle-by-cycle inclusion) so the final
-    // verdict is based on the actual observed distribution of Δ values,
-    // not on a posterior that weights recency.
+    // post-run binary verdict (KEEP / DROP based on median sign +
+    // posterior mean). Separate from the Thompson posteriors (which drive
+    // cycle-by-cycle inclusion) so the final verdict reflects the actual
+    // observed distribution of Δ values.
     const allDeltasPerSlot = {};
     for (const t of targets) allDeltasPerSlot[t.slot] = [];
 
+    // TRAINING-TRADE POOL — accumulates trades across cycles so each
+    // cycle's GBM is trained on the GROWING corpus, not just that cycle's
+    // ~55-100 trades. User's earlier complaint: TRAINED ON count bounced
+    // around per cycle instead of growing because we'd been discarding
+    // prior cycles' data. With pool accumulation:
+    //   cycle 1: pool = cycle-1 trades                   (~80)
+    //   cycle 2: pool = cycle-1 + cycle-2                (~160)
+    //   ...
+    //   cycle N: pool = concatenation of all cycles'     (~80 * N)
+    // Capped at POOL_CAP to keep GBM training tractable; oldest trades
+    // are evicted first (time-ordered FIFO).
+    const POOL_CAP = 1000;
+    const tradePool = [];
+
     const results = [];
     let bestAUC = -Infinity;
-    let bestGBM = loadGBM(universe);
     setContinuousVerdicts(null);
 
     try {
@@ -2122,7 +2131,17 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
           continue;
         }
 
-        trainGBMFromSim(res.trades, universe);
+        // Grow the pool with this cycle's fresh trades. FIFO cap at
+        // POOL_CAP — oldest trades drop off when we hit the ceiling.
+        // Each trade keeps its original ageDays, so trainGBM's internal
+        // time-ordered train/val split still works correctly on the pool.
+        tradePool.push(...res.trades);
+        while (tradePool.length > POOL_CAP) tradePool.shift();
+        // Train on the FULL pool — not just this cycle's trades. This is
+        // what makes cycles genuinely accumulate learning instead of
+        // treating each cycle in isolation. trainedOn in the saved GBM
+        // now grows cycle-over-cycle (capped at POOL_CAP).
+        trainGBMFromSim(tradePool, universe);
         if (continuousAbortRef.current) break;
 
         await new Promise(r => setTimeout(r, 30));
@@ -2177,12 +2196,14 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
           }
         }
 
-        if (aucNow != null && aucNow > bestAUC) {
-          bestAUC = aucNow;
-          bestGBM = loadGBM(universe);
-        } else if (bestGBM?.trees) {
-          localStorage.setItem(gbmKey, JSON.stringify(bestGBM));
-        }
+        // Best-AUC tracking for the run summary — NO rollback. Previous
+        // version wrote the "best-so-far" GBM back to localStorage on any
+        // regression, which meant that after the highest-AUC cycle, every
+        // subsequent cycle's trained weights got overwritten back to the
+        // prior best. Result: MODEL STATE frozen on the best-AUC cycle's
+        // state. With pool training each new cycle is trained on strictly
+        // MORE data than the previous — overwriting is the right behavior.
+        if (aucNow != null && aucNow > bestAUC) bestAUC = aucNow;
 
         // E[Beta(α,β)] = α/(α+β) — feature's posterior mean usefulness
         const posteriorSnapshot = Object.fromEntries(
@@ -2228,82 +2249,90 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
       setContinuousResults([...results]);
     }
 
-    // ─── POST-RUN VERDICTS (Wilcoxon signed-rank per feature) ────────
-    // For each feature, run a non-parametric test on its observed Δ
-    // distribution. Wilcoxon signed-rank: null hypothesis is "median Δ
-    // = 0" (feature has no effect). Significant positive rank-sum → keep.
-    // Significant negative → drop. Non-significant → uncertain (retain
-    // by default; lack of evidence is not evidence of uselessness).
+    // ─── POST-RUN BINARY VERDICTS ────────────────────────────────────
+    // User feedback: Wilcoxon at n=6 was structurally underpowered — the
+    // smallest achievable p on 6 observations is ~0.063 (unanimous signs),
+    // so p<0.05 gave UNCERTAIN for every feature except Parkinson by
+    // luck. Replaced with a BINARY decision:
+    //   KEEP  if median Δ > 0  OR posterior mean > 0.5
+    //   DROP  otherwise
+    // Confidence is surfaced separately (HIGH/LOW) based on the
+    // posterior's distance from 0.5 and |median Δ|. Every feature gets
+    // an actionable verdict — no more UNCERTAIN purgatory.
     //
-    // Two-sided p-value via normal approximation to the signed-rank
-    // statistic (fine for n >= 6; below that we just fall back to
-    // "uncertain — need more cycles").
+    // The final GBM is ALSO retrained with the DROP features masked, so
+    // the verdict is applied to the deployed model, not just displayed.
     const verdicts = [];
     for (const t of targets) {
       const obs = allDeltasPerSlot[t.slot].filter(Number.isFinite);
       const n = obs.length;
-      const sortedAbs = obs.slice().sort((a, b) => Math.abs(a) - Math.abs(b));
-      // rank |Δ| with ties getting average rank
-      let W = 0;
-      for (let i = 0; i < sortedAbs.length; i++) {
-        const rank = i + 1;
-        W += Math.sign(sortedAbs[i]) * rank;
-      }
       const median = n === 0 ? null
         : (() => {
           const s = obs.slice().sort((a, b) => a - b);
           const m = Math.floor(s.length / 2);
           return s.length % 2 ? s[m] : (s[m-1] + s[m]) / 2;
         })();
-      let verdict = "uncertain";
-      let pValue = null;
-      if (n >= 6) {
-        // Normal approximation: under H0, E[W]=0, Var[W]=n(n+1)(2n+1)/6
-        const sigma = Math.sqrt(n * (n + 1) * (2 * n + 1) / 6);
-        const z = W / sigma;
-        // Two-sided p via erfc approximation
-        pValue = 2 * (1 - normalCdf(Math.abs(z)));
-        if (pValue < 0.05) {
-          verdict = median > 0 ? "keep" : "drop";
-        }
-      }
+      const postMean = posteriors[t.slot].alpha / (posteriors[t.slot].alpha + posteriors[t.slot].beta);
+
+      // Binary decision. Use EITHER positive median Δ OR posterior mean
+      // above 0.5 — belt-and-braces so a single-signal indication is
+      // enough to keep. Drop only when BOTH signals say negative.
+      const medianPositive = (median ?? 0) > 0;
+      const posteriorPositive = postMean > 0.5;
+      const verdict = (medianPositive || posteriorPositive) ? "KEEP" : "DROP";
+
+      // Confidence: both signals strong + >= 4 observations = HIGH,
+      // single signal or limited obs = LOW. Makes the user's retained
+      // trust calibrated.
+      const strongSignal = Math.abs(postMean - 0.5) > 0.15 || Math.abs(median ?? 0) > 0.01;
+      const confidence = (strongSignal && n >= 4)
+        ? (medianPositive === posteriorPositive ? "HIGH" : "MED")
+        : "LOW";
+
       verdicts.push({
         slot: t.slot,
         name: t.name,
         verdict,
+        confidence,
         median,
-        pValue,
+        postMean,
         n,
-        posteriorMean: posteriors[t.slot].alpha / (posteriors[t.slot].alpha + posteriors[t.slot].beta),
       });
     }
-    // Sort: keep > uncertain > drop, then by |median| desc
-    verdicts.sort((a, b) => {
-      const order = { keep: 0, uncertain: 1, drop: 2 };
-      if (order[a.verdict] !== order[b.verdict]) return order[a.verdict] - order[b.verdict];
-      return Math.abs(b.median || 0) - Math.abs(a.median || 0);
-    });
+    // Sort: KEEP with HIGH confidence first, then KEEP LOW, DROP LOW, DROP HIGH
+    const sortKey = (v) => {
+      const baseScore = v.verdict === "KEEP" ? 0 : 2;
+      const confBoost = v.confidence === "HIGH" ? 0 : v.confidence === "MED" ? 0.5 : 1;
+      return v.verdict === "KEEP" ? baseScore + confBoost : baseScore + (1 - confBoost);
+    };
+    verdicts.sort((a, b) => sortKey(a) - sortKey(b));
+
+    // APPLY the verdicts — retrain a final GBM on the pool with all DROP
+    // features masked to zero. This is what the user asked for:
+    // "it should be implementing whatever features it chooses by the
+    // end of the model". The saved GBM post-run reflects the verdict.
+    const dropSlots = new Set(verdicts.filter(v => v.verdict === "DROP").map(v => v.slot));
+    if (tradePool.length >= 20 && dropSlots.size > 0) {
+      const maskedPool = tradePool.map(t => {
+        if (!t.features) return t;
+        const x = [...t.features];
+        for (const s of dropSlots) if (s < x.length) x[s] = 0;
+        return { ...t, features: x };
+      });
+      trainGBMFromSim(maskedPool, universe);
+    }
+
     setContinuousVerdicts({
       verdicts,
       totalCycles: results.filter(r => r.auc != null).length,
       bestAUC,
+      finalPoolSize: tradePool.length,
+      droppedSlots: Array.from(dropSlots),
       timestamp: Date.now(),
     });
 
     setContinuousRunning(false);
     continuousAbortRef.current = false;
-  }
-
-  // Normal CDF via Abramowitz-Stegun 7.1.26 approximation (max error ~7.5e-8).
-  // Used for the Wilcoxon signed-rank p-value in the post-run feature verdict.
-  function normalCdf(x) {
-    const a1 =  0.254829592, a2 = -0.284496736, a3 =  1.421413741;
-    const a4 = -1.453152027, a5 =  1.061405429, p =   0.3275911;
-    const sign = x < 0 ? -1 : 1;
-    const ax = Math.abs(x) / Math.sqrt(2);
-    const t = 1.0 / (1.0 + p * ax);
-    const y = 1.0 - (((((a5*t + a4)*t) + a3)*t + a2)*t + a1)*t * Math.exp(-ax*ax);
-    return 0.5 * (1.0 + sign * y);
   }
 
   // ─── Train NN on the most recent sim batch ────────────────────────────────
@@ -3473,16 +3502,16 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                                     not just simulating. */}
                                 <div style={{padding:"6px 10px",background:"#0A0F18",border:"1px solid #1A2A4A",marginBottom:8,fontSize:9}}>
                                   <div style={{fontSize:7,color:"#6A9FDF",letterSpacing:2,marginBottom:4}}>
-                                    🧠 MODEL STATE — persisted {universe.toUpperCase()} GBM
+                                    🧠 MODEL STATE — persisted {universe.toUpperCase()} GBM (trained on growing pool)
                                   </div>
-                                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6}}>
+                                  <div style={{display:"grid",gridTemplateColumns:"1fr 1.3fr 1.3fr",gap:6}}>
                                     <div>
                                       <span style={{color:"#555"}}>TREES </span>
                                       <span style={{color:treeCount>0?"#2ECC71":"#888",fontWeight:700}}>{treeCount}</span>
                                     </div>
                                     <div>
                                       <span style={{color:"#555"}}>TRAINED ON </span>
-                                      <span style={{color:"#CCC",fontWeight:700}}>{trainedOn} trades</span>
+                                      <span style={{color:trainedOn>100?"#2ECC71":"#CCC",fontWeight:700}}>{trainedOn} pooled trades</span>
                                     </div>
                                     <div>
                                       <span style={{color:"#555"}}>UPDATED </span>
@@ -3564,34 +3593,39 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                           {continuousVerdicts && (
                             <div style={{marginTop:12,padding:"8px 12px",background:"#0A1A0A",border:"1px solid #2A5A3A"}}>
                               <div style={{fontSize:9,color:"#7FD8A6",letterSpacing:2,marginBottom:6}}>
-                                📊 FINAL FEATURE VERDICTS — Wilcoxon signed-rank, p &lt; 0.05 two-sided ({continuousVerdicts.totalCycles} cycles)
+                                📊 FINAL FEATURE VERDICTS — binary decision applied to saved GBM ({continuousVerdicts.totalCycles} cycles, pool {continuousVerdicts.finalPoolSize} trades)
                               </div>
-                              <div style={{display:"grid",gridTemplateColumns:"0.5fr 2fr 0.8fr 0.8fr 0.8fr 0.8fr",gap:6,fontSize:9,rowGap:3}}>
+                              <div style={{display:"grid",gridTemplateColumns:"0.5fr 2fr 0.7fr 0.7fr 0.8fr 0.8fr 0.5fr",gap:6,fontSize:9,rowGap:3}}>
                                 <div style={{fontSize:8,color:"#555"}}>SLOT</div>
                                 <div style={{fontSize:8,color:"#555"}}>FEATURE</div>
                                 <div style={{fontSize:8,color:"#555"}}>VERDICT</div>
+                                <div style={{fontSize:8,color:"#555"}}>CONF</div>
                                 <div style={{fontSize:8,color:"#555"}}>MEDIAN Δ</div>
-                                <div style={{fontSize:8,color:"#555"}}>p-VALUE</div>
+                                <div style={{fontSize:8,color:"#555"}}>POST MEAN</div>
                                 <div style={{fontSize:8,color:"#555"}}>N OBS</div>
                                 {continuousVerdicts.verdicts.map(v => {
-                                  const col = v.verdict === "keep" ? "#2ECC71"
-                                           : v.verdict === "drop" ? "#E74C3C" : "#C9A84C";
+                                  const col = v.verdict === "KEEP" ? "#2ECC71" : "#E74C3C";
+                                  const confCol = v.confidence === "HIGH" ? "#2ECC71" : v.confidence === "MED" ? "#C9A84C" : "#888";
                                   return (
                                     <React.Fragment key={v.slot}>
                                       <div style={{color:"#888"}}>[{v.slot}]</div>
                                       <div style={{color:"#CCC"}}>{v.name}</div>
-                                      <div style={{color:col,fontWeight:700,textTransform:"uppercase"}}>{v.verdict}</div>
+                                      <div style={{color:col,fontWeight:700}}>{v.verdict}</div>
+                                      <div style={{color:confCol,fontSize:8}}>{v.confidence}</div>
                                       <div style={{color:"#888"}}>{v.median != null ? (v.median >= 0 ? "+" : "") + v.median.toFixed(4) : "—"}</div>
-                                      <div style={{color:"#888"}}>{v.pValue != null ? v.pValue.toFixed(3) : "n/a"}</div>
+                                      <div style={{color:"#888"}}>{v.postMean != null ? v.postMean.toFixed(3) : "—"}</div>
                                       <div style={{color:"#888"}}>{v.n}</div>
                                     </React.Fragment>
                                   );
                                 })}
                               </div>
                               <div style={{fontSize:8,color:"#555",marginTop:6,lineHeight:1.5}}>
-                                KEEP = median Δ &gt; 0 at p &lt; 0.05. DROP = median Δ &lt; 0 at p &lt; 0.05.
-                                UNCERTAIN = not significant, retained by default (run more cycles for power).
-                                Needs n ≥ 6 observations per feature for the normal-approximation test to apply.
+                                KEEP if median Δ &gt; 0 OR posterior mean &gt; 0.5. DROP otherwise. Every feature gets an
+                                actionable verdict — no uncertain purgatory. CONFIDENCE = HIGH when both signals agree
+                                strongly with n ≥ 4 observations; MED on signal disagreement; LOW on weak evidence.
+                                {continuousVerdicts.droppedSlots.length > 0
+                                  ? ` Saved GBM retrained on pool with slots ${continuousVerdicts.droppedSlots.map(s => `[${s}]`).join(" ")} masked — live predictions now use only the KEEP features.`
+                                  : ` All features kept — no mask applied to the final saved GBM.`}
                               </div>
                             </div>
                           )}
