@@ -2021,10 +2021,28 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
 
     // Config
     const ABLATE_EVERY = 3;
-    const POS_THRESHOLD = 0.002;
-    const NEG_THRESHOLD = -0.002;
-    const PRIOR_ALPHA = 1;
-    const PRIOR_BETA = 1;
+    // Noise-floor thresholds for posterior updates. Earlier value (±0.002)
+    // was ~20× below the per-cycle AUC noise floor (5-fold walk-forward
+    // std-dev runs ~0.05 on small crypto samples), so every tiny random
+    // fluctuation updated the posterior. User saw the pathology: all
+    // features converged to DROP because median delta across 6 noisy
+    // observations drifted slightly negative for everything. Raised to
+    // ±0.02 so only meaningful deltas count.
+    const POS_THRESHOLD = 0.02;
+    const NEG_THRESHOLD = -0.02;
+    // Quality gates: a cycle whose baseline AUC is indistinguishable from
+    // random (|AUC − 0.5| < 0.05) produces ablation deltas that are pure
+    // noise — no signal to harvest. Same for grossly overfit cycles
+    // (train-test gap > 0.15 = model fit the noise). Skip posterior
+    // updates on those cycles; delta archive still accumulates for the
+    // post-run median computation (with its own threshold).
+    const BASELINE_QUALITY_MIN = 0.05;  // |baselineAUC − 0.5|
+    const GAP_QUALITY_MAX = 0.15;        // train-test gap
+    // Stronger prior (was 1,1) resists single-observation shifts. With 6
+    // observations Beta(1,1) → Beta(1,7) → mean 0.125 is reachable from
+    // pure noise; Beta(2,2) → Beta(2,8) → mean 0.2 is more honest.
+    const PRIOR_ALPHA = 2;
+    const PRIOR_BETA = 2;
     // 7s pacing prevents saturating CoinGecko/Binance/Deribit rate
     // limits AND lets the UI repaint reliably between cycles — user
     // explicitly asked for this.
@@ -2080,13 +2098,29 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
       return x / (x + y);
     };
     // Sample mask from current posteriors: drop feature if p_i < 0.5.
+    // Safety floor: never drop more than 70% of targets in a single
+    // cycle — a fully-masked cycle produces no useful ablation (every
+    // slot's unioned mask is a no-op) AND the baseline AUC with zero
+    // features active is pure noise, which then pollutes posteriors
+    // for everything. Keep at least ceil(targets.length * 0.3) slots
+    // active per cycle. When Thompson wants to drop more, we KEEP the
+    // ones with highest posterior mean (most believed useful).
     const thompsonMask = () => {
-      const dropped = [];
+      const dropCandidates = [];
+      const perSlot = [];
       for (const t of targets) {
         const p = sampleBeta(posteriors[t.slot].alpha, posteriors[t.slot].beta);
-        if (p < 0.5) dropped.push(t.slot);
+        const postMean = posteriors[t.slot].alpha / (posteriors[t.slot].alpha + posteriors[t.slot].beta);
+        perSlot.push({ slot: t.slot, p, postMean });
+        if (p < 0.5) dropCandidates.push(t.slot);
       }
-      return dropped;
+      const maxDrops = Math.floor(targets.length * 0.7);
+      if (dropCandidates.length <= maxDrops) return dropCandidates;
+      // Too many would-be drops — rescue the ones with highest postMean
+      // (most-useful-believed) to respect the mask floor.
+      const sorted = perSlot.slice().sort((a, b) => b.postMean - a.postMean);
+      const rescued = new Set(sorted.slice(0, targets.length - maxDrops).map(x => x.slot));
+      return dropCandidates.filter(s => !rescued.has(s));
     };
 
 
@@ -2204,15 +2238,29 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         if (continuousAbortRef.current) break;
 
         // Update Beta posteriors from deltas AND accumulate full delta
-        // history for the post-run Wilcoxon test.
+        // history for the post-run median computation. Quality-gate the
+        // whole cycle: if baseline AUC is ~random or the train-test gap
+        // says the model is overfit, deltas are noise — archive but skip
+        // posterior updates. Without this gate, noise-dominated cycles
+        // ratchet every feature toward DROP (the user's pathology).
+        const baselineAUC = aucNow;
+        const baselineGap = gapNow;
+        const baselineIsNoise = baselineAUC == null
+          || Math.abs(baselineAUC - 0.5) < BASELINE_QUALITY_MIN
+          || (baselineGap != null && baselineGap > GAP_QUALITY_MAX);
         const posteriorUpdates = [];
         if (ablationDeltas) {
           for (const d of ablationDeltas) {
             if (d.delta == null) continue;
-            // Archive every observation for the final-verdict test
+            // Archive every observation for the final-verdict median —
+            // the median has its own noise-threshold test downstream.
             if (allDeltasPerSlot[d.slot]) allDeltasPerSlot[d.slot].push(d.delta);
             const post = posteriors[d.slot];
             if (!post) continue;
+            // Skip posterior update on noise-regime cycles. Delta archive
+            // still grows; the post-run median naturally absorbs noise by
+            // centering on zero for truly noisy features.
+            if (baselineIsNoise) continue;
             if (d.delta > POS_THRESHOLD) {
               post.alpha += 1;
               posteriorUpdates.push({ slot: d.slot, verdict: "helpful", delta: d.delta });
@@ -2301,20 +2349,36 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         })();
       const postMean = posteriors[t.slot].alpha / (posteriors[t.slot].alpha + posteriors[t.slot].beta);
 
-      // Binary decision. Use EITHER positive median Δ OR posterior mean
-      // above 0.5 — belt-and-braces so a single-signal indication is
-      // enough to keep. Drop only when BOTH signals say negative.
+      // Binary decision, asymmetric ("innocent until proven guilty").
+      // DROP requires BOTH the median delta AND the posterior mean to
+      // show meaningful negative evidence — not just hair-below-zero.
+      // Without this, noise medians like -0.005 on 6 observations were
+      // enough to drop a feature, leading to the pathology where every
+      // feature gets DROP because 6 noise samples cluster below zero
+      // for everything.
+      //
+      // Thresholds tuned to 5-fold WF noise floor (std-dev ~0.03 AUC
+      // per fold average → ~0.015 std-err across 5 folds → require the
+      // observed median to clear ~1.5σ before counting as evidence).
+      const DROP_MEDIAN_MAX = -0.02;      // median must be below this
+      const DROP_POSTERIOR_MAX = 0.45;     // posterior mean must be below this
+      const dropMedianEvidence = (median ?? 0) < DROP_MEDIAN_MAX;
+      const dropPosteriorEvidence = postMean < DROP_POSTERIOR_MAX;
+      const verdict = (dropMedianEvidence && dropPosteriorEvidence) ? "DROP" : "KEEP";
+
+      // Confidence: HIGH requires both signals strongly past threshold
+      // with >= 6 observations (at 20 cycles and ablate-every=3, that's
+      // every ablation cycle counting). MED if signals agree but one is
+      // weaker. LOW on disagreement or thin evidence.
       const medianPositive = (median ?? 0) > 0;
       const posteriorPositive = postMean > 0.5;
-      const verdict = (medianPositive || posteriorPositive) ? "KEEP" : "DROP";
-
-      // Confidence: both signals strong + >= 4 observations = HIGH,
-      // single signal or limited obs = LOW. Makes the user's retained
-      // trust calibrated.
-      const strongSignal = Math.abs(postMean - 0.5) > 0.15 || Math.abs(median ?? 0) > 0.01;
-      const confidence = (strongSignal && n >= 4)
-        ? (medianPositive === posteriorPositive ? "HIGH" : "MED")
-        : "LOW";
+      const strongMedian = Math.abs(median ?? 0) > 0.03;
+      const strongPosterior = Math.abs(postMean - 0.5) > 0.15;
+      const confidence = (n >= 6 && strongMedian && strongPosterior && (medianPositive === posteriorPositive))
+        ? "HIGH"
+        : (n >= 4 && (strongMedian || strongPosterior))
+          ? "MED"
+          : "LOW";
 
       verdicts.push({
         slot: t.slot,
@@ -3891,27 +3955,47 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                                 })}
                               </div>
                               <div style={{fontSize:8,color:"#555",marginTop:6,lineHeight:1.5}}>
-                                KEEP if median Δ &gt; 0 OR posterior mean &gt; 0.5. DROP otherwise. CONFIDENCE = HIGH when both signals
-                                agree strongly with n ≥ 4 observations; MED on signal disagreement; LOW on weak evidence.
-                                The saved GBM has been cold-retrained with the union of (persistent mask ∪ this run's DROPs) applied
-                                so the MODEL STATE panel reflects what APPLY would deliver.
+                                DROP requires BOTH median Δ &lt; −0.02 AND posterior mean &lt; 0.45 (asymmetric — innocent until
+                                proven guilty). CONFIDENCE = HIGH when |median| &gt; 0.03 and |postMean − 0.5| &gt; 0.15 with n ≥ 6.
+                                Noise-regime cycles (baseline AUC within ±0.05 of 0.5 or train-test gap &gt; 0.15) don't update
+                                posteriors. The saved GBM is cold-retrained with (persistent ∪ this run's DROPs) as preview.
                               </div>
                               {/* APPLY / CLEAR — commits the verdict to
                                   the persistent mask so it sticks across
                                   sessions and all training paths (scoring,
-                                  sim, continuous) honour it. This is the
-                                  single source of truth for "THE model's
-                                  feature set." */}
+                                  sim, continuous) honour it. Pathology
+                                  detection: a run that wants to drop
+                                  ≥70% of targets is noise-dominated, not
+                                  a real verdict — APPLY is blocked. The
+                                  user previously observed this: all 9
+                                  features getting DROP with HIGH confidence
+                                  when the run AUC was bouncing in [0.37,
+                                  0.70] and posteriors were driven by
+                                  noise-regime observations. */}
                               {(() => {
                                 const currentMaskInfo = getActiveMaskInfo(universe);
                                 const proposedDrops = continuousVerdicts.droppedSlots;
+                                const totalTargets = continuousVerdicts.verdicts.length;
+                                const dropFraction = totalTargets > 0 ? proposedDrops.length / totalTargets : 0;
+                                const pathological = totalTargets >= 3 && dropFraction >= 0.7;
                                 const newSlots = proposedDrops.filter(s => !currentMaskInfo.slots.includes(s));
                                 const unchanged = newSlots.length === 0 && proposedDrops.every(s => currentMaskInfo.slots.includes(s));
+                                const applyDisabled = unchanged || proposedDrops.length === 0 || pathological;
                                 return (
-                                  <div style={{marginTop:10,padding:"8px 10px",background:"#050A15",border:"1px solid #1A3A5A",borderRadius:2}}>
-                                    <div style={{fontSize:8,color:"#6A9FDF",letterSpacing:1.5,marginBottom:6}}>
-                                      COMMIT TO THE MODEL — persist this verdict system-wide
+                                  <div style={{marginTop:10,padding:"8px 10px",background:pathological?"#1A0505":"#050A15",border:`1px solid ${pathological?"#6A2A2A":"#1A3A5A"}`,borderRadius:2}}>
+                                    <div style={{fontSize:8,color:pathological?"#E74C3C":"#6A9FDF",letterSpacing:1.5,marginBottom:6}}>
+                                      {pathological ? "⚠ NOISE-DOMINATED RUN — APPLY BLOCKED" : "COMMIT TO THE MODEL — persist this verdict system-wide"}
                                     </div>
+                                    {pathological && (
+                                      <div style={{fontSize:8,color:"#E8A0A0",marginBottom:6,lineHeight:1.5,padding:"4px 6px",background:"#2A0A0A",border:"1px solid #4A1A1A"}}>
+                                        The run wants to drop {proposedDrops.length}/{totalTargets} features ({(dropFraction*100).toFixed(0)}%). When the
+                                        bandit drops nearly everything, it's almost always because per-cycle AUC variance is dominating the
+                                        per-feature signal — not a real verdict that the whole feature set is useless. Recommended action:
+                                        run MORE cycles (40+) to let the noise average out, OR reduce overfitting (shorter window, more data)
+                                        so baseline AUC stabilises above the 0.52 quality gate. APPLY is blocked to prevent committing a
+                                        model with no features.
+                                      </div>
+                                    )}
                                     <div style={{fontSize:8,color:"#888",marginBottom:6,lineHeight:1.5}}>
                                       Currently applied: <b style={{color:currentMaskInfo.slots.length?"#C97A7A":"#7FD8A6"}}>
                                         {currentMaskInfo.slots.length ? currentMaskInfo.slots.map(s => `[${s}]`).join(" ") : "no mask — all features active"}
@@ -3923,25 +4007,17 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                                     <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
                                       <button
                                         onClick={() => {
-                                          if (proposedDrops.length === 0) return;
+                                          if (applyDisabled) return;
                                           setActiveMask(universe, proposedDrops, { source: "continuous_verdict" });
-                                          // Cold-retrain with the now-persistent mask so the
-                                          // saved GBM reflects the committed feature set.
-                                          if (continuousVerdicts.finalPoolSize >= 20) {
-                                            // No way to access the pool from out here — the final
-                                            // retrain was already done before this button existed
-                                            // with the union mask applied. Saved model already
-                                            // matches the APPLY state; just persist the mask.
-                                          }
                                           setMaskVersion(v => v + 1);
                                         }}
-                                        disabled={unchanged || proposedDrops.length === 0}
-                                        style={{background:unchanged||proposedDrops.length===0?"#111":"#0F2A15",
-                                          border:`1px solid ${unchanged||proposedDrops.length===0?"#2A2A2A":"#4A8A5A"}`,
-                                          color:unchanged||proposedDrops.length===0?"#666":"#7FD8A6",
-                                          fontSize:9,padding:"6px 14px",cursor:unchanged||proposedDrops.length===0?"not-allowed":"pointer",
+                                        disabled={applyDisabled}
+                                        style={{background:applyDisabled?"#111":"#0F2A15",
+                                          border:`1px solid ${applyDisabled?"#2A2A2A":"#4A8A5A"}`,
+                                          color:applyDisabled?"#666":"#7FD8A6",
+                                          fontSize:9,padding:"6px 14px",cursor:applyDisabled?"not-allowed":"pointer",
                                           fontFamily:"inherit",letterSpacing:1.5,fontWeight:700}}>
-                                        {unchanged ? "✓ ALREADY APPLIED" : proposedDrops.length === 0 ? "NOTHING TO DROP" : `APPLY VERDICT → DROP ${proposedDrops.length} SLOT${proposedDrops.length===1?"":"S"}`}
+                                        {pathological ? "⚠ BLOCKED — NOISE-DOMINATED" : unchanged ? "✓ ALREADY APPLIED" : proposedDrops.length === 0 ? "NOTHING TO DROP" : `APPLY VERDICT → DROP ${proposedDrops.length} SLOT${proposedDrops.length===1?"":"S"}`}
                                       </button>
                                       <button
                                         onClick={() => {
