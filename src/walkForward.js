@@ -97,8 +97,17 @@ function maskFeatures(sample, slotsToZero) {
   return { ...sample, x };
 }
 
-export function runWalkForward(simTrades, opts = {}) {
-  const { folds = 5, epochs = 80, embargoSec = 3 * 60 * 60, modelKind = "nn", maskSlots = [] } = opts;
+// Async now (was sync). Yields to the event loop between folds so the
+// UI can repaint progress updates. Without this, a 5-fold walk-forward
+// on 2200 pooled trades holds the main thread for 2-5s and the browser
+// reports the state as stuck even though computation is progressing.
+// Callers must await.
+//
+// opts.onFoldProgress(foldIdx, totalFolds): optional callback fired
+// after each fold completes. Lets the caller update UI state like
+// "wf fold 3/5" per iteration instead of just "wf".
+export async function runWalkForward(simTrades, opts = {}) {
+  const { folds = 5, epochs = 80, embargoSec = 3 * 60 * 60, modelKind = "nn", maskSlots = [], onFoldProgress } = opts;
   // maskSlots: array of feature-vector indices to zero before both training
   // and prediction. Enables leave-one-out feature ablation — runAblation-
   // Study wraps this by calling runWalkForward multiple times with
@@ -282,6 +291,11 @@ export function runWalkForward(simTrades, opts = {}) {
       testBrier: brierScore(preds),
       metaTrained: !!metaPreds,
     });
+    // Yield to the event loop so the UI can repaint between folds.
+    // Without this, 5 folds × ~500ms each holds the main thread for
+    // 2-5s and the browser reports the state as frozen.
+    if (onFoldProgress) onFoldProgress(i, folds - 1);
+    await new Promise(r => setTimeout(r, 0));
   }
 
   if (foldResults.length === 0) {
@@ -415,7 +429,7 @@ export function runWalkForward(simTrades, opts = {}) {
 export async function runAblationStudy(simTrades, baseOpts = {}, targets = [], onProgress = null) {
   if (!simTrades?.length) return { error: "no trades provided" };
   // Baseline run — all features active.
-  const baseline = runWalkForward(simTrades, baseOpts);
+  const baseline = await runWalkForward(simTrades, baseOpts);
   if (baseline.error) return { error: `baseline: ${baseline.error}` };
   const baseAUC = baseline.overall?.oosAUC;
   if (baseAUC == null) return { error: "baseline produced no AUC" };
@@ -428,7 +442,7 @@ export async function runAblationStudy(simTrades, baseOpts = {}, targets = [], o
   const results = [];
   for (let ti = 0; ti < targets.length; ti++) {
     const t = targets[ti];
-    const masked = runWalkForward(simTrades, { ...baseOpts, maskSlots: [t.slot] });
+    const masked = await runWalkForward(simTrades, { ...baseOpts, maskSlots: [t.slot] });
     if (masked.error) {
       results.push({ ...t, auc: null, delta: null, error: masked.error });
     } else {

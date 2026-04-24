@@ -1575,15 +1575,14 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
     if (wfRunning || !simResult?.trades?.length) return;
     setWfRunning(true);
     setWfResult(null);
-    // Heavy CPU work — defer so the "running..." UI state paints first.
-    setTimeout(() => {
+    // runWalkForward is now async (yields between folds so UI can repaint).
+    // Setting state then awaiting lets the "running..." label render before
+    // the compute-heavy loop starts.
+    (async () => {
       try {
-        const out = runWalkForward(simResult.trades, {
+        await new Promise(r => setTimeout(r, 30));  // let "running" paint
+        const out = await runWalkForward(simResult.trades, {
           folds: 5, epochs: 80,
-          // Crypto: GBM-based walk-forward. 425-param NN on 24-sample
-          // folds over-fits noise into systematic anti-signal; GBM with
-          // val-loss early stopping stays near the prior on signal-free
-          // folds, giving an honest null AUC 0.50 instead of 0.44.
           modelKind: isCryptoUniverse(universe) ? "gbm" : "nn",
         });
         setWfResult(out);
@@ -1591,7 +1590,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         setWfResult({ error: err.message || String(err) });
       }
       setWfRunning(false);
-    }, 50);
+    })();
   }
 
   // ─── Multi-sim averaging ──────────────────────────────────────────────────
@@ -1680,7 +1679,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         setMultiSimState({ phase: "wf", run: i + 1, total: N_RUNS });
         // Brief yield so UI repaints between heavy WF runs.
         await new Promise(r => setTimeout(r, 30));
-        const wf = runWalkForward(res.trades, {
+        const wf = await runWalkForward(res.trades, {
           folds: 5, epochs: 60,
           modelKind: isCryptoUniverse(universe) ? "gbm" : "nn",
         });
