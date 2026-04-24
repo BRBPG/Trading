@@ -143,6 +143,55 @@ export function timeSeriesMomentumAt(bars, idx, lookback = 14, zWindow = 30) {
   return timeSeriesMomentum(slice, lookback, zWindow);
 }
 
+// ─── Realized-volatility regime feature (Phase 4 Commit 2) ──────────────────
+// Short-window RV ÷ long-window RV.
+// Ratio >1 = vol expanding (regime shift, post-compression breakout often).
+// Ratio <1 = vol compressing (coiling before move).
+// Centred at 0 (ratio=1 → 0), clipped to [-1,+1] via (ratio-1), then bounded.
+//
+// Research backing:
+//   - Catania & Sandholdt (2019), JRFM 12(1) — HAR-style RV features improve
+//     both volatility AND directional models on BTC.
+//   - Bergsli et al. (2022), Research in International Business and Finance
+//     59 — multi-horizon RV ratios act as regime indicators that carry
+//     forward-directional signal independent of OHLCV momentum features.
+//
+// Computed from log-returns (proper RV definition), not simple returns.
+// GBMs handle untransformed RV fine but the ratio formulation lets us use
+// a single clipped feature slot to carry a regime signal.
+function realizedVolAt(closes, idx, window) {
+  if (idx < window) return null;
+  let sum = 0, sumSq = 0;
+  for (let k = idx - window + 1; k <= idx; k++) {
+    if (closes[k - 1] <= 0 || closes[k] <= 0) return null;
+    const r = Math.log(closes[k] / closes[k - 1]);
+    sum += r;
+    sumSq += r * r;
+  }
+  const mean = sum / window;
+  const variance = sumSq / window - mean * mean;
+  return Math.sqrt(Math.max(0, variance));
+}
+
+// Backtest version — point-in-time using only bars[0..idx].
+export function rvRatioAt(bars, idx, shortW = 5, longW = 30) {
+  if (!bars?.closes || idx < longW + 1) return 0;
+  const rvShort = realizedVolAt(bars.closes, idx, shortW);
+  const rvLong  = realizedVolAt(bars.closes, idx, longW);
+  if (rvShort == null || rvLong == null || rvLong < 1e-9) return 0;
+  // Ratio centred at 1 (neutral regime). Map (ratio-1) into ±1 clip:
+  //   ratio=1.0 → 0     (neutral)
+  //   ratio=2.0 → +1    (vol doubled short-window vs long)
+  //   ratio=0.5 → -0.5  (vol halved — compressing)
+  return Math.max(-1, Math.min(1, rvShort / rvLong - 1));
+}
+
+// Live-path version — takes the latest bar series from a quote object.
+export function rvRatioLive(closes, shortW = 5, longW = 30) {
+  if (!closes || closes.length < longW + 1) return 0;
+  return rvRatioAt({ closes }, closes.length - 1, shortW, longW);
+}
+
 // ─── Cross-sectional momentum rank (Liu-Tsyvinski 2022) ─────────────────────
 // For the target symbol at a given timestamp, compute its 14-bar return's
 // percentile rank within the active universe's 14-bar returns AT THE SAME

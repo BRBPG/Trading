@@ -144,15 +144,15 @@ function extractFeatures(q, macro = null, calendar = null, pead = null, universe
   //
   //   slot  equity meaning          crypto meaning
   //   ----  ----------------------  ------------------------------
-  //   [7]   VIX z-score             BTC dominance z-score
+  //   [7]   VIX z-score             BTC dominance z-score (btc: 0)
   //   [8]   VIX term structure      time-series 14d momentum z
-  //   [9]   DXY momentum            cross-sectional mom rank (Liu-Tsyvinski)
+  //   [9]   DXY momentum            cross-sectional mom rank (btc: 0)
   //   [10]  TNX momentum            perp funding-rate z (Hazel 2021)
-  //   [11]  Oil momentum            (reserved — DVOL-RV spread step 3)
-  //   [12]  Gold momentum           0
-  //   [13]  TOD edge                0
-  //   [14]  PEAD daysSinceEarnings  0
-  //   [15]  PEAD surpriseDecayed    0
+  //   [11]  Oil momentum            (reserved — DVOL-RV spread, Commit 3)
+  //   [12]  Gold momentum           (reserved — OI z-score, Commit 4)
+  //   [13]  TOD edge                RV 5d/30d ratio (Catania 2019)
+  //   [14]  PEAD daysSinceEarnings  (reserved — DOW cyclical, Commit 5)
+  //   [15]  PEAD surpriseDecayed    (reserved — top L/S ratio z, Commit 6)
   //
   // crypto context arrives via macro.cryptoContext (set upstream by the
   // live loop or the backtest loop) containing dominanceZ, tsMom, xsMomRank.
@@ -172,7 +172,13 @@ function extractFeatures(q, macro = null, calendar = null, pead = null, universe
   // Slots 11-15: zeroed in crypto mode (slot 11 reserved for DVOL-RV step 3).
   const oil_mom  = isCrypto ? 0 : clip1((macro?.oilMom5  || 0) * 100);
   const gold_mom = isCrypto ? 0 : clip1((macro?.goldMom5 || 0) * 100);
-  const tod_edge = isCrypto ? 0 : clip0to1(calendar?.todEdge ?? 0.5);
+  // Slot [13]: equity retains time-of-day edge; crypto repurposes for
+  // realized-volatility regime (RV 5d/30d ratio, clipped ±1 via
+  // (short/long − 1)). Centred so 0 = neutral regime, positive = vol
+  // expanding, negative = compressing.
+  const tod_edge = isCrypto
+    ? clip1(macro?.cryptoContext?.rvRatio ?? 0)
+    : clip0to1(calendar?.todEdge ?? 0.5);
   const pead_days = isCrypto ? 0 : clip1(pead?.daysSinceEarnings ?? 0);
   const pead_surp = isCrypto ? 0 : clip1(pead?.surpriseDecayed ?? 0);
 
@@ -199,19 +205,16 @@ export const FEATURE_NAMES_CRYPTO = [
   "RSI", "MACD", "Mom", "BB", "EMA9/20", "EMA20/50", "Vol",
   "BTC_dom_z", "TS_mom_z",
   "XS_mom_rank", "Fund_z", "—", "—",
-  "—",
+  "RV_ratio",
   "—", "—",
 ];
-// BTC single-asset: XS momentum rank is structurally dead (n=1 has no
-// cross-section), so slot [9] is marked dead. The other crypto-native
-// features carry through. Future commits will populate slots [11-15]
-// with BTC-specific features (DVOL-RV spread, on-chain, etc.) — the
-// model still sees a 16-dim vector so storage shape stays stable.
+// BTC single-asset: slot [9] dead (no cross-section), slots [11-15] fill
+// incrementally per Phase 4 commit plan (DVOL-RV, OI z, DOW, L/S ratio).
 export const FEATURE_NAMES_BTC = [
   "RSI", "MACD", "Mom", "BB", "EMA9/20", "EMA20/50", "Vol",
-  "BTC_dom_z", "TS_mom_z",
+  "— (n/a single-asset)", "TS_mom_z",
   "— (n/a single-asset)", "Fund_z", "—", "—",
-  "—",
+  "RV_ratio",
   "—", "—",
 ];
 

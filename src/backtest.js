@@ -23,7 +23,7 @@ import { fetchPolygonBars, hasPolygonKey } from "./polygon";
 import { fetchMacroHistorical } from "./macro";
 import { calendarFeaturesAt } from "./calendar";
 import { computePeadFeatures } from "./earnings";
-import { timeSeriesMomentumAt, approximateDominanceZFromBTCReturns, xsMomRankAt } from "./crypto";
+import { timeSeriesMomentumAt, approximateDominanceZFromBTCReturns, xsMomRankAt, rvRatioAt } from "./crypto";
 import { fetchFundingForUniverse, fundingZAt } from "./funding";
 
 const YAHOO_PROXIES = [
@@ -455,6 +455,10 @@ export async function runBacktest(symbols, opts = {}) {
           ? 0
           : xsMomRankAt(symbol, bars.timestamps[i], universeReturns),
         fundingZ:   fundingRecs ? fundingZAt(fundingRecs, bars.timestamps[i], 21) : 0,
+        // RV regime: ratio of 5-bar realized vol / 30-bar realized vol,
+        // clipped centred at 0. Works on both daily and 5-min bars (the
+        // ratio is unit-free).
+        rvRatio:    rvRatioAt(bars, i, 5, 30),
       } : null;
       const baseMacro = macroHist?.at(bars.timestamps[i]) || null;
       const modelCtx = {
