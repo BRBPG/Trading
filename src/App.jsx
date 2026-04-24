@@ -38,15 +38,37 @@ const FH_METRIC = (sym, key) => `https://finnhub.io/api/v1/stock/metric?symbol=$
 // top-bar toggle.
 const EQUITY_WATCHLIST = ["SPY","QQQ","AAPL","MSFT","AMZN","NVDA","AMD","TSM","TSLA","IONQ","RGTI","UAL","USO","BNO","GLD","TW.L"];
 
-// Crypto top-10 by liquidity, Binance + Coinbase intersect. Yahoo chart API
-// supports these as "BTC-USD" etc natively — no new data adapter needed for
-// Phase 3a (Phase 3b will add Binance REST for funding/OI and Deribit for
-// DVOL which is the real feature upgrade).
+// Crypto universe — expanded from 10 → 20 to make cross-sectional momentum
+// rank (Liu-Tsyvinski 2022) statistically meaningful. At 8 symbols (when
+// BNB silent-drops) XS-rank has only 8 possible discrete percentile values,
+// which degenerates to near-random. 20 symbols give 5% resolution on
+// percentile, enough to pick up the documented XS-momentum edge if it's
+// present. Selected for:
+//   (a) Polygon Currencies Standard coverage (all serve as X:{SYM}USD)
+//   (b) Yahoo -USD fallback for redundancy
+//   (c) ≥1 year continuous trading history (no recent IPOs that lack the
+//       warmup buffer at 90-180d sim windows)
+//   (d) Sector diversity — L1s, DeFi, L2s, exchange tokens, legacy coins
 // MATIC was rebranded to POL in September 2024 when the Polygon ecosystem
 // migrated the native token. Polygon.io's ticker is now X:POLUSD and Yahoo
-// has migrated to POL-USD. MATIC-USD still exists on both sources but with
-// stale/no recent data. Using POL-USD gives clean forward history.
-const CRYPTO_WATCHLIST = ["BTC-USD","ETH-USD","SOL-USD","BNB-USD","XRP-USD","ADA-USD","AVAX-USD","LINK-USD","DOGE-USD","POL-USD"];
+// has migrated to POL-USD.
+const CRYPTO_WATCHLIST = [
+  // Top 10 by market cap / liquidity (original 3a universe)
+  "BTC-USD","ETH-USD","SOL-USD","BNB-USD","XRP-USD",
+  "ADA-USD","AVAX-USD","LINK-USD","DOGE-USD","POL-USD",
+  // Expansion: large-cap alts with multi-year history
+  "TRX-USD",  // Tron — L1, ~5y history
+  "LTC-USD",  // Litecoin — legacy major, ~14y history
+  "DOT-USD",  // Polkadot — L0/interop, ~5y history
+  "ATOM-USD", // Cosmos — IBC hub, ~6y
+  "UNI-USD",  // Uniswap — DeFi bluechip, ~5y
+  // Expansion: mid-cap L1s/L2s with ≥2y history
+  "NEAR-USD", // Near Protocol — L1
+  "APT-USD",  // Aptos — Move-based L1, launched Oct 2022
+  "ARB-USD",  // Arbitrum — L2, launched Mar 2023
+  "OP-USD",   // Optimism — L2, launched May 2022
+  "AAVE-USD", // Aave — DeFi lending bluechip
+];
 
 // Keep the legacy WATCHLIST symbol exported for anywhere that needs a
 // compile-time default — defaults to equities, will be overridden by the

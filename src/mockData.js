@@ -34,6 +34,18 @@ const VOL_PROFILES = {
   "LINK-USD":  { vol: 0.040 },
   "DOGE-USD":  { vol: 0.055 },
   "POL-USD":   { vol: 0.045 },  // formerly MATIC; Polygon ecosystem rebrand Sep 2024
+  // Expansion for XS-momentum rank (Phase 3d). Vol estimates are fallback-
+  // only; real data comes from Polygon/Yahoo when fetches succeed.
+  "TRX-USD":   { vol: 0.035 },
+  "LTC-USD":   { vol: 0.038 },
+  "DOT-USD":   { vol: 0.048 },
+  "ATOM-USD":  { vol: 0.050 },
+  "UNI-USD":   { vol: 0.048 },
+  "NEAR-USD":  { vol: 0.055 },
+  "APT-USD":   { vol: 0.060 },
+  "ARB-USD":   { vol: 0.058 },
+  "OP-USD":    { vol: 0.058 },
+  "AAVE-USD":  { vol: 0.050 },
 };
 
 // Synthetic-fallback starting prices. Rough ballpark — doesn't need to match
@@ -59,7 +71,18 @@ const FALLBACK_PRICES = {
   "AVAX-USD":  40,
   "LINK-USD":  18,
   "DOGE-USD":  0.38,
-  "POL-USD":   0.55,  // POL (formerly MATIC)
+  "POL-USD":   0.55,   // POL (formerly MATIC)
+  // Expansion — synthetic fallback ballparks only (real data via Polygon/Yahoo).
+  "TRX-USD":   0.18,
+  "LTC-USD":   88,
+  "DOT-USD":   7.20,
+  "ATOM-USD":  9.50,
+  "UNI-USD":   11.50,
+  "NEAR-USD":  5.80,
+  "APT-USD":   8.50,
+  "ARB-USD":   0.90,
+  "OP-USD":    2.20,
+  "AAVE-USD":  125,
 };
 
 function mulberry32(seed) {
