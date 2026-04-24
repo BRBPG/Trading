@@ -1862,10 +1862,22 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
     }
     setAblationRunning(true);
     setAblationResult(null);
-    // Per-universe targets: which feature slots to test. For crypto-family
-    // we target slots 7-15 (everything non-OHLCV). For equities, we'd
-    // target the macro/PEAD slots — deferred since equity didn't need
-    // this pivot.
+    // Per-universe ablation targets. The crypto and btc universes share
+    // most slots (slots 0-13) but differ on [14] and [15] after Phase 5
+    // Commit C (btc: Parkinson + Breakout; crypto retains DOW + TopLS).
+    // Labels reflect the ACTUAL feature in each slot so the ablation
+    // table doesn't mislabel what it's testing.
+    const btcTargets = [
+      { slot: 7,  name: "BTC dominance z (150-coin real)" },
+      { slot: 8,  name: "TS momentum z" },
+      { slot: 9,  name: "XS momentum rank (150-coin)" },
+      { slot: 10, name: "Perp funding z" },
+      { slot: 11, name: "DVOL-RV spread z" },
+      { slot: 12, name: "BTC OI Δlog z" },
+      { slot: 13, name: "RV 5d/30d ratio (close-to-close)" },
+      { slot: 14, name: "Parkinson 5d/30d ratio (hi-lo vol)" },
+      { slot: 15, name: "Breakout flag (20d Donchian)" },
+    ];
     const cryptoTargets = [
       { slot: 7,  name: "BTC dominance z" },
       { slot: 8,  name: "TS momentum z" },
@@ -1877,7 +1889,9 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
       { slot: 14, name: "DOW sin" },
       { slot: 15, name: "Top L/S contrarian z" },
     ];
-    const targets = isCryptoUniverse(universe) ? cryptoTargets : [];
+    const targets = universe === "btc" ? btcTargets
+                  : universe === "crypto" ? cryptoTargets
+                  : [];
     if (!targets.length) {
       setAblationResult({ error: "Ablation targets defined only for crypto/btc universes in this build." });
       setAblationRunning(false);

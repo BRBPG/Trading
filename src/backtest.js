@@ -23,7 +23,7 @@ import { fetchPolygonBars, hasPolygonKey } from "./polygon";
 import { fetchMacroHistorical } from "./macro";
 import { calendarFeaturesAt } from "./calendar";
 import { computePeadFeatures } from "./earnings";
-import { timeSeriesMomentumAt, approximateDominanceZFromBTCReturns, xsMomRankAt, rvRatioAt, dayOfWeekSinAt } from "./crypto";
+import { timeSeriesMomentumAt, approximateDominanceZFromBTCReturns, xsMomRankAt, rvRatioAt, dayOfWeekSinAt, parkinsonRatioAt, breakoutFlagAt } from "./crypto";
 import { fetchFundingForUniverse, fundingZAt } from "./funding";
 import { fetchDvolHistory, dvolRvSpreadAt } from "./dvol";
 import { fetchBtcOIHistory, oiZAt, fetchBtcTopLSHistory, topLSZAt } from "./openInterest";
@@ -574,6 +574,17 @@ export async function runBacktest(symbols, opts = {}) {
         breadth:    bmBreadth ?? 0,
         topLSZ:     (lsRecords && symbol === "BTC-USD")
                       ? topLSZAt(lsRecords, bars.timestamps[i], 21) : 0,
+        // Phase 5 Commit C: Parkinson 5d/30d volatility ratio. Intraday
+        // high-low-based vol (~5x more efficient than close-to-close per
+        // Parkinson 1980). Orthogonal to RV ratio at slot [13] which uses
+        // closing prices. Populated on all crypto universes but only
+        // consumed on btc (slot [14]) per the ablation-driven swap.
+        parkinsonRatio: isDaily ? parkinsonRatioAt(bars, i, 5, 30) : 0,
+        // Phase 5 Commit C: 20-day Donchian breakout flag ∈ {-1, 0, +1}.
+        // Close vs rolling prior-20-bar high/low. Documented BTC edge
+        // via Hudson-Urquhart 2021 and Detzel et al. 2021. Consumed on
+        // btc (slot [15]).
+        breakoutFlag:   isDaily ? breakoutFlagAt(bars, i, 20) : 0,
       } : null;
       const baseMacro = macroHist?.at(bars.timestamps[i]) || null;
       const modelCtx = {

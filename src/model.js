@@ -188,23 +188,33 @@ function extractFeatures(q, macro = null, calendar = null, pead = null, universe
   const tod_edge = isCrypto
     ? clip1(macro?.cryptoContext?.rvRatio ?? 0)
     : clip0to1(calendar?.todEdge ?? 0.5);
-  // Slot [14] — three-way split:
-  //   btc universe:    market breadth (% of top-150 with positive 14d
-  //                    return, centred 0). Replaced DOW_sin after Phase 4
-  //                    ablation showed Δ = −0.026 (actively harmful noise).
-  //   crypto universe: DOW_sin retained. Changing the slot here would
-  //                    require retraining existing crypto weights; deferred
-  //                    to a unified sweep when crypto also gets broad-market.
+  // Slot [14] — three-way split (Phase 5 Commit C update):
+  //   btc universe:    Parkinson 5d/30d volatility ratio (hi-lo-based,
+  //                    ~5x more statistically efficient than close-to-
+  //                    close RV at slot [13] — Parkinson 1980, Petukhina
+  //                    2021, Ardia 2019 on BTC). Replaces breadth (which
+  //                    replaced DOW_sin); research indicated Parkinson is
+  //                    the highest-orthogonality single addition given
+  //                    the rest of the feature set.
+  //   crypto universe: DOW_sin retained (changing it would require
+  //                    retraining existing crypto weights).
   //   equity:          PEAD daysSinceEarnings (unchanged).
   const pead_days = universe === "btc"
-    ? clip1(macro?.cryptoContext?.breadth ?? 0)
+    ? clip1(macro?.cryptoContext?.parkinsonRatio ?? 0)
     : isCrypto
     ? clip1(macro?.cryptoContext?.dowSin ?? 0)
     : clip1(pead?.daysSinceEarnings ?? 0);
-  // Slot [15]: crypto = top-trader L/S contrarian z (Kakinaka-Umeno 2022,
-  // sign pre-flipped in topLSZAt so positive = contrarian bullish);
-  // equity = PEAD surpriseDecayed.
-  const pead_surp = isCrypto
+  // Slot [15] — same three-way split (Phase 5 Commit C update):
+  //   btc universe:    20-day Donchian breakout flag ∈ {-1, 0, +1}.
+  //                    Classic Turtle signal; Hudson-Urquhart 2021 and
+  //                    Detzel 2021 document BTC-specific OOS edge. GBMs
+  //                    exploit discrete ternary features via axis-aligned
+  //                    splits — natural fit.
+  //   crypto universe: top-trader L/S contrarian z (Kakinaka-Umeno 2022).
+  //   equity:          PEAD surpriseDecayed (unchanged).
+  const pead_surp = universe === "btc"
+    ? clip1(macro?.cryptoContext?.breakoutFlag ?? 0)
+    : isCrypto
     ? clip1(macro?.cryptoContext?.topLSZ ?? 0)
     : clip1(pead?.surpriseDecayed ?? 0);
 
@@ -242,7 +252,7 @@ export const FEATURE_NAMES_BTC = [
   "BTC_dom_z", "TS_mom_z",
   "XS_rank_150", "Fund_z", "DVOL-RV_z", "OI_z",
   "RV_ratio",
-  "Breadth_150", "TopLS_z",
+  "Park_ratio", "Breakout_20d",
 ];
 
 function logisticScoreFromFeatures(f, universe = "equities") {

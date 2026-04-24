@@ -216,6 +216,91 @@ export function dayOfWeekSinAt(timestampSec) {
   return Math.sin(2 * Math.PI * dow / 7);
 }
 
+// ─── Parkinson volatility ratio (Phase 5 Commit C, slot [14] on btc) ───────
+// Parkinson (1980) range-based estimator:
+//   σ²_P = (1 / (4·ln(2))) · mean(ln(H/L)²)
+// Uses the intraday high-low range instead of close-to-close returns.
+// Statistically ~5× more efficient than close-to-close for capturing
+// true volatility (Parkinson's original proof; confirmed on BTC daily
+// by Petukhina et al. 2021 Q.Finance and Ardia/Bluteau/Rüede 2019 FRL).
+// On BTC specifically Liu-Tsyvinski-Wu (RFS 2022) use range-based vol
+// as a distinct factor from close-to-close RV.
+//
+// This feature is ORTHOGONAL to our existing RV 5d/30d slot [13] (which
+// is close-to-close): it captures overnight / intra-bar volatility
+// bursts that closing-price methods systematically miss.
+//
+// Ratio formulation: Parkinson_5d / Parkinson_30d, centred at 0 via
+// (ratio − 1), clipped ±1.
+function parkinsonVolAt(highs, lows, idx, window) {
+  if (idx < window) return null;
+  const L2 = Math.log(2);
+  let sumLogSq = 0;
+  let count = 0;
+  for (let k = idx - window + 1; k <= idx; k++) {
+    const h = highs[k], l = lows[k];
+    if (h <= 0 || l <= 0 || h < l) continue;
+    const lnHL = Math.log(h / l);
+    sumLogSq += lnHL * lnHL;
+    count++;
+  }
+  if (count < window - 2) return null;
+  const variance = sumLogSq / (4 * L2 * count);
+  return Math.sqrt(Math.max(0, variance));
+}
+
+export function parkinsonRatioAt(bars, idx, shortW = 5, longW = 30) {
+  if (!bars?.highs || !bars?.lows || idx < longW) return 0;
+  const pShort = parkinsonVolAt(bars.highs, bars.lows, idx, shortW);
+  const pLong  = parkinsonVolAt(bars.highs, bars.lows, idx, longW);
+  if (pShort == null || pLong == null || pLong < 1e-9) return 0;
+  return Math.max(-1, Math.min(1, pShort / pLong - 1));
+}
+
+// Live-path Parkinson ratio — takes a quote's full bar history.
+export function parkinsonRatioLive(highs, lows, shortW = 5, longW = 30) {
+  if (!highs || !lows || highs.length < longW + 1) return 0;
+  return parkinsonRatioAt({ highs, lows }, highs.length - 1, shortW, longW);
+}
+
+// ─── Donchian 20-day breakout flag (Phase 5 Commit C, slot [15] on btc) ────
+// Classic Turtle-trader signal. +1 if today's close > rolling 20-day
+// high excluding today, -1 if < 20-day low, 0 otherwise.
+//
+// Documented BTC edge:
+//   - Hudson & Urquhart (2021), European Journal of Finance — Donchian/
+//     breakout rules survive transaction costs on BTC where most
+//     technical rules do not.
+//   - Detzel, Liu, Strauss, Zhou, Zhu (2021), Management Science —
+//     "Learning and Predictability via Technical Analysis: Evidence
+//     from Bitcoin." Moving-average / breakout signals carry OOS
+//     predictive power on BTC returns.
+//
+// Why GBMs love this: axis-aligned splits. A tree can easily express
+// "if breakout_flag >= 0.5 then branch A" which is exactly the signal
+// structure the feature carries. Discrete ternary output ∈ {-1, 0, +1}.
+//
+// Uses previous N bars' high/low EXCLUDING current bar (point-in-time
+// safe — we decide at bar T based on bars 0..T-1's structure).
+export function breakoutFlagAt(bars, idx, window = 20) {
+  if (!bars?.highs || !bars?.lows || !bars?.closes || idx < window) return 0;
+  const close = bars.closes[idx];
+  if (!(close > 0)) return 0;
+  let priorHigh = -Infinity, priorLow = Infinity;
+  for (let k = idx - window; k < idx; k++) {
+    if (bars.highs[k] > priorHigh) priorHigh = bars.highs[k];
+    if (bars.lows[k] > 0 && bars.lows[k] < priorLow) priorLow = bars.lows[k];
+  }
+  if (close > priorHigh) return 1;
+  if (close < priorLow)  return -1;
+  return 0;
+}
+
+export function breakoutFlagLive(highs, lows, closes, window = 20) {
+  if (!highs || !lows || !closes || closes.length < window + 1) return 0;
+  return breakoutFlagAt({ highs, lows, closes }, closes.length - 1, window);
+}
+
 // ─── Cross-sectional momentum rank (Liu-Tsyvinski 2022) ─────────────────────
 // For the target symbol at a given timestamp, compute its 14-bar return's
 // percentile rank within the active universe's 14-bar returns AT THE SAME
