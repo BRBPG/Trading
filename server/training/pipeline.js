@@ -107,7 +107,7 @@ export async function runTrainingPipeline(polygonKey) {
   const results = {};
   clearSimCache();
 
-  for (const universe of ["equities", "crypto", "btc"]) {
+  for (const universe of ["btc"]) {
     log(`\n--- Universe: ${universe} ---`);
     try {
       const simTrades = await buildSimTrades(universe, polygonKey);

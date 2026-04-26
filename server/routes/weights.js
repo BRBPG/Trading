@@ -9,7 +9,7 @@ import { getLastRunReport } from "../training/pipeline.js";
 const router = Router();
 
 router.get("/weights", (req, res) => {
-  const universes = ["equities", "crypto", "btc"];
+  const universes = ["btc"];
   const weights = {};
   for (const u of universes) {
     weights[u] = {
@@ -25,7 +25,7 @@ router.get("/weights", (req, res) => {
 
 router.get("/status", (req, res) => {
   const report = getLastRunReport();
-  const universes = ["equities", "crypto", "btc"];
+  const universes = ["btc"];
   const models = {};
   for (const u of universes) {
     models[u] = {
