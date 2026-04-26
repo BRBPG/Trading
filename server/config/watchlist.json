@@ -1,0 +1,14 @@
+{
+  "equities": ["SPY","QQQ","AAPL","MSFT","AMZN","NVDA","AMD","TSM","TSLA","IONQ","RGTI","UAL","USO","BNO","GLD","TW.L"],
+  "crypto": [
+    "BTC-USD","ETH-USD","SOL-USD","BNB-USD","XRP-USD",
+    "ADA-USD","AVAX-USD","LINK-USD","DOGE-USD","POL-USD",
+    "TRX-USD","LTC-USD","DOT-USD","ATOM-USD","UNI-USD",
+    "NEAR-USD","APT-USD","ARB-USD","OP-USD","AAVE-USD",
+    "BCH-USD","ETC-USD","XLM-USD","HBAR-USD","ICP-USD",
+    "FIL-USD","ALGO-USD","VET-USD","STX-USD","IMX-USD",
+    "MKR-USD","CRV-USD","LDO-USD","SNX-USD","COMP-USD",
+    "GRT-USD","SUI-USD","SEI-USD","TIA-USD","RUNE-USD"
+  ],
+  "btc": ["BTC-USD"]
+}
