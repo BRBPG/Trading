@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
 import { generateMockQuote, generateLiveIndicators, computeIndicators } from "./mockData";
-import { scoreSetup, logDecision, reviewDecision, getPerformanceStats, getLog, adaptWeights, resetWeights, getCurrentWeights, trainNNFromLog, trainNNFromSim, resetNN, getNNInfo, trainGBMFromSim, trainGBMFromLog, resetGBM, getGBMInfo, trainRegimeFromSim, resetRegime, FEATURE_NAMES } from "./model";
+import { scoreSetup, logDecision, reviewDecision, getPerformanceStats, getLog, adaptWeights, resetWeights, saveWeights, getCurrentWeights, trainNNFromLog, trainNNFromSim, resetNN, getNNInfo, trainGBMFromSim, trainGBMFromLog, resetGBM, getGBMInfo, trainRegimeFromSim, resetRegime, FEATURE_NAMES } from "./model";
 import { loadGBM, predictGBM, getActiveMask, setActiveMask, clearActiveMask, getActiveMaskInfo } from "./gbm";
 import { computeSimMetrics, summariseEdge } from "./simMetrics";
 import { runWalkForward, interpretWF, runAblationStudy } from "./walkForward";
@@ -1127,6 +1127,32 @@ export default function App() {
   const [broadMarketSnapshot, setBroadMarketSnapshot] = useState(null);
   const chatRef = useRef(null);
   const importInputRef = useRef(null);
+  const [serverStatus, setServerStatus] = useState(null);
+
+  // Hydrate LR weights from server on mount; fall back to localStorage defaults if offline.
+  useEffect(() => {
+    fetch("/api/weights")
+      .then(r => r.ok ? r.json() : null)
+      .then(data => {
+        if (!data?.[universe]?.lr?.weights) return;
+        const { weights, bias } = data[universe].lr;
+        if (weights?.length === 16) saveWeights(weights, bias, universe);
+      })
+      .catch(() => {});
+  }, [universe]);
+
+  // Poll server status every 60 seconds for the status panel.
+  useEffect(() => {
+    function fetchStatus() {
+      fetch("/api/status")
+        .then(r => r.ok ? r.json() : null)
+        .then(setServerStatus)
+        .catch(() => setServerStatus(null));
+    }
+    fetchStatus();
+    const id = setInterval(fetchStatus, 60_000);
+    return () => clearInterval(id);
+  }, []);
 
   // Cross-device sync: trigger the hidden file picker, parse the dropped JSON,
   // restore log + LR + NN weights, then refresh React state from localStorage
@@ -2218,6 +2244,12 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         // extraMaskSlots so the loop searches AROUND the committed
         // verdict rather than against it.
         trainGBMFromSim(res.trades, universe, { extraMaskSlots: thompsonDrops });
+        // Train NN on the same batch (warm-start, universe-specific storage).
+        // The NN uses stronger L2 (0.01) inside trainNNFromSim for crypto/BTC
+        // to prevent memorization at typical trade counts. Its ensemble weight
+        // ramps conservatively (0→0.15 as trainedOn grows to 300) so it can
+        // only nudge — not override — the GBM's signal.
+        trainNNFromSim(res.trades, universe);
         // Keep the recent trades for the final feature-mask retrain at
         // run end (500-trade sliding window; we specifically want RECENT
         // data there, not historical, so FIFO is correct for this use).
@@ -2866,6 +2898,18 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
             }) : null;
             return (
               <div style={{flex:1,overflowY:"auto",padding:14,fontSize:11,color:"#888"}}>
+                {serverStatus ? (
+                  <div style={{marginBottom:10,padding:"6px 10px",background:"#0A1A0A",border:"1px solid #1A3A1A",fontSize:10}}>
+                    <span style={{color:"#7FD8A6",fontWeight:700,letterSpacing:1}}>◈ SERVER </span>
+                    <span style={{color:"#555"}}>last train: </span>
+                    <span style={{color:"#888"}}>{serverStatus.lastRun?.completedAt ? new Date(serverStatus.lastRun.completedAt).toLocaleString() : "never"}</span>
+                    <span style={{color:"#333",margin:"0 6px"}}>·</span>
+                    <span style={{color:"#555"}}>up </span>
+                    <span style={{color:"#888"}}>{Math.floor(serverStatus.uptime/3600)}h{Math.floor((serverStatus.uptime%3600)/60)}m</span>
+                  </div>
+                ) : (
+                  <div style={{marginBottom:10,padding:"4px 8px",background:"#111",border:"1px solid #222",fontSize:10,color:"#444"}}>server offline — local weights</div>
+                )}
                 {!m ? (
                   <div style={{padding:8,background:"#1A0F0F",border:"1px solid #4A1A1A",color:"#E74C3C",fontSize:10,lineHeight:1.6}}>
                     No quote loaded for <b>{selected}</b>.<br/>
@@ -4742,7 +4786,24 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                         {d.modelScore?.direction} · {d.modelScore?.treeSignal} · {d.modelScore?.confidence}%
                       </div>
                       {!d.reviewed&&!isAvoid&&currentPrice&&(
-                        <button onClick={()=>setDecisionLog(reviewDecision(d.id, currentPrice))}
+                        <button onClick={()=>{
+                          const updated = reviewDecision(d.id, currentPrice);
+                          setDecisionLog(updated);
+                          const reviewed = updated.find(e => e.id === d.id);
+                          if (reviewed?.features && reviewed?.outcome) {
+                            fetch("/api/outcome", {
+                              method: "POST",
+                              headers: { "Content-Type": "application/json" },
+                              body: JSON.stringify({
+                                symbol: reviewed.symbol,
+                                verdict: reviewed.verdict,
+                                outcome: reviewed.outcome,
+                                features: reviewed.features,
+                                universe,
+                              }),
+                            }).catch(()=>{});
+                          }
+                        }}
                           style={{marginTop:6,background:"#1A1500",border:"1px solid #C9A84C",color:"#C9A84C",
                             fontSize:9,padding:"3px 8px",cursor:"pointer",fontFamily:"inherit",letterSpacing:1}}>
                           ✓ REVIEW (${currentPrice?.toFixed(2)})

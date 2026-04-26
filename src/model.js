@@ -49,7 +49,7 @@ function loadWeights(universe = "equities") {
   return defaultWeightsFor(universe);
 }
 
-function saveWeights(weights, bias, universe = "equities") {
+export function saveWeights(weights, bias, universe = "equities") {
   localStorage.setItem(weightsKeyFor(universe), JSON.stringify({ weights, bias, updatedAt: new Date().toISOString() }));
 }
 
@@ -521,17 +521,20 @@ export function scoreSetup(q, context = {}) {
   // specific rules can be layered back in Phase 3c+ with learned rather
   // than hand-coded thresholds.
   const treeWeight = isCrypto ? 0 : (0.20 + 0.20 * (tree.strength ?? 0.5));
-  // NN weight muted in crypto. At current data scales (~20-run × 8-symbol
-  // sims → ~120 trades → 24 per walk-forward fold) a 425-param NN has
-  // ~18:1 param-to-sample ratio and memorises noise into systematic
-  // anti-signal (observed multi-sim AUC 0.446 below random). GBM with
-  // val-loss truncation stays near the prior on signal-free folds
-  // (honest AUC 0.50). Rehabilitate if/when Phase 3d features push us
-  // past that baseline AND sample count grows.
-  const nnWeight   = (nnReady && !isCrypto) ? Math.min(0.30, nnInfo.trainedOn  / 150) : 0;
+  // NN weight: equity gets up to 30% at ≥150 samples; BTC/crypto gets up to
+  // 15% but requires ≥300 samples to reach the cap. The lower cap + higher
+  // sample threshold compensates for the param-to-sample ratio being ~2×
+  // worse in BTC (433 params vs typical 100-300 BTC trades). L2 and early
+  // stopping in trainNNFromSim handle the rest. Stronger L2 is also applied
+  // at training time (0.01 vs 0.003) so the weights that reach inference are
+  // already shrunk toward zero on noisy features.
+  const nnWeight   = nnReady
+    ? (isCrypto ? Math.min(0.15, nnInfo.trainedOn / 300) : Math.min(0.30, nnInfo.trainedOn / 150))
+    : 0;
   const gbmWeight  = gbmReady ? Math.min(0.45, gbmInfo.trainedOn / 100) : 0;
-  // Crypto LR weight bumped to 0.60 (from 0.40) to fill the capacity
-  // freed by zeroing tree + NN. LR + GBM carry production in crypto.
+  // LR weight at 0.60 for crypto (GBM + NN + LR carry production; tree is
+  // muted). Normalisation divides through totalRaw so the exact 0.60 just
+  // sets the LR-to-GBM priority ratio; total always sums to 1.0.
   const lrWeight   = isCrypto ? 0.60 : 0.40;
   const totalRaw   = lrWeight + treeWeight + nnWeight + gbmWeight;
 
@@ -570,11 +573,12 @@ export function scoreSetup(q, context = {}) {
   const treeDir = treeScore > 0.5 ? 1 : -1;
   const nnDir   = nnReady  ? (nnProb  > 0.5 ? 1 : -1) : null;
   const gbmDir  = gbmReady ? (gbmProb > 0.5 ? 1 : -1) : null;
-  // Tree and NN both excluded from crypto agreement counting — tree for
-  // equity-mean-reversion calibration, NN for systematic overfit on
-  // small folds. Only LR + GBM count toward crypto consensus.
+  // Tree excluded from crypto — equity mean-reversion rules fire backwards
+  // on momentum-native BTC. NN is now re-enabled for BTC/crypto (with
+  // stronger L2 + lower ensemble cap) so it counts toward consensus when
+  // trained. GBM always counts when ready.
   const dirs = isCrypto ? [lrDir] : [lrDir, treeDir];
-  if (nnReady && !isCrypto) dirs.push(nnDir);
+  if (nnReady) dirs.push(nnDir);
   if (gbmReady) dirs.push(gbmDir);
   let agreeCount = 0, agreeTotal = 0;
   for (let i = 0; i < dirs.length; i++) {
@@ -687,7 +691,12 @@ export function trainNNFromSim(simTrades, universe = "equities") {
       y: deriveBullishLabel(d),
       ageDays: d.ageDays || 0,
     }));
-  return trainNNRaw(samples, { universe });
+  // Crypto/BTC: stronger L2 (0.01 vs default 0.003) to resist memorization
+  // at typical small sample counts (100-300 trades, 433 params). Val split +
+  // early stopping remain the primary guard; L2 adds weight-magnitude pressure
+  // that prevents any single feature from dominating on a noisy mini-batch.
+  const isCrypto = universe === "crypto" || universe === "btc";
+  return trainNNRaw(samples, { universe, ...(isCrypto ? { l2: 0.01, epochs: 100 } : {}) });
 }
 
 // Back-compat alias — older imports of trainNN keep working (= log training).
