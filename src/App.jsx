@@ -2145,12 +2145,14 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         }
         if (continuousAbortRef.current) break;
 
-        // Update Beta posteriors from deltas AND accumulate full delta
-        // history for the post-run median computation. Quality-gate the
-        // whole cycle: if baseline AUC is ~random or the train-test gap
-        // says the model is overfit, deltas are noise — archive but skip
-        // posterior updates. Without this gate, noise-dominated cycles
-        // ratchet every feature toward DROP (the user's pathology).
+        // Update normal-normal posteriors from each cycle's paired Δs and
+        // accumulate the full delta history for the post-run median
+        // sparkline. The previous baseline-quality gate (skip updates when
+        // |AUC−0.5| or train/test gap suggested noise) is no longer needed:
+        // the conjugate update is robust to one bad cycle, and the ±0.10
+        // clip below caps any single-cycle outlier Δ before it can pull
+        // the posterior. baselineAUC and baselineGap are still computed
+        // for the per-cycle results table.
         const baselineAUC = aucNow;
         const baselineGap = gapNow;
         const posteriorUpdates = [];
