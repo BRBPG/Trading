@@ -1,46 +1,54 @@
 // ─── Cross-device state persistence ─────────────────────────────────────────
-// Everything the trader system "learns" — the decision log, the LR weights,
-// the NN weights — lives in the browser's localStorage. That's per-device,
+// Everything the trader system "learns" — the decision log and the trained
+// model state — lives in the browser's localStorage. That's per-device,
 // per-browser. Open the app on a different laptop and you start from scratch.
 //
 // To make state portable without standing up a backend, we expose two manual
 // operations:
 //   exportState() → produces a JSON blob the user downloads as a file
-//   importState(json) → restores all three keys from a previously-exported file
+//   importState(json) → restores all keys from a previously-exported file
 //
 // API keys are deliberately NOT included in the export — those would be a
 // security hole if the file were ever shared or stored in the wrong place.
+//
+// Universe is hard-pinned to "btc" (App.jsx). Storage keys must match the
+// per-universe keys in nn.js / gbm.js / model.js / bagging.js / regime.js,
+// otherwise EXPORT/IMPORT silently round-trips empty slots.
 
 const KEYS = {
-  log:       "trader_decision_log",
-  lrWeights: "trader_lr_weights_v3",
-  nnWeights: "trader_nn_weights_v3",
-  lrBag:     "trader_lr_bag_v2",    // bag storage unchanged; 16-dim works fine
-  gbm:       "trader_gbm_v1",        // gradient-boosted trees model
-  earnings:  "trader_earnings_cache_v1", // earnings cache (optional export)
+  log:        "trader_decision_log",
+  lrWeights:  "trader_lr_weights_v5_btc",
+  nnWeights:  "trader_nn_weights_v5_btc",
+  lrBag:      "trader_lr_bag_v4_btc",
+  gbm:        "trader_gbm_v3_btc",
+  activeMask: "trader_active_mask_v1_btc",
+  regime:     "trader_regime_v3_btc",
+  earnings:   "trader_earnings_cache_v1",
 };
 
-// Bumped to 3 with the 16-dim feature vector (added PEAD). Imports from
-// v1/v2 payloads still work — old weights are simply ignored on shape
-// mismatch; the log always restores regardless of version.
-const SCHEMA_VERSION = 3;
-const COMPATIBLE_SCHEMAS = [1, 2, 3];
+// v4: BTC-only payload covering NN, GBM, LR, LR-bag, regime, and active
+// mask. v3 and earlier exports were equity-keyed and are no longer
+// readable — they round-tripped empty slots anyway, so nothing of value
+// is lost by rejecting them.
+const SCHEMA_VERSION = 4;
+const COMPATIBLE_SCHEMAS = [4];
 
 export function exportState() {
-  const payload = {
+  return {
     schemaVersion: SCHEMA_VERSION,
     exportedAt: new Date().toISOString(),
     appName: "the-trader",
-    log:       safeParse(localStorage.getItem(KEYS.log)) ?? [],
-    lrWeights: safeParse(localStorage.getItem(KEYS.lrWeights)) ?? null,
-    nnWeights: safeParse(localStorage.getItem(KEYS.nnWeights)) ?? null,
-    lrBag:     safeParse(localStorage.getItem(KEYS.lrBag)) ?? null,
-    gbm:       safeParse(localStorage.getItem(KEYS.gbm)) ?? null,
+    universe: "btc",
+    log:        safeParse(localStorage.getItem(KEYS.log)) ?? [],
+    lrWeights:  safeParse(localStorage.getItem(KEYS.lrWeights)) ?? null,
+    nnWeights:  safeParse(localStorage.getItem(KEYS.nnWeights)) ?? null,
+    lrBag:      safeParse(localStorage.getItem(KEYS.lrBag)) ?? null,
+    gbm:        safeParse(localStorage.getItem(KEYS.gbm)) ?? null,
+    activeMask: safeParse(localStorage.getItem(KEYS.activeMask)) ?? null,
+    regime:     safeParse(localStorage.getItem(KEYS.regime)) ?? null,
   };
-  return payload;
 }
 
-// Trigger a browser file download for the export blob.
 export function downloadExport() {
   const payload = exportState();
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
@@ -56,19 +64,26 @@ export function downloadExport() {
   return payload;
 }
 
-// Restore all three keys from a payload object.
+// Restore all keys from a payload object.
 // mode: "replace" wipes the existing log; "merge" appends new entries by id.
 export function importState(payload, { mode = "replace" } = {}) {
   if (!payload || typeof payload !== "object") {
     throw new Error("Invalid import: not an object.");
   }
-  if (payload.schemaVersion !== SCHEMA_VERSION) {
-    throw new Error(`Unsupported schema version ${payload.schemaVersion}; expected ${SCHEMA_VERSION}.`);
+  if (!COMPATIBLE_SCHEMAS.includes(payload.schemaVersion)) {
+    throw new Error(`Unsupported schema version ${payload.schemaVersion}; expected ${SCHEMA_VERSION}. Older exports were equity-keyed and contain no BTC model state.`);
   }
 
-  const restored = { log: 0, lrWeights: false, nnWeights: false };
+  const restored = {
+    log: 0,
+    lrWeights: false,
+    nnWeights: false,
+    lrBag: false,
+    gbm: false,
+    activeMask: false,
+    regime: false,
+  };
 
-  // Decision log
   if (Array.isArray(payload.log)) {
     if (mode === "merge") {
       const existing = safeParse(localStorage.getItem(KEYS.log)) ?? [];
@@ -85,15 +100,13 @@ export function importState(payload, { mode = "replace" } = {}) {
     }
   }
 
-  // Logistic-regression weights. Shape check matches current FEATURE_DIM (16)
-  // for v3. Older exports with 7 or 14 weights are silently skipped — they'd
-  // crash at inference since scoreSetup expects 16-dim features.
+  // LR weights — 16-dim BTC feature vector.
   if (payload.lrWeights && Array.isArray(payload.lrWeights.weights) && payload.lrWeights.weights.length === 16) {
     localStorage.setItem(KEYS.lrWeights, JSON.stringify(payload.lrWeights));
     restored.lrWeights = true;
   }
 
-  // Neural-network weights. v3 is 16→16→8→1, so W1 is 16×16.
+  // NN weights — 16→16→8→1; W1 is 16×16.
   if (payload.nnWeights && Array.isArray(payload.nnWeights.W1)
       && payload.nnWeights.W1.length === 16
       && payload.nnWeights.W1[0]?.length === 16) {
@@ -101,40 +114,30 @@ export function importState(payload, { mode = "replace" } = {}) {
     restored.nnWeights = true;
   }
 
-  // GBM model — array of trees + scalar metadata. We don't validate inner
-  // tree shape (variable depth, recursive), just sanity-check trees array.
   if (payload.gbm && Array.isArray(payload.gbm.trees) && payload.gbm.trees.length > 0) {
     localStorage.setItem(KEYS.gbm, JSON.stringify(payload.gbm));
     restored.gbm = true;
   }
 
-  // LR bag — 30 bootstrap models with weight + bias each. Imported as-is
-  // if shape is plausible; the bag is feature-dim-aware so old bags work.
   if (payload.lrBag && Array.isArray(payload.lrBag.bags) && payload.lrBag.bags.length > 0) {
     localStorage.setItem(KEYS.lrBag, JSON.stringify(payload.lrBag));
     restored.lrBag = true;
   }
 
+  if (payload.activeMask && Array.isArray(payload.activeMask.slots)) {
+    localStorage.setItem(KEYS.activeMask, JSON.stringify(payload.activeMask));
+    restored.activeMask = true;
+  }
+
+  if (payload.regime && typeof payload.regime === "object") {
+    localStorage.setItem(KEYS.regime, JSON.stringify(payload.regime));
+    restored.regime = true;
+  }
+
   return restored;
 }
 
-// Small helper so a corrupt entry in any one slot doesn't take the whole
-// importer down.
 function safeParse(s) {
   if (!s) return null;
   try { return JSON.parse(s); } catch { return null; }
-}
-
-// One-line summary of what's currently stored locally — useful for the UI.
-export function describeLocalState() {
-  const log = safeParse(localStorage.getItem(KEYS.log)) ?? [];
-  const lr  = safeParse(localStorage.getItem(KEYS.lrWeights));
-  const nn  = safeParse(localStorage.getItem(KEYS.nnWeights));
-  return {
-    logCount: log.length,
-    reviewedCount: log.filter(d => d.reviewed).length,
-    lrUpdatedAt: lr?.updatedAt || null,
-    nnTrainedOn: nn?.trainedOn || 0,
-    nnEpochs: nn?.epochs || 0,
-  };
 }

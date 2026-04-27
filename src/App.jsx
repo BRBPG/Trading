@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
 import { generateMockQuote, generateLiveIndicators, computeIndicators } from "./mockData";
-import { scoreSetup, logDecision, reviewDecision, getPerformanceStats, getLog, adaptWeights, resetWeights, saveWeights, getCurrentWeights, trainNNFromLog, trainNNFromSim, resetNN, getNNInfo, trainGBMFromSim, trainGBMFromLog, resetGBM, getGBMInfo, trainRegimeFromSim, resetRegime, FEATURE_NAMES } from "./model";
+import { scoreSetup, logDecision, reviewDecision, getPerformanceStats, getLog, adaptWeights, resetWeights, saveWeights, getCurrentWeights, trainNNFromLog, trainNNFromSim, resetNN, getNNInfo, trainGBMFromSim, trainGBMFromLog, resetGBM, getGBMInfo, trainRegimeFromSim, resetRegime, FEATURE_NAMES_BTC } from "./model";
 import { loadGBM, predictGBM, getActiveMask, setActiveMask, clearActiveMask, getActiveMaskInfo } from "./gbm";
 import { computeSimMetrics, summariseEdge } from "./simMetrics";
 import { runWalkForward, interpretWF, runAblationStudy } from "./walkForward";
@@ -37,78 +37,14 @@ const FH_METRIC = (sym, key) => `https://finnhub.io/api/v1/stock/metric?symbol=$
 // Two parallel asset universes share the infrastructure (backtest, walk-
 // forward, multi-sim, ensemble models) but have different watchlists,
 // session behaviour, cost defaults, and eventually feature vectors.
-// Universe is a runtime-switchable state — see universe selector in the
-// top-bar toggle.
-const EQUITY_WATCHLIST = ["SPY","QQQ","AAPL","MSFT","AMZN","NVDA","AMD","TSM","TSLA","IONQ","RGTI","UAL","USO","BNO","GLD","TW.L"];
-
-// Crypto universe — expanded from 10 → 20 to make cross-sectional momentum
-// rank (Liu-Tsyvinski 2022) statistically meaningful. At 8 symbols (when
-// BNB silent-drops) XS-rank has only 8 possible discrete percentile values,
-// which degenerates to near-random. 20 symbols give 5% resolution on
-// percentile, enough to pick up the documented XS-momentum edge if it's
-// present. Selected for:
-//   (a) Polygon Currencies Standard coverage (all serve as X:{SYM}USD)
-//   (b) Yahoo -USD fallback for redundancy
-//   (c) ≥1 year continuous trading history (no recent IPOs that lack the
-//       warmup buffer at 90-180d sim windows)
-//   (d) Sector diversity — L1s, DeFi, L2s, exchange tokens, legacy coins
-// MATIC was rebranded to POL in September 2024 when the Polygon ecosystem
-// migrated the native token. Polygon.io's ticker is now X:POLUSD and Yahoo
-// has migrated to POL-USD.
-// ─── BTC-only single-asset universe (Phase 4) ──────────────────────────────
-// After the 40-coin multi-symbol crypto pipeline landed three independent
-// diagnostics at null (overall AUC, conviction-stratified AUC, meta-labeling
-// AUC all at ~0.50), the pivot is to single-asset BTC focus. Rationale:
-//   - Retail feature universe is the ceiling on 40-coin universes where
-//     cross-sectional momentum degenerates (Liu-Tsyvinski 2022 used 1800+).
-//   - BTC has the richest orthogonal retail-accessible data (Deribit DVOL,
-//     Binance funding, on-chain metrics via free APIs) — most published
-//     retail-ML-for-crypto successes focus on BTC specifically.
-//   - Single-asset simplifies: no XS-rank degeneracy, no universe-level
-//     silent drops, no per-symbol feature normalization headaches.
-// Storage keys fully isolated from both "crypto" (multi-symbol weights) and
-// "equities" (different asset class entirely) — see model.js/nn.js/gbm.js
-// for btc-specific key routing.
+// Universe is hard-pinned to BTC single-asset (Phase 4 pivot). After the
+// 40-coin multi-symbol crypto pipeline landed three independent diagnostics
+// at null AUC ~0.50 (overall, conviction-stratified, meta-labeled), the
+// pivot was to single-asset BTC focus. Rationale: BTC has the richest
+// orthogonal retail-accessible data (Deribit DVOL, Binance funding, on-chain
+// via free APIs); single-asset removes XS-rank degeneracy and per-symbol
+// normalization. Storage keys are BTC-suffixed in nn.js/gbm.js/model.js.
 const BTC_WATCHLIST = ["BTC-USD"];
-
-const CRYPTO_WATCHLIST = [
-  // ─── Tier 1: Top 10 by market cap / liquidity (original 3a universe) ───
-  "BTC-USD","ETH-USD","SOL-USD","BNB-USD","XRP-USD",
-  "ADA-USD","AVAX-USD","LINK-USD","DOGE-USD","POL-USD",
-  // ─── Tier 2: Large-cap alts, multi-year history (3d step 1 expansion) ─
-  "TRX-USD","LTC-USD","DOT-USD","ATOM-USD","UNI-USD",
-  "NEAR-USD","APT-USD","ARB-USD","OP-USD","AAVE-USD",
-  // ─── Tier 3: Further expansion to ~40 symbols for XS-rank resolution ──
-  // Targeting ~2.5% percentile granularity which is where XS-momentum
-  // genuinely resolves in the literature (Liu-Tsyvinski used 1800+; we
-  // can't get there on a retail data plan, but 40 is the next meaningful
-  // step up from 20). All covered by Polygon Currencies Standard.
-  "BCH-USD",   // Bitcoin Cash — legacy fork, ~8y
-  "ETC-USD",   // Ethereum Classic — legacy fork, ~9y
-  "XLM-USD",   // Stellar — payments L1, ~11y
-  "HBAR-USD",  // Hedera — hashgraph L1, ~5y
-  "ICP-USD",   // Internet Computer — ~5y, Dfinity
-  "FIL-USD",   // Filecoin — decentralised storage, ~5y
-  "ALGO-USD",  // Algorand — L1, ~6y
-  "VET-USD",   // VeChain — supply-chain L1, ~7y
-  "STX-USD",   // Stacks — Bitcoin L2, ~4y
-  "IMX-USD",   // Immutable X — gaming L2, ~5y
-  "MKR-USD",   // Maker — CDP/DAI, DeFi bluechip, ~8y
-  "CRV-USD",   // Curve — stableswap AMM, ~5y
-  "LDO-USD",   // Lido — liquid staking, ~5y
-  "SNX-USD",   // Synthetix — synthetic assets, ~6y
-  "COMP-USD",  // Compound — DeFi lending, ~5y
-  "GRT-USD",   // The Graph — decentralised indexing, ~5y
-  "SUI-USD",   // Sui — Move-based L1, ~2.5y
-  "SEI-USD",   // Sei — trading L1, ~2.5y
-  "TIA-USD",   // Celestia — modular DA, ~2.5y
-  "RUNE-USD",  // THORChain — cross-chain AMM, ~5y
-];
-
-// Keep the legacy WATCHLIST symbol exported for anywhere that needs a
-// compile-time default — defaults to equities, will be overridden by the
-// React state when the user switches universe.
-const WATCHLIST = EQUITY_WATCHLIST;
 
 function isCryptoSymbol(sym) {
   // Yahoo crypto pairs end in -USD or -USDT. Distinguishes from LSE dot-
@@ -116,81 +52,27 @@ function isCryptoSymbol(sym) {
   return /-USD(T)?$/.test(sym);
 }
 
-// Single-source truth for "is this universe a crypto-style asset class?"
-// Used everywhere we need to route features + 24/7 session handling + crypto-
-// specific model configuration. Both multi-symbol "crypto" and single-asset
-// "btc" pass this check — storage keys are still segregated per universe in
-// model.js/nn.js/gbm.js so they don't cross-contaminate.
-function isCryptoUniverse(universe) {
-  return universe === "crypto" || universe === "btc";
+// Always true while the universe is hard-pinned to BTC. Kept as a function
+// (rather than inlined `true`) so a future re-introduction of multi-asset
+// modes only needs to update this one definition.
+function isCryptoUniverse(_universe) {
+  return true;
 }
 
-function watchlistFor(universe) {
-  if (universe === "btc")    return BTC_WATCHLIST;
-  if (universe === "crypto") return CRYPTO_WATCHLIST;
-  return EQUITY_WATCHLIST;
+function watchlistFor(_universe) {
+  return BTC_WATCHLIST;
 }
 
-function backtestSymbolsFor(universe) {
-  // Equities: drop dot-suffix (non-US session-misaligned).
-  // Crypto / BTC: use all — 24/7 markets, no session mismatch.
-  const list = watchlistFor(universe);
-  return isCryptoUniverse(universe)
-    ? [...list]
-    : list.filter(s => !s.includes("."));
+function backtestSymbolsFor(_universe) {
+  return [...BTC_WATCHLIST];
 }
 
-// Per-universe default cost model. Crypto costs are dominated by spread
-// + taker fees, much higher than US equities.
-//   Equities: 15 bps round-trip (retail on liquid US equities)
-//   Crypto:   30 bps default; BTC/ETH are lower (~20), alts higher (~40-60).
-//             Phase 3b will add per-asset cost table; for 3a a flat 30 is
-//             an honest middle estimate. Used by the universe-switch side
-//             effect to reset costBps when the user flips universe.
-// eslint-disable-next-line no-unused-vars
-function defaultCostBpsFor(universe) {
-  // BTC on a top-tier venue (Coinbase Pro, Kraken, Binance) clears at ~15-20
-  // bps round-trip at retail size — tighter than the broad crypto average
-  // because BTC is the highest-liquidity pair by an order of magnitude.
-  if (universe === "btc")    return 18;
-  if (universe === "crypto") return 30;
-  return 15;
+// High-vol exclusion was an equity-era diagnostic (IONQ/RGTI at ±5-6% per
+// bar dominated multi-sim variance). N/A for the single-asset BTC universe;
+// retained as an empty list so the diagnostic toggle stays wired.
+function highVolSymbolsFor(_universe) {
+  return [];
 }
-
-// Subset of the watchlist fed into the backtest / sim / training pipeline.
-// Non-US listings (anything with a dot-suffix, currently just TW.L) are
-// deliberately excluded because:
-//   1. Their session hours don't align with US-session macro features.
-//     VIX, SPY, TNX, DXY all publish US-hours timestamps; TW.L trades
-//     8am-4:30pm GMT. The macro.at(t) lookup for a TW.L bar timestamp
-//     would return VIX from 3am-11:30am ET (pre-open for most of it),
-//     producing spurious cross-asset inputs.
-//   2. Currency mismatch — TW.L is quoted in GBX (pence), the cost model
-//     assumes USD-like scale for the 15bps round-trip default.
-//   3. The user explicitly added TW.L for live reference viewing (their
-//     father's interest), not for systematic trading.
-// The live dashboard still fetches, displays, and allows manual ANALYZE
-// on TW.L via the regular WATCHLIST iteration — only the backtest loop
-// skips it.
-// Legacy compile-time defaults — runtime code paths call backtestSymbolsFor
-// and high-vol list is looked up per-universe via highVolSymbolsFor.
-const BACKTEST_SYMBOLS = backtestSymbolsFor("equities");
-// Symbols whose per-bar vol is high enough to materially destabilise sims:
-// quantum names introduce ±5-6% per-bar moves that dominate the variance
-// across multi-sim runs. Excluding them via the diagnostic toggle isolates
-// whether the apparent edge is robust or a quantum-name-day artefact.
-// High-vol speculative names per universe. Equity: small-cap quantum.
-// Crypto: meme coins + highly speculative alts whose swings dominate
-// multi-sim variance the way IONQ/RGTI did for equities.
-const HIGH_VOL_EQUITIES = ["IONQ", "RGTI"];
-const HIGH_VOL_CRYPTO   = ["DOGE-USD", "AVAX-USD"];  // tune with experience
-const HIGH_VOL_BTC      = [];                         // n/a for single-asset
-function highVolSymbolsFor(universe) {
-  if (universe === "btc")    return HIGH_VOL_BTC;
-  if (universe === "crypto") return HIGH_VOL_CRYPTO;
-  return HIGH_VOL_EQUITIES;
-}
-const HIGH_VOL_SYMBOLS = HIGH_VOL_EQUITIES;  // back-compat default
 
 // ─── Market-session detection (pure, client-side) ───────────────────────────
 // US stocks:   premarket 04:00-09:30 ET, open 09:30-16:00 ET, after 16:00-20:00 ET
@@ -1043,14 +925,9 @@ export default function App() {
   // "crypto" (BTC/ETH/alts via Yahoo). Switches the watchlist, session
   // handling, cost defaults, and which model guards fire (e.g. PEAD
   // disabled on crypto since there's no earnings concept).
-  // Universe hard-pinned to BTC single-asset as of Phase 6. Equity and
-  // multi-crypto paths are retained in the model/backtest/training code
-  // (so they still compile and run if the flag is flipped in devtools)
-  // but the UI no longer exposes them — they created unnecessary UI tree
-  // complexity that was a memory/re-render pressure source on the heavy
-  // MODEL tab. Single-universe + 150-coin broad-market context gives the
-  // cleanest mental model for the bot pivot.
-  const [universe] = useState("btc");
+  // Universe is hard-pinned to BTC single-asset (Phase 6 onwards). Read-only
+  // const rather than state — there is no setter and no UI to switch.
+  const universe = "btc";
   // Runtime-resolved watchlists. Use these throughout the live loop +
   // sim dispatch rather than the compile-time WATCHLIST constant, so that
   // switching universe actually changes which symbols are fetched.
@@ -4531,7 +4408,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                                 </div>
                                 <div style={{fontSize:8,color:"#555",marginTop:6,lineHeight:1.5}}>
                                   Symbols with &lt;45% win-rate across {r.runs} runs are likely dragging the model.
-                                  Consider excluding them from BACKTEST_SYMBOLS or investigating why features don't fit.
+                                  Consider excluding them from the active symbol set or investigating why features don't fit.
                                 </div>
                               </div>
                             )}
@@ -4650,10 +4527,6 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
             const stats = getPerformanceStats();
             const reviewed = decisionLog.filter(d=>d.reviewed && d.features);
             const wts = getCurrentWeights(universe);
-            // FEATURE_NAMES is now imported from model.js (14 entries, kept
-            // in sync with the feature vector). The local 7-entry copy was
-            // silently truncating the display of the 7 new macro+calendar
-            // LR weights.
             return (
               <div style={{flex:1,overflowY:"auto",padding:14}}>
                 {/* Header row */}
@@ -4739,7 +4612,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                 {/* Current weights display */}
                 <div style={{background:"#0A0A0A",border:"1px solid #1A1A1A",padding:"8px 10px",marginBottom:12,fontSize:9,color:"#444"}}>
                   <span style={{color:"#555",letterSpacing:1}}>LR WEIGHTS: </span>
-                  {FEATURE_NAMES.map((n,i)=>(
+                  {FEATURE_NAMES_BTC.map((n,i)=>(
                     <span key={n} style={{marginRight:10,color:wts.weights[i]>0?"#2ECC71":"#E74C3C"}}>
                       {n}:{wts.weights[i]?.toFixed(2)}
                     </span>
