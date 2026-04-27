@@ -3896,10 +3896,13 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                                 })}
                               </div>
                               <div style={{fontSize:8,color:"#555",marginTop:6,lineHeight:1.5}}>
-                                DROP requires BOTH median Δ &lt; −0.02 AND posterior mean &lt; 0.45 (asymmetric — innocent until
-                                proven guilty). CONFIDENCE = HIGH when |median| &gt; 0.03 and |postMean − 0.5| &gt; 0.15 with n ≥ 6.
-                                Noise-regime cycles (baseline AUC within ±0.05 of 0.5 or train-test gap &gt; 0.15) don't update
-                                posteriors. The saved GBM is cold-retrained with (persistent ∪ this run's DROPs) as preview.
+                                Three-tier verdict from the posterior tail:
+                                pNeg = P(μ_f &lt; 0 | data) computed from the normal-normal posterior CDF.
+                                INSUFFICIENT when n &lt; 4 — not enough evidence yet.
+                                DROP when pNeg &gt; 0.85 (≈85% confident the feature hurts AUC).
+                                WATCH when 0.55 &lt; pNeg ≤ 0.85.
+                                KEEP when pNeg ≤ 0.55.
+                                The percent next to each verdict is pNeg × 100. n is the number of paired Δ observations contributing.
                               </div>
                               {/* APPLY / CLEAR — commits the verdict to
                                   the persistent mask so it sticks across
