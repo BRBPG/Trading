@@ -1,26 +1,62 @@
-// ─── Pre-trained logistic regression ────────────────────────────────────────
-// Features: [rsi_centered, macd_sign, momentum_norm, bb_centered, ema_short, ema_med, vol_norm]
-// Weights derived from backtesting across 12 historical crisis/volatility regimes
-const DEFAULT_WEIGHTS = [-0.52, 1.28, 1.61, -0.74, 0.91, 1.05, 0.22];
-const DEFAULT_BIAS = 0.04;
-const WEIGHTS_KEY = "trader_lr_weights";
+import { predictNN, trainNN as trainNNRaw, getNNInfo, resetNN as resetNNRaw } from "./nn";
+import { predictGBM, loadGBM, trainGBM as trainGBMRaw, saveGBM, getGBMInfo, resetGBM as resetGBMRaw, getActiveMask } from "./gbm";
+import { predictRegime, getRegimeInfo, trainRegimeModels as trainRegimeRaw, resetRegimeModels as resetRegimeRaw } from "./regime";
 
-function loadWeights() {
-  try {
-    const saved = JSON.parse(localStorage.getItem(WEIGHTS_KEY) || "null");
-    if (saved?.weights?.length === 7) return { weights: saved.weights, bias: saved.bias };
-  } catch {}
-  return { weights: [...DEFAULT_WEIGHTS], bias: DEFAULT_BIAS };
+// ─── Pre-trained logistic regression (v3, 16-dim, PER UNIVERSE) ────────────
+// Separate default weights + storage keys per universe. Equity defaults
+// encode a mild bullish-tech prior (MACD/momentum/EMA trend-following
+// positive). Crypto defaults are NEUTRAL — no prior at all — because the
+// equity bullish-tech prior is actively anti-signal on crypto (baseline
+// multi-sim: equity-trained-prior on crypto = 0.456 AUC, confidently wrong
+// in the wrong direction). Crypto models learn their weights from sim /
+// log training only.
+const DEFAULT_WEIGHTS_EQUITIES = [
+  -0.52, 1.28, 1.61, -0.74, 0.91, 1.05, 0.22,   // technicals (legacy)
+   0.00, 0.00,                                   // VIX_z, VIX_term (learned)
+   0.00, 0.00, 0.00, 0.00,                       // DXY, TNX, Oil, Gold mom
+   0.00,                                         // TOD_edge
+   0.00, 0.50,                                   // PEAD days (learned), surprise prior
+];
+const DEFAULT_WEIGHTS_CRYPTO = new Array(16).fill(0);
+// BTC single-asset starts from neutral zero weights like multi-crypto —
+// we're measuring whether the feature set (retrained from scratch) carries
+// signal on BTC alone; any baked prior would contaminate that test.
+const DEFAULT_WEIGHTS_BTC = new Array(16).fill(0);
+const DEFAULT_BIAS = 0.04;
+const DEFAULT_BIAS_CRYPTO = 0.0;  // no directional prior
+const DEFAULT_BIAS_BTC = 0.0;     // no directional prior, clean-slate pivot
+
+function weightsKeyFor(universe) {
+  // btc gets its own v5 key so the audit-flagged storage collision risk —
+  // where stale multi-symbol crypto weights would poison BTC training —
+  // is structurally prevented.
+  if (universe === "btc")    return "trader_lr_weights_v5_btc";
+  if (universe === "crypto") return "trader_lr_weights_v4_crypto";
+  return "trader_lr_weights_v3";   // leave equities key unchanged for back-compat
 }
 
-function saveWeights(weights, bias) {
-  localStorage.setItem(WEIGHTS_KEY, JSON.stringify({ weights, bias, updatedAt: new Date().toISOString() }));
+function defaultWeightsFor(universe) {
+  if (universe === "btc")    return { weights: [...DEFAULT_WEIGHTS_BTC], bias: DEFAULT_BIAS_BTC };
+  if (universe === "crypto") return { weights: [...DEFAULT_WEIGHTS_CRYPTO], bias: DEFAULT_BIAS_CRYPTO };
+  return { weights: [...DEFAULT_WEIGHTS_EQUITIES], bias: DEFAULT_BIAS };
+}
+
+function loadWeights(universe = "equities") {
+  try {
+    const saved = JSON.parse(localStorage.getItem(weightsKeyFor(universe)) || "null");
+    if (saved?.weights?.length === 16) return { weights: saved.weights, bias: saved.bias };
+  } catch { /* corrupt localStorage — fall through to defaults */ }
+  return defaultWeightsFor(universe);
+}
+
+export function saveWeights(weights, bias, universe = "equities") {
+  localStorage.setItem(weightsKeyFor(universe), JSON.stringify({ weights, bias, updatedAt: new Date().toISOString() }));
 }
 
 // Gradient descent update: minimise binary cross-entropy on reviewed trades
 // lr = learning rate, epochs = passes over the data
-export function adaptWeights(reviewedLog, lr = 0.08, epochs = 40) {
-  const { weights, bias } = loadWeights();
+export function adaptWeights(reviewedLog, lr = 0.08, epochs = 40, universe = "equities") {
+  const { weights, bias } = loadWeights(universe);
   const w = [...weights];
   let b = bias;
 
@@ -44,21 +80,36 @@ export function adaptWeights(reviewedLog, lr = 0.08, epochs = 40) {
     }
   }
 
-  saveWeights(w, b);
+  saveWeights(w, b, universe);
   return { weights: w, bias: b, trained: samples.length };
 }
 
-export function resetWeights() {
-  localStorage.removeItem(WEIGHTS_KEY);
+export function resetWeights(universe = "equities") {
+  localStorage.removeItem(weightsKeyFor(universe));
 }
 
-export function getCurrentWeights() {
-  return loadWeights();
+export function getCurrentWeights(universe = "equities") {
+  return loadWeights(universe);
 }
 
 function sigmoid(x) { return 1 / (1 + Math.exp(-x)); }
 
-function extractFeatures(q) {
+// ─── Feature extraction ────────────────────────────────────────────────────
+// 16-dim feature vector as of v3:
+//   [0..6]   Single-symbol technicals (v1 legacy):
+//            rsi_c, macd_s, mom_n, bb_c, ema_s, ema_m, vol_n
+//   [7]      VIX z-score (regime indicator, -1..1 clipped)
+//   [8]      VIX term structure (VIX9D/VIX, >1 = stress bid)
+//   [9..12]  Cross-asset 5-bar momentum: DXY, TNX, Oil, Gold (each ±1 clipped)
+//   [13]     Time-of-day edge-ness (0=open/close, 1=midday)
+//   [14]     PEAD: daysSinceEarnings, [-1,1], -1 = just announced
+//   [15]     PEAD: surprise × exp(-days/30), [-1,1], surprise carries the
+//            drift direction for ~30-60 days post-announcement.
+//
+// All context args (macro, calendar, pead) are OPTIONAL — missing slots are
+// zeroed so the vector length is always 16 and callers without context
+// still work.
+function extractFeatures(q, macro = null, calendar = null, pead = null, universe = "equities") {
   const rsi_c   = q.rsi != null ? (q.rsi - 50) / 50 : 0;
   const macd_s  = q.macd != null ? Math.sign(q.macd) : 0;
   const mom_n   = q.momentum5 != null ? Math.max(-1, Math.min(1, q.momentum5 / 4)) : 0;
@@ -66,18 +117,163 @@ function extractFeatures(q) {
   const ema_s   = q.ema9 && q.ema20 ? (q.ema9 > q.ema20 ? 1 : -1) : 0;
   const ema_m   = q.ema20 && q.ema50 ? (q.ema20 > q.ema50 ? 1 : -1) : 0;
   const vol_n   = q.volRatio != null ? Math.max(-1, Math.min(1, (q.volRatio - 1) / 1.5)) : 0;
-  return [rsi_c, macd_s, mom_n, bb_c, ema_s, ema_m, vol_n];
+
+  // Clip helpers so extreme values (rare flash crashes etc.) can't blow up
+  // the NN's input distribution.
+  const clip1 = v => Math.max(-1, Math.min(1, v || 0));
+  const clip0to1 = v => Math.max(0, Math.min(1, v || 0));
+
+  // Is this a crypto asset (multi-symbol or single-asset BTC)? Equity-
+  // specific macro/calendar/PEAD features either produce nonsense (VIX on
+  // BTC) or timing-misaligned noise (earnings drift on a coin with no
+  // earnings). Zero those slots so they don't actively mispredict — the
+  // crypto-trained models can then place their own (near-zero) weights
+  // on those slots and ignore them.
+  // "btc" universe shares all crypto-mode feature routing (24/7, no earnings,
+  // crypto-native macro). Only the storage keys differ — see weightsKeyFor.
+  const isCrypto = universe === "crypto" || universe === "btc";
+  // Cross-sectional features only make sense with multiple symbols in the
+  // universe. On BTC-only, xsMomRank is structurally undefined (one symbol,
+  // no cross-section), so suppress it explicitly even if the upstream
+  // backtest accidentally populates it. Feature slot [9] stays at 0.
+  const isSingleAsset = universe === "btc";
+
+  // ── Slot semantics differ by universe ─────────────────────────────
+  // Same 16-dim vector, different meaning per universe. Storage keys are
+  // already universe-gated so trained weights never cross-contaminate.
+  //
+  //   slot  equity meaning          crypto meaning
+  //   ----  ----------------------  ------------------------------
+  //   [7]   VIX z-score             BTC dominance z-score (btc: 0)
+  //   [8]   VIX term structure      time-series 14d momentum z
+  //   [9]   DXY momentum            cross-sectional mom rank (btc: 0)
+  //   [10]  TNX momentum            perp funding-rate z (Hazel 2021)
+  //   [11]  Oil momentum            DVOL-RV spread z (Alexander 2023; BTC-only, daily-only)
+  //   [12]  Gold momentum           BTC perp OI Δlog z (BTC-only, daily-only, ~30d depth)
+  //   [13]  TOD edge                RV 5d/30d ratio (Catania 2019)
+  //   [14]  PEAD daysSinceEarnings  btc: broad-market breadth (Phase 4.5)
+  //                                 crypto: DOW cyclical (Caporale-Plastun 2019)
+  //   [15]  PEAD surpriseDecayed    Top-trader L/S contrarian z (Kakinaka 2022)
+  //
+  // crypto context arrives via macro.cryptoContext (set upstream by the
+  // live loop or the backtest loop) containing dominanceZ, tsMom, xsMomRank.
+  const vix_z    = isCrypto
+    ? clip1(macro?.cryptoContext?.dominanceZ ?? 0)
+    : (macro?.vixZ != null ? clip1(macro.vixZ / 2) : 0);
+  const vix_term = isCrypto
+    ? clip1(macro?.cryptoContext?.tsMom ?? 0)
+    : (macro?.vixTerm != null ? clip1((macro.vixTerm - 1) * 5) : 0);
+  const dxy_mom  = isCrypto
+    ? (isSingleAsset ? 0 : clip1(macro?.cryptoContext?.xsMomRank ?? 0))
+    : clip1((macro?.dxyMom5  || 0) * 100);
+  // Slot [10]: crypto = perp funding-rate z (Phase 3d step 2); equity = TNX.
+  const tnx_mom  = isCrypto
+    ? clip1(macro?.cryptoContext?.fundingZ ?? 0)
+    : clip1((macro?.tnxMom5  || 0) * 100);
+  // Slot [11]: crypto = DVOL−RV spread z (Phase 4 Commit 3). Only
+  // populates on daily-horizon BTC data; stays 0 for 5-min sims, non-BTC
+  // crypto symbols, or if Deribit fetch failed. Equity: Oil momentum.
+  const oil_mom  = isCrypto
+    ? clip1(macro?.cryptoContext?.dvolRvZ ?? 0)
+    : clip1((macro?.oilMom5  || 0) * 100);
+  // Slot [12]: crypto = BTC OI Δlog z (Phase 4 Commit 4). BTC-only,
+  // daily-only, last ~30d due to Binance endpoint depth cap. 0 elsewhere.
+  const gold_mom = isCrypto
+    ? clip1(macro?.cryptoContext?.oiZ ?? 0)
+    : clip1((macro?.goldMom5 || 0) * 100);
+  // Slot [13]: equity retains time-of-day edge; crypto repurposes for
+  // realized-volatility regime (RV 5d/30d ratio, clipped ±1 via
+  // (short/long − 1)). Centred so 0 = neutral regime, positive = vol
+  // expanding, negative = compressing.
+  const tod_edge = isCrypto
+    ? clip1(macro?.cryptoContext?.rvRatio ?? 0)
+    : clip0to1(calendar?.todEdge ?? 0.5);
+  // Slot [14] — three-way split (Phase 5 Commit C update):
+  //   btc universe:    Parkinson 5d/30d volatility ratio (hi-lo-based,
+  //                    ~5x more statistically efficient than close-to-
+  //                    close RV at slot [13] — Parkinson 1980, Petukhina
+  //                    2021, Ardia 2019 on BTC). Replaces breadth (which
+  //                    replaced DOW_sin); research indicated Parkinson is
+  //                    the highest-orthogonality single addition given
+  //                    the rest of the feature set.
+  //   crypto universe: DOW_sin retained (changing it would require
+  //                    retraining existing crypto weights).
+  //   equity:          PEAD daysSinceEarnings (unchanged).
+  const pead_days = universe === "btc"
+    ? clip1(macro?.cryptoContext?.parkinsonRatio ?? 0)
+    : isCrypto
+    ? clip1(macro?.cryptoContext?.dowSin ?? 0)
+    : clip1(pead?.daysSinceEarnings ?? 0);
+  // Slot [15] — same three-way split (Phase 5 Commit C update):
+  //   btc universe:    20-day Donchian breakout flag ∈ {-1, 0, +1}.
+  //                    Classic Turtle signal; Hudson-Urquhart 2021 and
+  //                    Detzel 2021 document BTC-specific OOS edge. GBMs
+  //                    exploit discrete ternary features via axis-aligned
+  //                    splits — natural fit.
+  //   crypto universe: top-trader L/S contrarian z (Kakinaka-Umeno 2022).
+  //   equity:          PEAD surpriseDecayed (unchanged).
+  const pead_surp = universe === "btc"
+    ? clip1(macro?.cryptoContext?.breakoutFlag ?? 0)
+    : isCrypto
+    ? clip1(macro?.cryptoContext?.topLSZ ?? 0)
+    : clip1(pead?.surpriseDecayed ?? 0);
+
+  return [
+    rsi_c, macd_s, mom_n, bb_c, ema_s, ema_m, vol_n,
+    vix_z, vix_term,
+    dxy_mom, tnx_mom, oil_mom, gold_mom,
+    tod_edge,
+    pead_days, pead_surp,
+  ];
 }
 
-function logisticScore(q) {
-  const f = extractFeatures(q);
-  const { weights, bias } = loadWeights();
-  const dot = f.reduce((sum, v, i) => sum + v * weights[i], bias);
-  return sigmoid(dot); // P(bullish)
+export const FEATURE_DIM = 16;
+// Feature names for equity universe (LR weights display). Crypto reuses the
+// same 16 slots with different meanings — see extractFeatures comment.
+export const FEATURE_NAMES = [
+  "RSI", "MACD", "Mom", "BB", "EMA9/20", "EMA20/50", "Vol",
+  "VIX_z", "VIX_term",
+  "DXY_m", "TNX_m", "Oil_m", "Gold_m",
+  "TOD_edge",
+  "PEAD_days", "PEAD_surp",
+];
+export const FEATURE_NAMES_CRYPTO = [
+  "RSI", "MACD", "Mom", "BB", "EMA9/20", "EMA20/50", "Vol",
+  "BTC_dom_z", "TS_mom_z",
+  "XS_mom_rank", "Fund_z", "DVOL-RV_z", "OI_z",
+  "RV_ratio",
+  "DOW_sin", "TopLS_z",
+];
+// Phase 4.5: btc universe now has a 150-coin broad-market context so
+// slots [7][9] are no longer structural zeros, and slot [14] carries
+// breadth instead of the ablation-negative DOW_sin.
+export const FEATURE_NAMES_BTC = [
+  "RSI", "MACD", "Mom", "BB", "EMA9/20", "EMA20/50", "Vol",
+  "BTC_dom_z", "TS_mom_z",
+  "XS_rank_150", "Fund_z", "DVOL-RV_z", "OI_z",
+  "RV_ratio",
+  "Park_ratio", "Breakout_20d",
+];
+
+function logisticScoreFromFeatures(f, universe = "equities") {
+  const { weights, bias } = loadWeights(universe);
+  // Defensive: if feature length drifts (e.g. old saved weights + new
+  // feature vector), pad/truncate to keep the dot product well-defined.
+  const n = Math.min(f.length, weights.length);
+  let dot = bias;
+  for (let i = 0; i < n; i++) dot += f[i] * weights[i];
+  // Clip to [0.01, 0.99]. LR doesn't saturate as aggressively as NN/GBM
+  // (L2-regularised linear model with bounded features) but it can still
+  // produce extreme probs on feature outliers. Keeping the same bound
+  // across all sub-models means the ensemble output + log-loss are both
+  // bounded by the same constant. See nn.js clipP comment.
+  return Math.max(0.01, Math.min(0.99, sigmoid(dot))); // P(bullish)
 }
 
-// ─── Decision tree — FORCED DECISIVE MODE ────────────────────────────────────
-// Only returns AVOID in genuine crisis conditions. Every other state returns BUY or SELL.
+// ─── Decision tree — FORCED DECISIVE MODE with STRONG signals ────────────────
+// Returns { signal, strength, reason }. signal ∈ {STRONG_BUY, BUY, SELL,
+// STRONG_SELL, AVOID}. strength ∈ [0,1] — how much conviction the rule carries,
+// used to weight the tree's contribution to the composite score.
 function decisionTree(q) {
   const rsi = q.rsi ?? 50;
   const macd_bull = q.macd != null && q.macd > 0;
@@ -86,48 +282,145 @@ function decisionTree(q) {
   const mom = q.momentum5 ?? 0;
   const vol = q.volRatio ?? 1;
   const bb = q.bb?.pos ?? 0.5;
-
-  // ═ CRISIS-ONLY AVOID — only when genuinely dangerous ═
-  // Extreme ATR (crash vol) + falling prices
   const atrPct = q.atr && q.price ? (q.atr / q.price) * 100 : 0;
+
+  // ═ CRISIS-ONLY AVOID ═
   if (atrPct > 4 && mom < -5 && vol > 3) {
-    return { signal: "AVOID", reason: "Crisis-level volatility — ATR >4% price + momentum <-5% + volume >3x. Stand aside until dust settles." };
+    return { signal: "AVOID", strength: 1.0, reason: "Crisis-level volatility — ATR >4% + mom <-5% + vol >3x. Stand aside." };
   }
 
-  // ═ BEAR REGIME (EMA20 < EMA50) ═ — bias short
+  // ═ STRONG signals — multiple factors aligned ═
+  // RSI bands are DISJOINT: 50-65 bullish, 35-50 bearish. The 50 midline is
+  // neutral. Prior code used 45-65 / 35-55 which double-counted the 45-55
+  // band — a flat tape at RSI 50 would simultaneously add to bull AND bear
+  // factor counts, making STRONG_BUY and STRONG_SELL tallies inflate together.
+  const bullFactors = [ema_s_bull, ema_m_bull, macd_bull, mom > 1, rsi >= 50 && rsi < 65, vol > 1.2, bb > 0.5].filter(Boolean).length;
+  const bearFactors = [!ema_s_bull, !ema_m_bull, !macd_bull, mom < -1, rsi >= 35 && rsi < 50, vol > 1.2, bb < 0.5].filter(Boolean).length;
+
+  if (bullFactors >= 6 && rsi < 75) {
+    return { signal: "STRONG_BUY", strength: 0.9, reason: `Full-stack bull alignment — ${bullFactors}/7 bullish factors. EMAs stacked, MACD positive, momentum up, price holding above BB midline.` };
+  }
+  if (bearFactors >= 6 && rsi > 25) {
+    return { signal: "STRONG_SELL", strength: 0.9, reason: `Full-stack bear alignment — ${bearFactors}/7 bearish factors. EMAs inverted, MACD negative, momentum down, price below BB midline.` };
+  }
+
+  // ═ BEAR REGIME (EMA20 < EMA50) ═
   if (!ema_m_bull) {
-    if (rsi < 25 && vol > 1.5) return { signal: "BUY", reason: "Capitulation bounce setup — extreme oversold + volume spike. Counter-trend long only, tight stop." };
-    if (rsi < 32) return { signal: "BUY", reason: "Oversold bounce in bear regime — quick long scalp opportunity, exit on any strength." };
-    if (rsi > 60) return { signal: "SELL", reason: "Bear regime rally — shorting resistance is high-probability." };
-    if (mom < -1) return { signal: "SELL", reason: "Bear regime + negative momentum = trend continuation short." };
-    if (ema_s_bull && vol > 1.2) return { signal: "BUY", reason: "Short-term reversal forming inside bear regime — tactical long." };
-    return { signal: "SELL", reason: "Bear regime default — trend-following bias." };
+    if (rsi < 25 && vol > 1.5) return { signal: "BUY", strength: 0.55, reason: "Capitulation bounce — extreme oversold + volume spike. Counter-trend long only, tight stop." };
+    if (rsi < 32) return { signal: "BUY", strength: 0.45, reason: "Oversold bounce in bear — quick long scalp, exit on strength." };
+    if (rsi > 60) return { signal: "STRONG_SELL", strength: 0.75, reason: "Bear regime rally — high-probability shorting opportunity into resistance." };
+    if (mom < -1) return { signal: "SELL", strength: 0.65, reason: "Bear regime + negative momentum = trend continuation short." };
+    if (ema_s_bull && vol > 1.2) return { signal: "BUY", strength: 0.50, reason: "Short-term reversal inside bear — tactical long." };
+    return { signal: "SELL", strength: 0.55, reason: "Bear regime default — trend-following bias." };
   }
 
-  // ═ BULL REGIME (EMA20 > EMA50) ═ — bias long
-  if (rsi > 78 && mom > 3 && bb > 0.95) return { signal: "SELL", reason: "Bull regime blowoff — extremely overbought + stretched BB. Short-term short/profit-take." };
-  if (rsi > 72 && !macd_bull) return { signal: "SELL", reason: "Bull regime exhaustion — high RSI + MACD rolling over. Tactical short." };
-  if (rsi < 35 && ema_s_bull) return { signal: "BUY", reason: "Bull regime pullback into support — classic buy-the-dip. High conviction long." };
-  if (rsi < 45 && vol > 1.2) return { signal: "BUY", reason: "Bull regime dip with volume confirmation — accumulation zone." };
-  if (!ema_s_bull && !macd_bull && mom < -1.5) return { signal: "SELL", reason: "Short-term breakdown in bull regime — tactical counter-trend short, tight stop above prior high." };
-  if (ema_s_bull && macd_bull) return { signal: "BUY", reason: "Bull regime trend continuation — EMAs + MACD aligned. Stay with the trend." };
-  return { signal: "BUY", reason: "Bull regime default — long bias unless proven otherwise." };
+  // ═ BULL REGIME (EMA20 > EMA50) ═
+  if (rsi > 78 && mom > 3 && bb > 0.95) return { signal: "STRONG_SELL", strength: 0.70, reason: "Bull regime blowoff — extreme overbought + stretched BB. Profit-take/counter-trend short." };
+  if (rsi > 72 && !macd_bull) return { signal: "SELL", strength: 0.60, reason: "Bull regime exhaustion — high RSI + MACD rolling over." };
+  if (rsi < 35 && ema_s_bull) return { signal: "STRONG_BUY", strength: 0.80, reason: "Bull regime pullback into support — classic buy-the-dip. High conviction." };
+  if (rsi < 45 && vol > 1.2) return { signal: "BUY", strength: 0.65, reason: "Bull regime dip with volume confirmation — accumulation zone." };
+  if (!ema_s_bull && !macd_bull && mom < -1.5) return { signal: "SELL", strength: 0.55, reason: "Short-term breakdown in bull — tactical counter-trend short, tight stop above prior high." };
+  if (ema_s_bull && macd_bull) return { signal: "BUY", strength: 0.60, reason: "Bull regime trend continuation — EMAs + MACD aligned." };
+  return { signal: "BUY", strength: 0.50, reason: "Bull regime default — long bias unless proven otherwise." };
 }
 
-// ─── Historical crisis fingerprints ─────────────────────────────────────────
+// Map tree signal to a 0-1 bullish score for blending
+function treeSignalToScore(signal) {
+  if (signal === "STRONG_BUY")  return 0.88;
+  if (signal === "BUY")         return 0.66;
+  if (signal === "SELL")        return 0.34;
+  if (signal === "STRONG_SELL") return 0.12;
+  return 0.50; // AVOID
+}
+
+// ─── Historical regime fingerprints ─────────────────────────────────────────
+// Expanded from 12 → 55 scenarios. Covers crashes, corrections, euphoria tops,
+// melt-ups, sideways regimes, sector-specific events, political shocks, and
+// recovery patterns. Each entry is a hand-calibrated feature fingerprint that
+// the nearest-neighbour matcher compares against live market state. More
+// scenarios = better coverage of edge cases and finer-grained analogue
+// matching. Sourced from: NBER recession dating, CBOE historical VIX, Fed
+// minutes, earnings-reaction studies, and public post-mortems.
 const CRISIS_SCENARIOS = [
-  { name: "2008 Financial Crisis",     rsi: 28, mom: -4.2, vol: 2.8, bb: 0.02, emaShort: -1, emaMed: -1, note: "Credit collapse. Bear regime. Only short or cash." },
-  { name: "2020 COVID Crash",          rsi: 22, mom: -6.1, vol: 3.5, bb: 0.01, emaShort: -1, emaMed: -1, note: "Panic selling. Fastest 30% drop ever. V-shaped recovery followed." },
-  { name: "2022 Rate Hike Selloff",    rsi: 38, mom: -1.8, vol: 1.4, bb: 0.12, emaShort: -1, emaMed: -1, note: "Slow grind down. RSI stays 30-45. Rallies get sold." },
-  { name: "Dot-com Peak 2000",         rsi: 72, mom: 2.1,  vol: 0.7, bb: 0.94, emaShort:  1, emaMed:  1, note: "Euphoria top. High RSI, low vol on advance. Distribution." },
-  { name: "Black Monday 1987",         rsi: 18, mom: -9.8, vol: 4.1, bb: 0.0,  emaShort: -1, emaMed: -1, note: "Single-day collapse. Extreme ATR. Bounce was sharp but brief." },
-  { name: "Asian Crisis 1997",         rsi: 31, mom: -3.1, vol: 2.1, bb: 0.05, emaShort: -1, emaMed: -1, note: "Contagion. Emerging markets led. US dipped then recovered." },
-  { name: "Hormuz Tension 2019",       rsi: 44, mom: -1.2, vol: 1.6, bb: 0.28, emaShort: -1, emaMed:  1, note: "Oil spike, equity dip. Short-lived. Bull regime intact." },
-  { name: "Oil Price Collapse 2020",   rsi: 25, mom: -5.4, vol: 3.2, bb: 0.03, emaShort: -1, emaMed: -1, note: "WTI went negative. Energy sector devastated. XOM -60%." },
-  { name: "European Debt 2011",        rsi: 32, mom: -2.4, vol: 1.9, bb: 0.08, emaShort: -1, emaMed: -1, note: "Greece/Italy contagion fear. Slow bleed. Reversals failed." },
-  { name: "China Devaluation 2015",    rsi: 34, mom: -3.3, vol: 2.4, bb: 0.06, emaShort: -1, emaMed: -1, note: "Flash crash risk. Vol surge. Quick 10% drop then stabilised." },
-  { name: "Q4 2018 Selloff",           rsi: 36, mom: -2.1, vol: 1.7, bb: 0.11, emaShort: -1, emaMed: -1, note: "Fed tightening fear. 20% correction. Reversed on Fed pivot." },
-  { name: "SVB Bank Run 2023",         rsi: 40, mom: -1.6, vol: 2.0, bb: 0.18, emaShort: -1, emaMed:  1, note: "Regional bank panic. Contained. Bull regime resumed fast." },
+  // ─── Major crashes ─────────────────────────────────────────────────
+  { name: "2008 Financial Crisis",     rsi: 28, mom: -4.2, vol: 2.8, bb: 0.02, emaShort: -1, emaMed: -1, regime: "crash", note: "Credit collapse. Bear regime. Only short or cash." },
+  { name: "2020 COVID Crash",          rsi: 22, mom: -6.1, vol: 3.5, bb: 0.01, emaShort: -1, emaMed: -1, regime: "crash", note: "Panic selling. Fastest 30% drop ever. V-shaped recovery followed." },
+  { name: "Black Monday 1987",         rsi: 18, mom: -9.8, vol: 4.1, bb: 0.00, emaShort: -1, emaMed: -1, regime: "crash", note: "Single-day collapse. Extreme ATR. Bounce was sharp but brief." },
+  { name: "Dot-com Crash 2001-2002",   rsi: 30, mom: -2.7, vol: 1.8, bb: 0.10, emaShort: -1, emaMed: -1, regime: "crash", note: "18-month bear. -49% SPX. Tech led; breadth kept breaking down. Rallies sold." },
+  { name: "9/11 Reopening 2001",       rsi: 26, mom: -5.8, vol: 3.8, bb: 0.03, emaShort: -1, emaMed: -1, regime: "crash", note: "Market closed 4 days. Reopened -7%. Airlines/insurers destroyed. V recovery within weeks." },
+  { name: "1973-74 Oil Shock Bear",    rsi: 29, mom: -2.2, vol: 1.6, bb: 0.08, emaShort: -1, emaMed: -1, regime: "crash", note: "Stagflation. -48% over 21 months. Slow grinding bear. No V recovery." },
+  { name: "1929 Crash (historical)",   rsi: 20, mom: -7.5, vol: 3.2, bb: 0.02, emaShort: -1, emaMed: -1, regime: "crash", note: "Oct 1929. -12% single day. Deeper bear followed: -89% trough 1932." },
+
+  // ─── Corrections (-10-20%) ─────────────────────────────────────────
+  { name: "2022 Rate Hike Selloff",    rsi: 38, mom: -1.8, vol: 1.4, bb: 0.12, emaShort: -1, emaMed: -1, regime: "correction", note: "Slow grind down. RSI 30-45. Rallies get sold. -27% peak to trough." },
+  { name: "Q4 2018 Selloff",           rsi: 36, mom: -2.1, vol: 1.7, bb: 0.11, emaShort: -1, emaMed: -1, regime: "correction", note: "Fed tightening fear. -20% correction. Reversed on Powell pivot Jan 2019." },
+  { name: "Jan 2016 China Worry",      rsi: 34, mom: -2.4, vol: 2.0, bb: 0.09, emaShort: -1, emaMed: -1, regime: "correction", note: "-13% in 6 weeks. Oil + China. Bottomed Feb '16." },
+  { name: "2011 Debt Ceiling",         rsi: 32, mom: -2.9, vol: 2.3, bb: 0.07, emaShort: -1, emaMed: -1, regime: "correction", note: "S&P downgraded USA to AA+. -19% drop. VIX spiked to 48." },
+  { name: "2015 Aug Flash Crash",      rsi: 33, mom: -4.1, vol: 2.8, bb: 0.05, emaShort: -1, emaMed: -1, regime: "correction", note: "Yuan devaluation Aug 11. SPX -11% in 6 days. ETF pricing broke." },
+  { name: "2010 Flash Crash",          rsi: 42, mom: -5.2, vol: 3.0, bb: 0.04, emaShort: -1, emaMed: -1, regime: "correction", note: "May 6 2010. DJIA -9% intraday, recovered. HFT failure. Single bad trade." },
+  { name: "2018 Volmageddon Feb",      rsi: 31, mom: -3.8, vol: 3.4, bb: 0.04, emaShort: -1, emaMed: -1, regime: "correction", note: "Short-vol blow-up. XIV liquidated. VIX +118% in a day. -10% SPX." },
+  { name: "2023 Aug-Oct Yield Jump",   rsi: 37, mom: -1.4, vol: 1.3, bb: 0.15, emaShort: -1, emaMed:  1, regime: "correction", note: "10Y hit 5%. Long-duration stocks clobbered. -10% SPX." },
+
+  // ─── Slow bleeds & sideways bears ──────────────────────────────────
+  { name: "European Debt 2011",        rsi: 32, mom: -2.4, vol: 1.9, bb: 0.08, emaShort: -1, emaMed: -1, regime: "slow_bleed", note: "Greece/Italy contagion. Slow bleed. Reversals failed repeatedly." },
+  { name: "Asian Crisis 1997",         rsi: 31, mom: -3.1, vol: 2.1, bb: 0.05, emaShort: -1, emaMed: -1, regime: "slow_bleed", note: "Thai baht devaluation. Contagion. EM led. US dipped then recovered." },
+  { name: "1994 Bond Massacre",        rsi: 36, mom: -1.1, vol: 1.5, bb: 0.14, emaShort: -1, emaMed: -1, regime: "slow_bleed", note: "Greenspan hike cycle. Bonds -10%, equities flat-down. Sideways chop." },
+  { name: "Stagflation 1970s",         rsi: 39, mom: -0.6, vol: 1.2, bb: 0.25, emaShort: -1, emaMed: -1, regime: "slow_bleed", note: "High inflation + low growth. Nominal flat, real -50%. Gold outperformed." },
+
+  // ─── Euphoria tops ─────────────────────────────────────────────────
+  { name: "Dot-com Peak 2000",         rsi: 72, mom: 2.1, vol: 0.7, bb: 0.94, emaShort:  1, emaMed:  1, regime: "euphoria", note: "Euphoria top. High RSI, low vol on advance. Distribution under the surface." },
+  { name: "Jan 2022 Top",              rsi: 71, mom: 1.6, vol: 0.8, bb: 0.92, emaShort:  1, emaMed:  1, regime: "euphoria", note: "Post-COVID stimulus peak. ARKK already rolling over 3 months prior." },
+  { name: "Nov 2021 Meme Peak",        rsi: 74, mom: 3.2, vol: 1.3, bb: 0.95, emaShort:  1, emaMed:  1, regime: "euphoria", note: "Rivian IPO, Shiba, NFTs. Quality had peaked earlier. Rotation under the hood." },
+  { name: "Oct 2007 Top",              rsi: 68, mom: 0.8, vol: 0.9, bb: 0.88, emaShort:  1, emaMed:  1, regime: "euphoria", note: "Last gasp before GFC. Credit markets already showed cracks." },
+  { name: "Jun 1990 Top",              rsi: 70, mom: 1.2, vol: 0.8, bb: 0.90, emaShort:  1, emaMed:  1, regime: "euphoria", note: "Iraq/Kuwait preamble. S&L crisis building. -20% bear ensued." },
+
+  // ─── Geopolitical shocks ───────────────────────────────────────────
+  { name: "Hormuz Tension 2019",       rsi: 44, mom: -1.2, vol: 1.6, bb: 0.28, emaShort: -1, emaMed:  1, regime: "geo_shock", note: "Oil spike, equity dip. Short-lived. Bull regime intact." },
+  { name: "Russia/Ukraine Feb 2022",   rsi: 35, mom: -2.8, vol: 2.2, bb: 0.08, emaShort: -1, emaMed: -1, regime: "geo_shock", note: "Invasion. SPX -7% in 2 weeks. Energy +40%. Tech sold hard." },
+  { name: "Israel/Hamas Oct 2023",     rsi: 43, mom: -1.0, vol: 1.4, bb: 0.30, emaShort: -1, emaMed:  1, regime: "geo_shock", note: "Brief risk-off. Oil spike. Equities rebounded within 2 weeks." },
+  { name: "Brexit Vote Jun 2016",      rsi: 38, mom: -4.3, vol: 2.6, bb: 0.06, emaShort: -1, emaMed:  1, regime: "geo_shock", note: "Overnight -8% FTSE. 2-day panic. New highs within 3 weeks." },
+  { name: "Fukushima Mar 2011",        rsi: 40, mom: -2.1, vol: 1.8, bb: 0.15, emaShort: -1, emaMed:  1, regime: "geo_shock", note: "Nikkei -17% in 2 days. Yen surge. Global contagion mild." },
+  { name: "Gulf War Jan 1991",         rsi: 48, mom:  2.3, vol: 1.9, bb: 0.55, emaShort:  1, emaMed:  1, regime: "geo_shock", note: "Actually triggered RALLY. 'Uncertainty priced in' — operation start = relief trade." },
+
+  // ─── Sector / commodity events ─────────────────────────────────────
+  { name: "Oil Price Collapse 2020",   rsi: 25, mom: -5.4, vol: 3.2, bb: 0.03, emaShort: -1, emaMed: -1, regime: "sector_shock", note: "WTI went negative. XOM -60%. Energy sector devastated." },
+  { name: "Oil Crash 2014-16",         rsi: 33, mom: -3.0, vol: 2.0, bb: 0.10, emaShort: -1, emaMed: -1, regime: "sector_shock", note: "Oil $100 → $26. Shale producers blew up. HY credit spreads widened." },
+  { name: "Silver Spike Apr 2011",     rsi: 78, mom: 5.1, vol: 2.2, bb: 0.97, emaShort:  1, emaMed:  1, regime: "sector_shock", note: "Silver $50. CME hiked margins 5x. -30% in 2 weeks." },
+  { name: "Bitcoin Crash 2022",        rsi: 24, mom: -5.9, vol: 2.9, bb: 0.02, emaShort: -1, emaMed: -1, regime: "sector_shock", note: "Luna + 3AC + FTX cascade. BTC $69k → $15k. Crypto-equity correlation broke." },
+  { name: "AI Bubble Melt-up 2023-24", rsi: 73, mom: 3.8, vol: 1.4, bb: 0.95, emaShort:  1, emaMed:  1, regime: "euphoria", note: "NVDA +240% YTD. Mag-7 concentration record. Breadth anaemic." },
+
+  // ─── Banking crises ────────────────────────────────────────────────
+  { name: "SVB Bank Run 2023",         rsi: 40, mom: -1.6, vol: 2.0, bb: 0.18, emaShort: -1, emaMed:  1, regime: "bank_crisis", note: "Regional bank panic. Contained by BTFP. Bull resumed within a month." },
+  { name: "Credit Suisse Mar 2023",    rsi: 42, mom: -1.2, vol: 1.7, bb: 0.20, emaShort: -1, emaMed:  1, regime: "bank_crisis", note: "UBS rescue. AT1s wiped. European banks sold hard. Contained fast." },
+  { name: "Bear Stearns Mar 2008",     rsi: 32, mom: -3.6, vol: 2.5, bb: 0.06, emaShort: -1, emaMed: -1, regime: "bank_crisis", note: "Fire sale to JPM. Dead-cat rally; real crisis peaked Sept '08." },
+  { name: "Lehman Sept 2008",          rsi: 22, mom: -7.2, vol: 3.9, bb: 0.01, emaShort: -1, emaMed: -1, regime: "bank_crisis", note: "Bankruptcy Sept 15. MMF broke the buck. -28% SPX in 3 weeks." },
+
+  // ─── Melt-ups / sustained bulls ────────────────────────────────────
+  { name: "2017 Low-Vol Melt-up",      rsi: 65, mom: 0.9, vol: 0.6, bb: 0.82, emaShort:  1, emaMed:  1, regime: "melt_up", note: "VIX sub-10. Steady grind up. No corrections >3% all year." },
+  { name: "2013 QE3 Rally",            rsi: 63, mom: 1.1, vol: 0.8, bb: 0.78, emaShort:  1, emaMed:  1, regime: "melt_up", note: "Taper Tantrum aside, straight line up. Bonds bled, equities won." },
+  { name: "2020-21 Post-COVID Melt",   rsi: 67, mom: 2.4, vol: 1.1, bb: 0.85, emaShort:  1, emaMed:  1, regime: "melt_up", note: "Fiscal + monetary firehose. Everything bid. Speculative excess visible." },
+  { name: "2019 Fed Pivot Rally",      rsi: 62, mom: 1.3, vol: 0.9, bb: 0.75, emaShort:  1, emaMed:  1, regime: "melt_up", note: "After Powell pivot Jan '19. Rate cuts. Y-end +29%." },
+
+  // ─── Recovery / base-building ──────────────────────────────────────
+  { name: "March 2009 Bottom",         rsi: 31, mom: 0.4, vol: 2.0, bb: 0.25, emaShort:  1, emaMed: -1, regime: "recovery", note: "666 SPX. 12-year bull began. Short covering first, fundamentals later." },
+  { name: "Dec 2018 Bottom",           rsi: 34, mom: 0.2, vol: 1.8, bb: 0.22, emaShort:  1, emaMed: -1, regime: "recovery", note: "Christmas Eve low. Fed pivot. V-recovery back to ATH by April." },
+  { name: "March 2020 Bottom",         rsi: 30, mom: 1.1, vol: 2.4, bb: 0.30, emaShort:  1, emaMed: -1, regime: "recovery", note: "Fed ZIRP + unlimited QE. Fastest bear-to-bull in history." },
+  { name: "Oct 2022 Bottom",           rsi: 36, mom: 0.6, vol: 1.5, bb: 0.28, emaShort:  1, emaMed: -1, regime: "recovery", note: "SPX 3491. CPI peaked month prior. Stealth bull began here." },
+
+  // ─── Sideways / chop ────────────────────────────────────────────────
+  { name: "Chop 2015 Sideways",        rsi: 51, mom: 0.1, vol: 1.1, bb: 0.52, emaShort:  0, emaMed:  0, regime: "chop", note: "Flat year. No trend. RSI oscillated 40-60. Mean-reversion worked." },
+  { name: "Chop 1994 Sideways",        rsi: 49, mom: -0.2, vol: 1.0, bb: 0.48, emaShort:  0, emaMed:  0, regime: "chop", note: "Post-'93 rally consolidation. Range-bound all year." },
+  { name: "Summer 2019 Chop",          rsi: 53, mom: 0.3, vol: 1.2, bb: 0.58, emaShort:  1, emaMed:  1, regime: "chop", note: "Trade war tweets. Rangebound 2800-3000. Volatile chop, no trend." },
+
+  // ─── Inflation / macro shocks ──────────────────────────────────────
+  { name: "2021-22 Inflation Shock",   rsi: 45, mom: -1.0, vol: 1.5, bb: 0.35, emaShort: -1, emaMed:  1, regime: "macro_shock", note: "CPI 9.1%. Fed behind curve. Growth/quality sold, energy/defensive won." },
+  { name: "Taper Tantrum May 2013",    rsi: 44, mom: -1.8, vol: 1.6, bb: 0.20, emaShort: -1, emaMed:  1, regime: "macro_shock", note: "10Y 1.6→3%. EM/bonds hit. SPX dipped 5% then new high." },
+  { name: "1998 LTCM Russia",          rsi: 32, mom: -3.4, vol: 2.3, bb: 0.08, emaShort: -1, emaMed: -1, regime: "macro_shock", note: "Russia default + LTCM bailout. -20% SPX. Fed cut. V recovery." },
+  { name: "Aug 2024 Yen Carry Unwind", rsi: 34, mom: -3.1, vol: 2.4, bb: 0.09, emaShort: -1, emaMed:  1, regime: "macro_shock", note: "BOJ hike. VIX 65 intraday. -6% SPX in 3 days. Full recovery in 2 weeks." },
+
+  // ─── Election / political ──────────────────────────────────────────
+  { name: "Trump Election Nov 2016",   rsi: 58, mom: 3.2, vol: 1.8, bb: 0.72, emaShort:  1, emaMed:  1, regime: "political", note: "Overnight limit down, reopened limit up. Reflation trade. 18-month rally." },
+  { name: "Nov 2020 Election",         rsi: 60, mom: 2.8, vol: 1.4, bb: 0.76, emaShort:  1, emaMed:  1, regime: "political", note: "Vaccine news day after. Rotation value/small. Biden-trade started." },
 ];
 
 function findClosestCrisis(q) {
@@ -151,35 +444,336 @@ function findClosestCrisis(q) {
   return best;
 }
 
-// ─── Main scoring function ───────────────────────────────────────────────────
-export function scoreSetup(q) {
-  const features  = extractFeatures(q);
-  const lrProb   = logisticScore(q);          // P(bullish) from LR
-  const tree     = decisionTree(q);           // Decision tree signal
-  const crisis   = findClosestCrisis(q);      // Nearest historical analogue
-  const atr      = q.atr ?? 0;
-  const price    = q.price ?? 0;
+// ─── Main scoring function — ensemble of LR + NN + Tree + Crisis analogue ──
+//
+// Composite probability is a weighted blend:
+//
+//   • LR      always contributes 40%
+//   • NN      contributes 0-40% depending on how many samples it's seen
+//             (ramps from 0 at <8 samples to 40% at ≥50 samples)
+//   • Tree    contributes 20-40% depending on its own strength score
+//   • Crisis  doesn't vote but BIASES the composite ±5% based on whether the
+//             nearest analogue was bullish or bearish
+//
+// Weights always normalise to 1.0 so the output stays a probability.
+// Agreement between models boosts confidence; disagreement reduces it.
+export function scoreSetup(q, context = {}) {
+  const { macro = null, calendar = null, pead = null, universe = "equities" } = context;
+  const features  = extractFeatures(q, macro, calendar, pead, universe);
+  const lrProb    = logisticScoreFromFeatures(features, universe);
+  // Crisis analogue is a curated library of 55 EQUITY regimes (1929, 2008,
+  // 2020 COVID, etc.). Matching BTC to "2008 Financial Crisis" produces
+  // nonsense — different asset class, different dynamics. Suppress for
+  // crypto until Phase 3b adds a crypto-specific regime library (2017
+  // mania, 2018 bear, 2022 LUNA/FTX, etc.).
+  const isCrypto = universe === "crypto" || universe === "btc";
+  // Decision tree is hand-coded for equity mean-reversion patterns
+  // (RSI-band → bounce). Firing it on crypto produces backwards calls
+  // that pollute the composite even though the weight is zeroed, so
+  // short-circuit the whole computation for any crypto universe. Audit
+  // item #10: avoid wasted compute + avoid any future accidental read
+  // of tree fields on crypto.
+  const tree      = isCrypto
+    ? { signal: "AVOID", strength: 0, reason: "muted for crypto/btc — equity-mean-reversion rules don't apply" }
+    : decisionTree(q);
+  // Crisis analogue library is equity-only (1929, 2008, COVID...). Skip
+  // entirely on crypto — findClosestCrisis only runs for equities.
+  const crisis    = isCrypto ? null : findClosestCrisis(q);
+  const atr       = q.atr ?? 0;
+  const price     = q.price ?? 0;
 
-  const direction = lrProb > 0.58 ? "BULLISH" : lrProb < 0.42 ? "BEARISH" : "NEUTRAL";
-  const confidence = Math.round(Math.abs(lrProb - 0.5) * 200); // 0-100
+  // ── NN probability (null if untrained) ──────────────────────────────
+  const nnProb    = predictNN(features, universe);
+  const nnInfo    = getNNInfo(universe);
+  const nnReady   = nnProb != null;
 
-  // Risk levels from ATR
-  const stopLong  = price > 0 && atr > 0 ? (price - 1.5 * atr).toFixed(2) : null;
-  const stopShort = price > 0 && atr > 0 ? (price + 1.5 * atr).toFixed(2) : null;
-  const tgt3Long  = price > 0 && atr > 0 ? (price + 4.5 * atr).toFixed(2) : null;
-  const tgt3Short = price > 0 && atr > 0 ? (price - 4.5 * atr).toFixed(2) : null;
+  // ── GBM probability (null if untrained) ─────────────────────────────
+  // Gradient-boosted trees consistently outperform a small NN on tabular
+  // financial data. They capture feature interactions (e.g. VIX_z × RSI)
+  // that a 16→16→8→1 NN can't represent well. Carries its own weight in
+  // the composite, which ramps from 0 → 0.45 as samples grow.
+  //
+  // Regime override: if regime-conditional GBMs are trained and the
+  // current macro regime is non-neutral, USE THE REGIME MODEL instead of
+  // the universal GBM. This lets the model learn separate weight sets for
+  // high-VIX vs low-VIX markets where the same features have different
+  // meanings (e.g. low RSI = buy signal in calm, panic-trap in crisis).
+  const universalGBM  = loadGBM(universe);
+  const universalProb = universalGBM ? predictGBM(universalGBM, features) : null;
+  const regimePred    = macro ? predictRegime(features, macro, universe) : null;
+  const gbmProb   = regimePred?.prob != null ? regimePred.prob : universalProb;
+  const gbmInfo   = getGBMInfo(universe);
+  const regimeInfo = getRegimeInfo(universe);
+  const gbmReady  = gbmProb != null;
+  const gbmSource = regimePred?.used || (universalProb != null ? "universal" : null);
+
+  // ── Blend weights ───────────────────────────────────────────────────
+  // GBM dominates as it accumulates samples (tabular ML is its forté).
+  // NN is a smaller secondary contributor. LR + Tree are baseline priors.
+  //
+  // CRYPTO-SPECIFIC: the decision tree is a hand-coded library of equity
+  // mean-reversion rules (e.g. "RSI > 78 + extended BB → STRONG_SELL").
+  // Those rules fire BACKWARDS on momentum-native crypto assets — BTC
+  // being "overbought by equity standards" usually means continuation, not
+  // reversion. The 20-sim 180d baseline produced log-loss 2.28 (vs random
+  // 0.693) precisely because the tree was making high-confidence WRONG
+  // calls into the composite. Zero the tree weight for crypto; crypto-
+  // specific rules can be layered back in Phase 3c+ with learned rather
+  // than hand-coded thresholds.
+  const treeWeight = isCrypto ? 0 : (0.20 + 0.20 * (tree.strength ?? 0.5));
+  // NN weight: equity gets up to 30% at ≥150 samples; BTC/crypto gets up to
+  // 15% but requires ≥300 samples to reach the cap. The lower cap + higher
+  // sample threshold compensates for the param-to-sample ratio being ~2×
+  // worse in BTC (433 params vs typical 100-300 BTC trades). L2 and early
+  // stopping in trainNNFromSim handle the rest. Stronger L2 is also applied
+  // at training time (0.01 vs 0.003) so the weights that reach inference are
+  // already shrunk toward zero on noisy features.
+  const nnWeight   = nnReady
+    ? (isCrypto ? Math.min(0.15, nnInfo.trainedOn / 300) : Math.min(0.30, nnInfo.trainedOn / 150))
+    : 0;
+  const gbmWeight  = gbmReady ? Math.min(0.45, gbmInfo.trainedOn / 100) : 0;
+  // LR weight at 0.60 for crypto (GBM + NN + LR carry production; tree is
+  // muted). Normalisation divides through totalRaw so the exact 0.60 just
+  // sets the LR-to-GBM priority ratio; total always sums to 1.0.
+  const lrWeight   = isCrypto ? 0.60 : 0.40;
+  const totalRaw   = lrWeight + treeWeight + nnWeight + gbmWeight;
+
+  const lrW   = lrWeight   / totalRaw;
+  const treeW = treeWeight / totalRaw;
+  const nnW   = nnWeight   / totalRaw;
+  const gbmW  = gbmWeight  / totalRaw;
+
+  const treeScore = treeSignalToScore(tree.signal);
+  let compositeProb = lrW * lrProb
+                    + treeW * treeScore
+                    + nnW * (nnProb ?? 0.5)
+                    + gbmW * (gbmProb ?? 0.5);
+
+  // Crisis bias: nearest analogue's bias pushes +/- 5%. Suppressed in
+  // crypto mode — the crisis library is equity-only (1929, 2008, COVID)
+  // and would apply nonsense biases to BTC/ETH/alts.
+  const crisisBias = isCrypto ? 0
+                   : crisis?.regime === "melt_up" || crisis?.regime === "recovery" ?  0.05
+                  : crisis?.regime === "crash"    || crisis?.regime === "slow_bleed" ? -0.05
+                  : crisis?.regime === "euphoria" ? -0.03   // top-like conditions lean bearish
+                  : crisis?.regime === "bank_crisis" || crisis?.regime === "macro_shock" ? -0.04
+                  : 0;
+  compositeProb = Math.max(0.01, Math.min(0.99, compositeProb + crisisBias * (crisis?.similarity ?? 0)));
+
+  // ── Agreement boost — if LR, NN, Tree all point same way, amplify confidence ──
+  // When the NN is untrained, it has NO OPINION. Previous behaviour forced
+  // nnDir = lrDir, which guaranteed at least 2/3 agreement and "boosted"
+  // confidence vacuously for the first ~50 trades of a new install. Now: if
+  // NN isn't ready, we only count 2-way agreement between LR and Tree.
+  // Pairwise agreement count among ALL trained models (LR + Tree always
+  // count; NN and GBM count only when ready). Agreement total = number of
+  // pairs being compared. This keeps the boost meaningful as the ensemble
+  // size grows.
+  const lrDir   = lrProb > 0.5   ? 1 : -1;
+  const treeDir = treeScore > 0.5 ? 1 : -1;
+  const nnDir   = nnReady  ? (nnProb  > 0.5 ? 1 : -1) : null;
+  const gbmDir  = gbmReady ? (gbmProb > 0.5 ? 1 : -1) : null;
+  // Tree excluded from crypto — equity mean-reversion rules fire backwards
+  // on momentum-native BTC. NN is now re-enabled for BTC/crypto (with
+  // stronger L2 + lower ensemble cap) so it counts toward consensus when
+  // trained. GBM always counts when ready.
+  const dirs = isCrypto ? [lrDir] : [lrDir, treeDir];
+  if (nnReady) dirs.push(nnDir);
+  if (gbmReady) dirs.push(gbmDir);
+  let agreeCount = 0, agreeTotal = 0;
+  for (let i = 0; i < dirs.length; i++) {
+    for (let j = i + 1; j < dirs.length; j++) {
+      agreeTotal++;
+      if (dirs[i] === dirs[j]) agreeCount++;
+    }
+  }
+  // Boost = full agreement → 1.20, no agreement → 0.75, mixed → 1.0.
+  const agreeRatio = agreeTotal > 0 ? agreeCount / agreeTotal : 0.5;
+  const agreementBoost = agreeRatio >= 1.0 ? 1.20
+                       : agreeRatio >= 0.5 ? 1.0
+                       : 0.75;
+
+  const rawConfidence = Math.abs(compositeProb - 0.5) * 200;
+  const confidence    = Math.min(100, Math.round(rawConfidence * agreementBoost));
+
+  const direction = compositeProb > 0.58 ? "BULLISH" : compositeProb < 0.42 ? "BEARISH" : "NEUTRAL";
+
+  // ── Risk levels from ATR ──────────────────────────────────────────────
+  // TWO sets of levels, because the feature-computing bar frequency
+  // (5-min intraday) gives an ATR that is only appropriate for intraday
+  // (~1-3 hour) trades. For swing trades (~1-5 days) we need a daily-scale
+  // ATR. We don't have daily bars in the live path, so we approximate:
+  //
+  //   daily_ATR ≈ 5-min_ATR × √(bars_per_day) = ATR × √78 ≈ 8.83
+  //
+  // This is the random-walk volatility-scaling approximation. In practice
+  // the ratio is 5-12× depending on intraday autocorrelation, but √78 is
+  // a reasonable central estimate. Conservative vs sqrt(252) which would
+  // over-widen.
+  //
+  // Intraday (tight, scalp horizon):  1.5 ATR stop, 4.5 ATR target (3:1 R/R)
+  // Swing    (wider, 1-5d horizon):   2 daily_ATR stop, 6 daily_ATR target
+  const dailyAtrEst = atr > 0 ? atr * Math.sqrt(78) : 0;
+  const stopLong     = price > 0 && atr > 0 ? (price - 1.5 * atr).toFixed(2) : null;
+  const stopShort    = price > 0 && atr > 0 ? (price + 1.5 * atr).toFixed(2) : null;
+  const tgt3Long     = price > 0 && atr > 0 ? (price + 4.5 * atr).toFixed(2) : null;
+  const tgt3Short    = price > 0 && atr > 0 ? (price - 4.5 * atr).toFixed(2) : null;
+  const swingStopLong    = price > 0 && dailyAtrEst > 0 ? (price - 2 * dailyAtrEst).toFixed(2) : null;
+  const swingStopShort   = price > 0 && dailyAtrEst > 0 ? (price + 2 * dailyAtrEst).toFixed(2) : null;
+  const swingTargetLong  = price > 0 && dailyAtrEst > 0 ? (price + 6 * dailyAtrEst).toFixed(2) : null;
+  const swingTargetShort = price > 0 && dailyAtrEst > 0 ? (price - 6 * dailyAtrEst).toFixed(2) : null;
 
   return {
     features,
     lrProb: (lrProb * 100).toFixed(1),
+    nnProb: nnReady ? (nnProb * 100).toFixed(1) : null,
+    gbmProb: gbmReady ? (gbmProb * 100).toFixed(1) : null,
+    compositeProb: (compositeProb * 100).toFixed(1),
+    weights: { lr: lrW, nn: nnW, gbm: gbmW, tree: treeW, crisisBias },
     direction,
     confidence,
+    agreement: { count: agreeCount, total: agreeTotal, boost: agreementBoost },
     treeSignal: tree.signal,
+    treeStrength: tree.strength,
     treeReason: tree.reason,
     crisis,
+    nnInfo,
+    gbmInfo,
+    gbmSource,                  // "high_vol" | "low_vol" | "universal" | null
+    regimeInfo,                 // { highTrained, lowTrained, ... } or null
     stopLong, stopShort, tgt3Long, tgt3Short,
+    swingStopLong, swingStopShort, swingTargetLong, swingTargetShort,
+    dailyAtrEst,
   };
 }
+
+// ─── Delegating wrappers so App.jsx doesn't need to import nn.js directly ──
+//
+// Two distinct training sources:
+//   • LOG  — real trades the user manually reviewed in the Decision Log.
+//            Shape: { reviewed:true, outcome:"WIN"|"LOSS", features, timestamp:ISO }
+//   • SIM  — synthetic trades produced by the backtester from real candles.
+//            Shape: { outcome:"WIN"|"LOSS", features, timestamp:ms, ageDays, ... }
+//            (no `reviewed` flag — they were never user-reviewed)
+//
+// They were previously sharing one wrapper that hard-required `reviewed:true`,
+// which silently dropped every sim trade and produced "Need at least 8 samples"
+// even when the backtester returned 100+ trades.
+
+export function trainNNFromLog(reviewedLog, universe = "equities") {
+  const samples = reviewedLog
+    .filter(d => d.reviewed && d.outcome && d.features)
+    .map(d => ({
+      x: d.features,
+      y: d.outcome === "WIN" ? 1 : 0,
+      ageDays: (Date.now() - new Date(d.timestamp).getTime()) / (24 * 3600 * 1000),
+    }));
+  return trainNNRaw(samples, { universe });
+}
+
+// Direction-based label helper. Sim trades generated by runBacktest
+// include a `labelBullish` field that is "did price go up from entry to
+// exit" — which is what compositeProb is supposed to predict. Back-compat
+// fallback: if a trade predates the field (older cached runs), derive it
+// from verdict + outcome. See the long comment in backtest.js for why
+// this matters for training honesty.
+function deriveBullishLabel(d) {
+  if (d.labelBullish === 0 || d.labelBullish === 1) return d.labelBullish;
+  return (d.verdict === "BUY" && d.outcome === "WIN") ||
+         (d.verdict === "SELL" && d.outcome === "LOSS") ? 1 : 0;
+}
+
+export function trainNNFromSim(simTrades, universe = "equities") {
+  const samples = simTrades
+    .filter(d => d.outcome && d.features)
+    .map(d => ({
+      x: d.features,
+      y: deriveBullishLabel(d),
+      ageDays: d.ageDays || 0,
+    }));
+  // Crypto/BTC: stronger L2 (0.01 vs default 0.003) to resist memorization
+  // at typical small sample counts (100-300 trades, 433 params). Val split +
+  // early stopping remain the primary guard; L2 adds weight-magnitude pressure
+  // that prevents any single feature from dominating on a noisy mini-batch.
+  const isCrypto = universe === "crypto" || universe === "btc";
+  return trainNNRaw(samples, { universe, ...(isCrypto ? { l2: 0.01, epochs: 100 } : {}) });
+}
+
+// Back-compat alias — older imports of trainNN keep working (= log training).
+export const trainNN = trainNNFromLog;
+
+export function resetNN(universe = "equities") { resetNNRaw(universe); }
+export { getNNInfo };
+
+// ─── GBM wrappers ──────────────────────────────────────────────────────────
+// Same shape as the NN wrappers. trainGBM returns the trained model and
+// also persists it via saveGBM (so subsequent scoreSetup calls pick it up).
+export function trainGBMFromLog(reviewedLog, universe = "equities") {
+  const samples = reviewedLog
+    .filter(d => d.reviewed && d.outcome && d.features)
+    .map(d => ({
+      x: d.features,
+      y: d.outcome === "WIN" ? 1 : 0,
+    }));
+  if (samples.length < 20) {
+    return { trained: 0, rounds: 0, reason: `Need ≥20 reviewed samples, got ${samples.length}` };
+  }
+  const result = trainGBMRaw(samples);
+  if (result.trees) saveGBM(result, universe);
+  return result;
+}
+
+// Sim-trade training with WARM-START by default. Loads the saved GBM
+// and continues boosting from there — trees accumulate across calls,
+// genuine incremental learning. Pass opts.coldStart:true to skip the
+// warm-start (used by the final masked-feature retrain in runContinuous
+// so the deployed model doesn't inherit trees that split on features
+// now being masked to zero).
+//
+// Active feature mask: the user-applied verdict (persistent localStorage
+// mask) is read here and zeroed out on every sample before training.
+// Extra slots passed via opts.extraMaskSlots are UNIONED in — this is how
+// the continuous Thompson loop layers exploration on top of the applied
+// verdict. Pass opts.ignoreActiveMask:true to bypass (used only when we
+// need a baseline measurement against the full feature set).
+export function trainGBMFromSim(simTrades, universe = "equities", opts = {}) {
+  const {
+    coldStart = false,
+    maxTreesTotal = 300,
+    extraMaskSlots = [],
+    ignoreActiveMask = false,
+    ...gbmOpts
+  } = opts;
+  const activeMask = ignoreActiveMask ? [] : getActiveMask(universe);
+  const fullMask = new Set([...activeMask, ...extraMaskSlots]);
+  const samples = simTrades
+    .filter(d => d.outcome && d.features)
+    .map(d => {
+      let x = d.features;
+      if (fullMask.size > 0) {
+        x = x.slice();
+        for (const s of fullMask) if (s < x.length) x[s] = 0;
+      }
+      return { x, y: deriveBullishLabel(d) };
+    });
+  if (samples.length < 20) {
+    return { trained: 0, rounds: 0, reason: `Need ≥20 sim samples, got ${samples.length}` };
+  }
+  const continueFrom = coldStart ? null : loadGBM(universe);
+  const result = trainGBMRaw(samples, { ...gbmOpts, continueFrom, maxTreesTotal });
+  if (result.trees) saveGBM(result, universe);
+  return result;
+}
+
+export function resetGBM(universe = "equities") { resetGBMRaw(universe); }
+export { getGBMInfo };
+
+// ─── Regime-conditional models ─────────────────────────────────────────────
+export function trainRegimeFromSim(simTrades, universe = "equities") {
+  return trainRegimeRaw(simTrades, universe);
+}
+export function resetRegime(universe = "equities") { resetRegimeRaw(universe); }
+export { getRegimeInfo };
 
 // ─── Decision log (localStorage) ────────────────────────────────────────────
 const LOG_KEY = "trader_decision_log";

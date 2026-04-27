@@ -1,15 +1,130 @@
+// Per-symbol daily-vol estimates used by the synthetic candle fallback when
+// live fetch fails. Only consulted by generateMockQuote — has no effect on
+// real Yahoo/Finnhub/Polygon data. Missing entries fall through to 0.015
+// (see generateCandles). Values are rough intraday ranges; exact numbers
+// don't matter because this path is only a fallback, not primary data.
 const VOL_PROFILES = {
-  SPY:  { vol: 0.008 }, QQQ:  { vol: 0.011 }, AAPL: { vol: 0.013 },
-  NVDA: { vol: 0.028 }, TSLA: { vol: 0.035 }, AMD:  { vol: 0.025 },
-  MSFT: { vol: 0.012 }, META: { vol: 0.018 }, UAL:  { vol: 0.022 },
-  CCL:  { vol: 0.025 }, XOM:  { vol: 0.014 }, GLD:  { vol: 0.009 },
-  AMZN: { vol: 0.016 }, BNO:  { vol: 0.022 }, XAUUSD: { vol: 0.009 },
+  // Broad indices
+  SPY:  { vol: 0.008 }, QQQ:  { vol: 0.011 },
+  // Mega-cap tech
+  AAPL: { vol: 0.013 }, MSFT: { vol: 0.012 }, AMZN: { vol: 0.016 },
+  // Semiconductors
+  NVDA: { vol: 0.028 }, AMD:  { vol: 0.025 }, TSM:  { vol: 0.018 },
+  // EV / autos
+  TSLA: { vol: 0.035 },
+  // Quantum — extremely high vol, small-cap behaviour
+  IONQ: { vol: 0.055 }, RGTI: { vol: 0.060 },
+  // Airline
+  UAL:  { vol: 0.022 },
+  // Commodities
+  USO:  { vol: 0.020 }, BNO:  { vol: 0.022 }, GLD:  { vol: 0.009 },
+  // LSE
+  "TW.L": { vol: 0.018 },
+  // Crypto — ~3-5× equity vol. Daily ranges frequently 3-6% on majors,
+  // 5-10% on small-caps. Per-bar vol estimates here are for the random-walk
+  // fallback only (real data comes from Yahoo/Polygon). Ordered roughly by
+  // market cap / historical volatility.
+  "BTC-USD":   { vol: 0.025 },
+  "ETH-USD":   { vol: 0.032 },
+  "SOL-USD":   { vol: 0.045 },
+  "BNB-USD":   { vol: 0.028 },
+  "XRP-USD":   { vol: 0.038 },
+  "ADA-USD":   { vol: 0.042 },
+  "AVAX-USD":  { vol: 0.050 },
+  "LINK-USD":  { vol: 0.040 },
+  "DOGE-USD":  { vol: 0.055 },
+  "POL-USD":   { vol: 0.045 },  // formerly MATIC; Polygon ecosystem rebrand Sep 2024
+  // Expansion for XS-momentum rank (Phase 3d). Vol estimates are fallback-
+  // only; real data comes from Polygon/Yahoo when fetches succeed.
+  "TRX-USD":   { vol: 0.035 },
+  "LTC-USD":   { vol: 0.038 },
+  "DOT-USD":   { vol: 0.048 },
+  "ATOM-USD":  { vol: 0.050 },
+  "UNI-USD":   { vol: 0.048 },
+  "NEAR-USD":  { vol: 0.055 },
+  "APT-USD":   { vol: 0.060 },
+  "ARB-USD":   { vol: 0.058 },
+  "OP-USD":    { vol: 0.058 },
+  "AAVE-USD":  { vol: 0.050 },
+  // Further expansion 20 → 40 for meaningful XS-rank resolution.
+  "BCH-USD":   { vol: 0.040 },
+  "ETC-USD":   { vol: 0.045 },
+  "XLM-USD":   { vol: 0.042 },
+  "HBAR-USD":  { vol: 0.048 },
+  "ICP-USD":   { vol: 0.055 },
+  "FIL-USD":   { vol: 0.052 },
+  "ALGO-USD":  { vol: 0.050 },
+  "VET-USD":   { vol: 0.050 },
+  "STX-USD":   { vol: 0.058 },
+  "IMX-USD":   { vol: 0.055 },
+  "MKR-USD":   { vol: 0.045 },
+  "CRV-USD":   { vol: 0.055 },
+  "LDO-USD":   { vol: 0.055 },
+  "SNX-USD":   { vol: 0.055 },
+  "COMP-USD":  { vol: 0.050 },
+  "GRT-USD":   { vol: 0.055 },
+  "SUI-USD":   { vol: 0.060 },
+  "SEI-USD":   { vol: 0.065 },
+  "TIA-USD":   { vol: 0.065 },
+  "RUNE-USD":  { vol: 0.060 },
 };
 
+// Synthetic-fallback starting prices. Rough ballpark — doesn't need to match
+// the live price exactly, just needs to be in the right order of magnitude
+// so the random walk doesn't produce nonsense during a full Finnhub + Yahoo
+// outage.
 const FALLBACK_PRICES = {
-  SPY: 530, QQQ: 455, AAPL: 213, NVDA: 875, TSLA: 248,
-  AMD: 158, MSFT: 415, META: 512, UAL: 68, CCL: 19.5,
-  XOM: 112, GLD: 224, AMZN: 195, BNO: 20, XAUUSD: 3300,
+  SPY: 530, QQQ: 455,
+  AAPL: 213, MSFT: 415, AMZN: 195,
+  NVDA: 875, AMD: 158, TSM: 185,
+  TSLA: 248,
+  IONQ: 32, RGTI: 12,
+  UAL: 68,
+  USO: 78, BNO: 20, GLD: 224,
+  "TW.L": 112,
+  // Crypto (Apr 2026 ballpark). Off-market fallback only, real data via Yahoo.
+  "BTC-USD":   95000,
+  "ETH-USD":   3300,
+  "SOL-USD":   175,
+  "BNB-USD":   620,
+  "XRP-USD":   2.20,
+  "ADA-USD":   0.85,
+  "AVAX-USD":  40,
+  "LINK-USD":  18,
+  "DOGE-USD":  0.38,
+  "POL-USD":   0.55,   // POL (formerly MATIC)
+  // Expansion — synthetic fallback ballparks only (real data via Polygon/Yahoo).
+  "TRX-USD":   0.18,
+  "LTC-USD":   88,
+  "DOT-USD":   7.20,
+  "ATOM-USD":  9.50,
+  "UNI-USD":   11.50,
+  "NEAR-USD":  5.80,
+  "APT-USD":   8.50,
+  "ARB-USD":   0.90,
+  "OP-USD":    2.20,
+  "AAVE-USD":  125,
+  // Further expansion (Phase 3d universe 20 → 40).
+  "BCH-USD":   450,
+  "ETC-USD":   27,
+  "XLM-USD":   0.14,
+  "HBAR-USD":  0.095,
+  "ICP-USD":   10,
+  "FIL-USD":   5.20,
+  "ALGO-USD":  0.22,
+  "VET-USD":   0.04,
+  "STX-USD":   2.50,
+  "IMX-USD":   1.50,
+  "MKR-USD":   2200,
+  "CRV-USD":   0.48,
+  "LDO-USD":   1.80,
+  "SNX-USD":   1.90,
+  "COMP-USD":  65,
+  "GRT-USD":   0.22,
+  "SUI-USD":   3.20,
+  "SEI-USD":   0.48,
+  "TIA-USD":   8.50,
+  "RUNE-USD":  5.50,
 };
 
 function mulberry32(seed) {
@@ -40,11 +155,11 @@ function generateCandles(symbol, anchorPrice) {
     closes[i] = Math.max(next * 0.85, next - change);
   }
 
-  const highs = closes.map((c, i) => {
+  const highs = closes.map(c => {
     const range = c * vol * (0.3 + rand() * 0.7);
     return c + range * rand();
   });
-  const lows = closes.map((c, i) => {
+  const lows = closes.map(c => {
     const range = c * vol * (0.3 + rand() * 0.7);
     return c - range * rand();
   });
@@ -53,7 +168,7 @@ function generateCandles(symbol, anchorPrice) {
   return { closes, highs, lows, volumes };
 }
 
-function computeIndicators(closes, highs, lows, volumes) {
+export function computeIndicators(closes, highs, lows, volumes) {
   const k = (period) => {
     if (closes.length < period) return null;
     const kf = 2 / (period + 1);
@@ -127,9 +242,17 @@ export function generateMockQuote(symbol) {
 // Called when we have real price/prevClose from Finnhub
 export function generateLiveIndicators(symbol, realPrice, realPrevClose) {
   const { closes, highs, lows, volumes } = generateCandles(symbol, realPrice);
-  // Anchor the last candle to the real price and first to prevClose
+  // Anchor the last candle to the real current price. Do NOT also anchor
+  // closes[0] to realPrevClose — the random walker already starts somewhere
+  // close to realPrice and overriding closes[0] creates an artificial
+  // discontinuity vs closes[1] that the winsoriser flags as an outlier on
+  // every refresh. This was particularly visible on low-vol assets like GLD
+  // and XAUUSD (vol=0.009) where the anchor jump dwarfs the natural ~0.13%
+  // bar moves. realPrevClose is still used for the displayed change/changePct
+  // (computed from quote.pc, not from closes[0]).
   closes[closes.length-1] = realPrice;
-  closes[0] = realPrevClose;
+  // realPrevClose is intentionally not used to mutate closes[0]
+  void realPrevClose;
   const indicators = computeIndicators(closes, highs, lows, volumes);
   return { closes, highs, lows, volumes, ...indicators,
     sparkline: closes.slice(-30),
