@@ -3861,19 +3861,33 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                                 <div style={{fontSize:8,color:"#555"}}>SLOT</div>
                                 <div style={{fontSize:8,color:"#555"}}>FEATURE</div>
                                 <div style={{fontSize:8,color:"#555"}}>VERDICT</div>
-                                <div style={{fontSize:8,color:"#555"}}>CONF</div>
+                                <div style={{fontSize:8,color:"#555"}}>N</div>
                                 <div style={{fontSize:8,color:"#555"}}>MEDIAN Δ</div>
                                 <div style={{fontSize:8,color:"#555"}}>POST MEAN</div>
                                 <div style={{fontSize:8,color:"#555"}}>N OBS</div>
                                 {continuousVerdicts.verdicts.map(v => {
-                                  const col = v.verdict === "KEEP" ? "#2ECC71" : "#E74C3C";
-                                  const confCol = v.confidence === "HIGH" ? "#2ECC71" : v.confidence === "MED" ? "#C9A84C" : "#888";
+                                  const col =
+                                    v.verdict === TIER.KEEP ? "#2ECC71"
+                                    : v.verdict === TIER.WATCH ? "#C9A84C"
+                                    : v.verdict === TIER.DROP ? "#E74C3C"
+                                    : "#888";  // INSUFFICIENT
+                                  const confPct = v.verdict === TIER.INSUFFICIENT
+                                    ? null
+                                    : Math.round((v.pNeg ?? 0) * 100);
                                   return (
                                     <React.Fragment key={v.slot}>
                                       <div style={{color:"#888"}}>[{v.slot}]</div>
                                       <div style={{color:"#CCC"}}>{v.name}</div>
-                                      <div style={{color:col,fontWeight:700}}>{v.verdict}</div>
-                                      <div style={{color:confCol,fontSize:8}}>{v.confidence}</div>
+                                      <div style={{color:col,fontWeight:700}}>
+                                        <span style={{color:col,fontWeight:700}}>
+                                          {v.verdict}{confPct != null ? ` — ${confPct}%` : ""}
+                                        </span>
+                                      </div>
+                                      <div style={{fontSize:8}}>
+                                        {v.n != null && (
+                                          <span style={{color:"#555",fontSize:8,marginLeft:6}}>n={v.n}</span>
+                                        )}
+                                      </div>
                                       <div style={{color:"#888"}}>{v.median != null ? (v.median >= 0 ? "+" : "") + v.median.toFixed(4) : "—"}</div>
                                       <div style={{color:"#888"}}>{v.postMean != null ? v.postMean.toFixed(3) : "—"}</div>
                                       <div style={{color:"#888"}}>{v.n}</div>
