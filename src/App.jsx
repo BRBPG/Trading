@@ -982,11 +982,11 @@ export default function App() {
   // STOP button.
   const continuousAbortRef = useRef(false);
   // Final post-run verdict per feature. Computed after cycles complete
-  // via Wilcoxon signed-rank on the accumulated deltas. One verdict per
-  // feature slot: { slot, name, verdict: "keep"|"drop"|"uncertain",
-  // median, pValue, nObservations }. Displayed in a summary panel so the
-  // user can see the principled final decision, not just the bandit's
-  // moment-to-moment state.
+  // from each slot's normal-normal posterior tail probability. Shape per
+  // entry: { slot, name, verdict: TIER.*, pNeg, median, postMean,
+  // postVariance, n }. Displayed in a summary panel so the user can see
+  // the principled final decision, not just the bandit's moment-to-moment
+  // state.
   const [continuousVerdicts, setContinuousVerdicts] = useState(null);
   // Bump to force re-read of the persistent mask from localStorage when
   // the user applies or clears a verdict — the GBM panel reads mask
@@ -1884,27 +1884,22 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
   }
 
   // ─── Adaptive continuous training loop ───────────────────────────────────
-  // Principled Thompson-sampling bandit over feature inclusion decisions.
-  // Replaces the earlier heuristic "drop if median < threshold / add back
-  // if median > threshold" which mixed arbitrary thresholds with ad-hoc
-  // probe cycles. The bandit approach has theoretical backing (Agrawal &
-  // Goyal 2012, "Analysis of Thompson Sampling for the Multi-Armed Bandit
-  // Problem", COLT): provably optimal regret for Bernoulli arms. Balances
-  // exploitation (converges to best features) with exploration (never
-  // permanently drops a feature — low-evidence slots get re-sampled in
-  // proportion to their Beta-posterior variance).
+  // Thompson-sampling bandit over feature inclusion, driven by a closed-form
+  // normal-normal posterior over each feature's true mean ablation Δ. Earlier
+  // generations used a Wilcoxon-on-Δs test, then a Beta(α,β) discretized
+  // ratchet — both replaced by the current normal-normal model (see spec at
+  // docs/superpowers/specs/2026-04-27-pruning-verdict-redesign-design.md).
   //
   // Algorithm per feature i:
-  //   Beta(α_i, β_i) posterior of "feature i is beneficial"
-  //     α_i = 1 + count of positive Δ observations (Δ > +0.002 in ablation)
-  //     β_i = 1 + count of negative Δ observations (Δ < -0.002)
-  //   Per-cycle mask: sample p_i ~ Beta(α_i, β_i); include feature if
-  //     p_i ≥ 0.5, drop otherwise.
+  //   posterior μ_i ~ N(μ̂_i, τ²_i) updated from accumulated paired Δs
+  //   per-cycle mask: sample μ̃_i ~ posterior, drop feature if μ̃_i < 0
+  //   post-run verdict: tier from pNeg = P(μ_i < 0 | data)
+  //     INSUFFICIENT (n<4) | DROP (pNeg>0.85) | WATCH (>0.55) | KEEP
   //
   // Loop per cycle:
-  //   1. Sample mask via Thompson
+  //   1. Sample mask via Thompson (normal-normal)
   //   2. Fresh sim → train GBM
-  //   3. Every 3rd cycle: ablation (updates Beta posteriors)
+  //   3. Every 3rd cycle: ablation (updates posteriors)
   //      Other cycles: single walk-forward
   //   4. Best-AUC GBM auto-preserved
   //   5. Sleep INTER_CYCLE_SLEEP_MS — respects fetch rate limits and
@@ -1968,7 +1963,8 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
     const persistentSet = new Set(persistentMask);
     const targets = rawTargets.filter(t => !persistentSet.has(t.slot));
 
-    // Beta posteriors per feature (only for exploration targets)
+    // Normal-normal posteriors per feature (only for exploration targets).
+    // Shape: { mean, variance, n, deltas[] } — see posteriorVerdict.js.
     const posteriors = {};
     for (const t of targets) {
       posteriors[t.slot] = { mean: 0, variance: PRIOR_SIGMA * PRIOR_SIGMA, n: 0, deltas: [] };
@@ -2002,14 +1998,6 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
       return dropCandidates.filter(s => !rescued.has(s));
     };
 
-
-    // Accumulate all observed deltas per slot across the run. Feeds the
-    // post-run binary verdict (KEEP / DROP based on median sign +
-    // posterior mean). Separate from the Thompson posteriors (which drive
-    // cycle-by-cycle inclusion) so the final verdict reflects the actual
-    // observed distribution of Δ values.
-    const allDeltasPerSlot = {};
-    for (const t of targets) allDeltasPerSlot[t.slot] = [];
 
     // Accumulated last-cycle trades — kept only for the final masked
     // retrain at run end. NOT used for per-cycle training: that uses
@@ -2047,9 +2035,9 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         if (continuousAbortRef.current) break;
 
         // Cycles 1-2 run with ONLY the persistent mask (no Thompson
-        // exploration yet) to prime the Beta posteriors with a
-        // baseline measurement. From cycle 3 onwards Thompson sampling
-        // layers extra drops on top of the committed verdict.
+        // exploration yet) to prime the posteriors with a baseline
+        // measurement. From cycle 3 onwards Thompson sampling layers
+        // extra drops on top of the committed verdict.
         const thompsonDrops = cycle < 2 ? [] : thompsonMask();
         const activeMask = Array.from(new Set([...persistentMask, ...thompsonDrops]));
 
@@ -2124,6 +2112,11 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
             folds: 5, epochs: 60,
             modelKind: isCryptoUniverse(universe) ? "gbm" : "nn",
             maskSlots: activeMask,
+            // Per-cycle seed so the baseline + every masked walk-forward
+            // call inside this cycle share the same Math.random stream
+            // (paired comparison), while different cycles get different
+            // seeds (independent observations across cycles).
+            seed: cycle + 1,
           }, targets);
           if (!ablation.error) {
             aucNow = ablation.baselineAUC;
@@ -2158,9 +2151,6 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         if (ablationDeltas) {
           for (const d of ablationDeltas) {
             if (d.delta == null) continue;
-            // Archive every observation for the final-verdict median —
-            // the median has its own noise-threshold test downstream.
-            if (allDeltasPerSlot[d.slot]) allDeltasPerSlot[d.slot].push(d.delta);
             const post = posteriors[d.slot];
             if (!post) continue;
             // Clip absurd Δs (likely a botched fold, not feature signal)
@@ -2242,16 +2232,12 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
       setContinuousResults([...results]);
     }
 
-    // ─── POST-RUN BINARY VERDICTS ────────────────────────────────────
-    // User feedback: Wilcoxon at n=6 was structurally underpowered — the
-    // smallest achievable p on 6 observations is ~0.063 (unanimous signs),
-    // so p<0.05 gave UNCERTAIN for every feature except Parkinson by
-    // luck. Replaced with a BINARY decision:
-    //   KEEP  if median Δ > 0  OR posterior mean > 0.5
-    //   DROP  otherwise
-    // Confidence is surfaced separately (HIGH/LOW) based on the
-    // posterior's distance from 0.5 and |median Δ|. Every feature gets
-    // an actionable verdict — no more UNCERTAIN purgatory.
+    // ─── POST-RUN THREE-TIER VERDICTS ──────────────────────────────
+    // Each feature's normal-normal posterior is collapsed to a tail
+    // probability pNeg = P(μ_f < 0 | data); the tier comes from cutoffs
+    // on pNeg (DROP > 0.85, WATCH > 0.55, else KEEP; INSUFFICIENT when
+    // n < 4). Calibrated by construction — under truly μ=0 the pNeg is
+    // uniform on [0,1] giving expected DROP/WATCH/KEEP ≈ 15/30/55%.
     //
     // The final GBM is ALSO retrained with the DROP features masked, so
     // the verdict is applied to the deployed model, not just displayed.
@@ -3844,14 +3830,11 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                           })()}
 
                           {/* FINAL VERDICTS — appears after a run completes.
-                              Principled per-feature decision via Wilcoxon
-                              signed-rank on the accumulated Δ observations.
-                              Non-parametric → doesn't assume Δ distribution.
-                              Significance at p < 0.05 two-sided. Features
-                              where neither direction is significant get
-                              "uncertain" (not "drop") — absence of evidence
-                              ≠ evidence of absence. User-actionable final
-                              decision, not just the bandit's transient state. */}
+                              Three-tier (DROP / WATCH / KEEP / INSUFFICIENT)
+                              from the normal-normal posterior tail probability
+                              pNeg = P(μ_f < 0 | data). Confidence% next to
+                              each tier is pNeg × 100. n is the number of
+                              paired Δ observations contributing. */}
                           {continuousVerdicts && (
                             <div style={{marginTop:12,padding:"8px 12px",background:"#0A1A0A",border:"1px solid #2A5A3A"}}>
                               <div style={{fontSize:9,color:"#7FD8A6",letterSpacing:2,marginBottom:6}}>
