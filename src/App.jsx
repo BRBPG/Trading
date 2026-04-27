@@ -2308,7 +2308,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
     // like IF the user clicks APPLY VERDICT. Until they apply, the
     // persistent mask itself is unchanged — user decides whether these
     // drops stick.
-    const newDropSlots = new Set(verdicts.filter(v => v.verdict === "DROP").map(v => v.slot));
+    const newDropSlots = new Set(verdicts.filter(v => v.verdict === TIER.DROP).map(v => v.slot));
     const unionMaskForPreview = new Set([...persistentMask, ...newDropSlots]);
     if (recentTradesForFinalRetrain.length >= 20 && unionMaskForPreview.size > 0) {
       // Cold-start retrain with the union mask applied. trainGBMFromSim's
