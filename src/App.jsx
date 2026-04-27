@@ -4,6 +4,8 @@ import { scoreSetup, logDecision, reviewDecision, getPerformanceStats, getLog, a
 import { loadGBM, predictGBM, getActiveMask, setActiveMask, clearActiveMask, getActiveMaskInfo } from "./gbm";
 import { computeSimMetrics, summariseEdge } from "./simMetrics";
 import { runWalkForward, interpretWF, runAblationStudy } from "./walkForward";
+// eslint-disable-next-line no-unused-vars
+import { normalNormalPosterior, pNeg, mapTier, estimateSigmaObs, sampleNormal, TIER } from "./posteriorVerdict.js";
 import { runBacktest, clearBarsCache, barsCacheSize } from "./backtest";
 import { calcADX, calcWilliamsR, calcStochastic, calcROC, calcZScore,
          calcCMF, calcMaxDrawdown, calcSharpe, engineerFeatures,
@@ -1924,28 +1926,11 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
 
     // Config
     const ABLATE_EVERY = 3;
-    // Noise-floor thresholds for posterior updates. Earlier value (±0.002)
-    // was ~20× below the per-cycle AUC noise floor (5-fold walk-forward
-    // std-dev runs ~0.05 on small crypto samples), so every tiny random
-    // fluctuation updated the posterior. User saw the pathology: all
-    // features converged to DROP because median delta across 6 noisy
-    // observations drifted slightly negative for everything. Raised to
-    // ±0.02 so only meaningful deltas count.
-    const POS_THRESHOLD = 0.02;
-    const NEG_THRESHOLD = -0.02;
-    // Quality gates: a cycle whose baseline AUC is indistinguishable from
-    // random (|AUC − 0.5| < 0.05) produces ablation deltas that are pure
-    // noise — no signal to harvest. Same for grossly overfit cycles
-    // (train-test gap > 0.15 = model fit the noise). Skip posterior
-    // updates on those cycles; delta archive still accumulates for the
-    // post-run median computation (with its own threshold).
-    const BASELINE_QUALITY_MIN = 0.05;  // |baselineAUC − 0.5|
-    const GAP_QUALITY_MAX = 0.15;        // train-test gap
-    // Stronger prior (was 1,1) resists single-observation shifts. With 6
-    // observations Beta(1,1) → Beta(1,7) → mean 0.125 is reachable from
-    // pure noise; Beta(2,2) → Beta(2,8) → mean 0.2 is more honest.
-    const PRIOR_ALPHA = 2;
-    const PRIOR_BETA = 2;
+    // Normal-normal posterior parameters. priorSigma is the prior SD on
+    // mu_f (the true mean ablation Δ); a 5% AUC swing is "large." obsSigma
+    // is recomputed from the empirical pooled SD once enough Δs exist;
+    // until then it falls back to 0.02 (see posteriorVerdict.js).
+    const PRIOR_SIGMA = 0.05;
     // 7s pacing prevents saturating CoinGecko/Binance/Deribit rate
     // limits AND lets the UI repaint reliably between cycles — user
     // explicitly asked for this.
@@ -1987,35 +1972,27 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
     // Beta posteriors per feature (only for exploration targets)
     const posteriors = {};
     for (const t of targets) {
-      posteriors[t.slot] = { alpha: PRIOR_ALPHA, beta: PRIOR_BETA };
+      posteriors[t.slot] = { mean: 0, variance: PRIOR_SIGMA * PRIOR_SIGMA, n: 0, deltas: [] };
     }
 
-    // Beta sampler via Gamma ratio (exact for integer shape params).
-    const sampleGamma = (shape) => {
-      let sum = 0;
-      for (let i = 0; i < shape; i++) sum += -Math.log(1 - Math.random());
-      return sum;
-    };
-    const sampleBeta = (a, b) => {
-      const x = sampleGamma(a), y = sampleGamma(b);
-      return x / (x + y);
-    };
-    // Sample mask from current posteriors: drop feature if p_i < 0.5.
-    // Safety floor: never drop more than 70% of targets in a single
-    // cycle — a fully-masked cycle produces no useful ablation (every
-    // slot's unioned mask is a no-op) AND the baseline AUC with zero
-    // features active is pure noise, which then pollutes posteriors
-    // for everything. Keep at least ceil(targets.length * 0.3) slots
-    // active per cycle. When Thompson wants to drop more, we KEEP the
-    // ones with highest posterior mean (most believed useful).
+    // Sample mask from current posteriors: drop feature if sampledMu < 0
+    // (this draw says the feature is harmful). Safety floor: never drop
+    // more than 70% of targets in a single cycle — a fully-masked cycle
+    // produces no useful ablation (every slot's unioned mask is a no-op)
+    // AND the baseline AUC with zero features active is pure noise, which
+    // then pollutes posteriors for everything. Keep at least
+    // ceil(targets.length * 0.3) slots active per cycle. When Thompson
+    // wants to drop more, we KEEP the ones with highest posterior mean
+    // (most believed useful).
     const thompsonMask = () => {
       const dropCandidates = [];
       const perSlot = [];
       for (const t of targets) {
-        const p = sampleBeta(posteriors[t.slot].alpha, posteriors[t.slot].beta);
-        const postMean = posteriors[t.slot].alpha / (posteriors[t.slot].alpha + posteriors[t.slot].beta);
-        perSlot.push({ slot: t.slot, p, postMean });
-        if (p < 0.5) dropCandidates.push(t.slot);
+        const post = posteriors[t.slot];
+        const sampledMu = sampleNormal(post.mean, post.variance);
+        const postMean = post.mean;
+        perSlot.push({ slot: t.slot, sampledMu, postMean });
+        if (sampledMu < 0) dropCandidates.push(t.slot);
       }
       const maxDrops = Math.floor(targets.length * 0.7);
       if (dropCandidates.length <= maxDrops) return dropCandidates;
@@ -2176,9 +2153,6 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         // ratchet every feature toward DROP (the user's pathology).
         const baselineAUC = aucNow;
         const baselineGap = gapNow;
-        const baselineIsNoise = baselineAUC == null
-          || Math.abs(baselineAUC - 0.5) < BASELINE_QUALITY_MIN
-          || (baselineGap != null && baselineGap > GAP_QUALITY_MAX);
         const posteriorUpdates = [];
         if (ablationDeltas) {
           for (const d of ablationDeltas) {
@@ -2188,17 +2162,29 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
             if (allDeltasPerSlot[d.slot]) allDeltasPerSlot[d.slot].push(d.delta);
             const post = posteriors[d.slot];
             if (!post) continue;
-            // Skip posterior update on noise-regime cycles. Delta archive
-            // still grows; the post-run median naturally absorbs noise by
-            // centering on zero for truly noisy features.
-            if (baselineIsNoise) continue;
-            if (d.delta > POS_THRESHOLD) {
-              post.alpha += 1;
-              posteriorUpdates.push({ slot: d.slot, verdict: "helpful", delta: d.delta });
-            } else if (d.delta < NEG_THRESHOLD) {
-              post.beta += 1;
-              posteriorUpdates.push({ slot: d.slot, verdict: "harmful", delta: d.delta });
-            }
+            // Clip absurd Δs (likely a botched fold, not feature signal)
+            // before they pull the posterior. ±0.10 covers any plausible
+            // single-feature ablation effect.
+            const clipped = Math.max(-0.10, Math.min(0.10, d.delta));
+            post.deltas.push(clipped);
+            // Recompute σ_obs from all Δs accumulated so far across all
+            // features. With <10 total observations the estimator falls
+            // back to 0.02; thereafter it uses the pooled empirical SD.
+            const allDeltas = Object.values(posteriors)
+              .flatMap(p => (p.deltas ?? []))
+              .filter(Number.isFinite);
+            const sigmaObs = estimateSigmaObs(allDeltas);
+            const updated = normalNormalPosterior(post.deltas, PRIOR_SIGMA, sigmaObs);
+            post.mean = updated.mean;
+            post.variance = updated.variance;
+            post.n = updated.n;
+            posteriorUpdates.push({
+              slot: d.slot,
+              verdict: clipped > 0 ? "helpful" : clipped < 0 ? "harmful" : "neutral",
+              delta: clipped,
+              mean: updated.mean,
+              n: updated.n,
+            });
           }
         }
 
@@ -2211,9 +2197,9 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         // MORE data than the previous — overwriting is the right behavior.
         if (aucNow != null && aucNow > bestAUC) bestAUC = aucNow;
 
-        // E[Beta(α,β)] = α/(α+β) — feature's posterior mean usefulness
+        // Posterior mean mu_f for each feature — used for display and rescue logic.
         const posteriorSnapshot = Object.fromEntries(
-          Object.entries(posteriors).map(([s, p]) => [s, p.alpha / (p.alpha + p.beta)])
+          Object.entries(posteriors).map(([s, p]) => [s, p.mean])
         );
 
         // Record only the small summary — NOT the full trades array.
