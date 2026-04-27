@@ -59,3 +59,15 @@ test("withSeededRandom returns the value of fn", async () => {
   const out = await withSeededRandom(42, async () => "hello");
   assert.strictEqual(out, "hello");
 });
+
+test("integration: paired calls produce identical Math.random sequences across two withSeededRandom invocations", async () => {
+  const a = [];
+  const b = [];
+  await withSeededRandom(123, async () => {
+    for (let i = 0; i < 5; i++) a.push(Math.random());
+  });
+  await withSeededRandom(123, async () => {
+    for (let i = 0; i < 5; i++) b.push(Math.random());
+  });
+  assert.deepStrictEqual(a, b);
+});

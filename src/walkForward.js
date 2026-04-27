@@ -18,6 +18,7 @@
 
 import { trainNN as trainNNRaw, scoreWithWeights } from "./nn";
 import { trainGBM, predictGBM } from "./gbm";
+import { withSeededRandom } from "./seededRandom.js";
 
 // Convert sim trades to the {x, y, ageDays} shape expected by the NN.
 // Mirrors trainNNFromSim in model.js — direction-based labels (labelBullish
@@ -428,12 +429,18 @@ export async function runWalkForward(simTrades, opts = {}) {
 // browser thread for ~20 seconds and the user sees a frozen UI.
 export async function runAblationStudy(simTrades, baseOpts = {}, targets = [], onProgress = null) {
   if (!simTrades?.length) return { error: "no trades provided" };
-  // Baseline run — all features active.
-  const baseline = await runWalkForward(simTrades, baseOpts);
+
+  // Seed for paired comparisons within this cycle. Caller passes
+  // baseOpts.seed; if absent we derive a deterministic seed from the
+  // call timestamp — better than nothing, but the caller SHOULD pass a
+  // per-cycle seed so different cycles produce independent paired
+  // observations.
+  const seed = (baseOpts.seed >>> 0) || (Date.now() & 0xffffffff);
+
+  const baseline = await withSeededRandom(seed, () => runWalkForward(simTrades, baseOpts));
   if (baseline.error) return { error: `baseline: ${baseline.error}` };
   const baseAUC = baseline.overall?.oosAUC;
   if (baseAUC == null) return { error: "baseline produced no AUC" };
-  // Yield to the event loop after baseline so UI can repaint.
   if (onProgress) {
     await new Promise(r => setTimeout(r, 0));
     onProgress({ phase: "baseline_done", idx: 0, total: targets.length + 1 });
@@ -442,13 +449,11 @@ export async function runAblationStudy(simTrades, baseOpts = {}, targets = [], o
   const results = [];
   for (let ti = 0; ti < targets.length; ti++) {
     const t = targets[ti];
-    // If baseOpts already masks some slots, the ablation target's mask
-    // is the UNION — we're measuring "marginal Δ of adding t.slot to
-    // the already-masked baseline". Important for adaptive training
-    // which passes an evolving mask across cycles.
     const base = baseOpts.maskSlots || [];
     const unioned = Array.from(new Set([...base, t.slot]));
-    const masked = await runWalkForward(simTrades, { ...baseOpts, maskSlots: unioned });
+    const masked = await withSeededRandom(seed, () =>
+      runWalkForward(simTrades, { ...baseOpts, maskSlots: unioned })
+    );
     if (masked.error) {
       results.push({ ...t, auc: null, delta: null, error: masked.error });
     } else {
@@ -456,8 +461,6 @@ export async function runAblationStudy(simTrades, baseOpts = {}, targets = [], o
       if (maskedAUC == null) {
         results.push({ ...t, auc: null, delta: null, error: "no auc" });
       } else {
-        // delta = baseline AUC − masked AUC. Positive delta means removing
-        // the feature HURT the model, so the feature was contributing.
         results.push({
           ...t,
           aucWithout: maskedAUC,
@@ -466,22 +469,17 @@ export async function runAblationStudy(simTrades, baseOpts = {}, targets = [], o
         });
       }
     }
-    // Yield per feature so the browser can paint the progress indicator.
     if (onProgress) {
       await new Promise(r => setTimeout(r, 0));
       onProgress({ phase: "feature_done", slot: t.slot, name: t.name, idx: ti + 1, total: targets.length + 1 });
     }
   }
-  // Sort by delta descending — most important features at the top.
   results.sort((a, b) => (b.delta ?? -Infinity) - (a.delta ?? -Infinity));
 
   return {
     baselineAUC: baseAUC,
     baselineLogLoss: baseline.overall?.oosLogLoss,
     baselineSamples: baseline.overall?.oosSamples,
-    // Generalization gap — avgTestLoss - avgTrainLoss. > 0.15 = severe
-    // overfit per AFML Ch.7. Exposed on the return so adaptive-training
-    // cycles can track it alongside AUC without re-computing.
     baselineGap: (baseline.overall?.avgTestLoss != null && baseline.overall?.avgTrainLoss != null)
       ? baseline.overall.avgTestLoss - baseline.overall.avgTrainLoss : null,
     results,
