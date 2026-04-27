@@ -4,7 +4,6 @@ import { scoreSetup, logDecision, reviewDecision, getPerformanceStats, getLog, a
 import { loadGBM, predictGBM, getActiveMask, setActiveMask, clearActiveMask, getActiveMaskInfo } from "./gbm";
 import { computeSimMetrics, summariseEdge } from "./simMetrics";
 import { runWalkForward, interpretWF, runAblationStudy } from "./walkForward";
-// eslint-disable-next-line no-unused-vars
 import { normalNormalPosterior, pNeg, mapTier, estimateSigmaObs, sampleNormal, TIER } from "./posteriorVerdict.js";
 import { runBacktest, clearBarsCache, barsCacheSize } from "./backtest";
 import { calcADX, calcWilliamsR, calcStochastic, calcROC, calcZScore,
@@ -2258,7 +2257,8 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
     // the verdict is applied to the deployed model, not just displayed.
     const verdicts = [];
     for (const t of targets) {
-      const obs = allDeltasPerSlot[t.slot].filter(Number.isFinite);
+      const post = posteriors[t.slot];
+      const obs = (post?.deltas ?? []).filter(Number.isFinite);
       const n = obs.length;
       const median = n === 0 ? null
         : (() => {
@@ -2266,56 +2266,41 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
           const m = Math.floor(s.length / 2);
           return s.length % 2 ? s[m] : (s[m-1] + s[m]) / 2;
         })();
-      const postMean = posteriors[t.slot].alpha / (posteriors[t.slot].alpha + posteriors[t.slot].beta);
-
-      // Binary decision, asymmetric ("innocent until proven guilty").
-      // DROP requires BOTH the median delta AND the posterior mean to
-      // show meaningful negative evidence — not just hair-below-zero.
-      // Without this, noise medians like -0.005 on 6 observations were
-      // enough to drop a feature, leading to the pathology where every
-      // feature gets DROP because 6 noise samples cluster below zero
-      // for everything.
-      //
-      // Thresholds tuned to 5-fold WF noise floor (std-dev ~0.03 AUC
-      // per fold average → ~0.015 std-err across 5 folds → require the
-      // observed median to clear ~1.5σ before counting as evidence).
-      const DROP_MEDIAN_MAX = -0.02;      // median must be below this
-      const DROP_POSTERIOR_MAX = 0.45;     // posterior mean must be below this
-      const dropMedianEvidence = (median ?? 0) < DROP_MEDIAN_MAX;
-      const dropPosteriorEvidence = postMean < DROP_POSTERIOR_MAX;
-      const verdict = (dropMedianEvidence && dropPosteriorEvidence) ? "DROP" : "KEEP";
-
-      // Confidence: HIGH requires both signals strongly past threshold
-      // with >= 6 observations (at 20 cycles and ablate-every=3, that's
-      // every ablation cycle counting). MED if signals agree but one is
-      // weaker. LOW on disagreement or thin evidence.
-      const medianPositive = (median ?? 0) > 0;
-      const posteriorPositive = postMean > 0.5;
-      const strongMedian = Math.abs(median ?? 0) > 0.03;
-      const strongPosterior = Math.abs(postMean - 0.5) > 0.15;
-      const confidence = (n >= 6 && strongMedian && strongPosterior && (medianPositive === posteriorPositive))
-        ? "HIGH"
-        : (n >= 4 && (strongMedian || strongPosterior))
-          ? "MED"
-          : "LOW";
+      const postSnapshot = post
+        ? { mean: post.mean, variance: post.variance, n: post.n }
+        : { mean: 0, variance: PRIOR_SIGMA * PRIOR_SIGMA, n: 0 };
+      const pNegValue = pNeg(postSnapshot);
+      const tier = mapTier(postSnapshot.n, pNegValue);
 
       verdicts.push({
         slot: t.slot,
         name: t.name,
-        verdict,
-        confidence,
-        median,
-        postMean,
-        n,
+        verdict: tier,           // "DROP" | "WATCH" | "KEEP" | "INSUFFICIENT"
+        pNeg: pNegValue,         // posterior tail probability — UI confidence number
+        median,                  // retained for the sparkline render
+        postMean: postSnapshot.mean,
+        postVariance: postSnapshot.variance,
+        n: postSnapshot.n,
       });
     }
-    // Sort: KEEP with HIGH confidence first, then KEEP LOW, DROP LOW, DROP HIGH
-    const sortKey = (v) => {
-      const baseScore = v.verdict === "KEEP" ? 0 : 2;
-      const confBoost = v.confidence === "HIGH" ? 0 : v.confidence === "MED" ? 0.5 : 1;
-      return v.verdict === "KEEP" ? baseScore + confBoost : baseScore + (1 - confBoost);
-    };
-    verdicts.sort((a, b) => sortKey(a) - sortKey(b));
+    // Sort: most actionable items first.
+    //   DROP-high → DROP-low → WATCH-high → WATCH-low → KEEP-low → KEEP-high → INSUFFICIENT.
+    // Within a tier, items closer to the decision boundary are less
+    // certain — placing the high-pNeg DROPs and the high-pNeg KEEPs
+    // (i.e. lowest pNeg KEEPs) at the EXTREMES makes the "what should
+    // I act on?" question read top-to-bottom.
+    const tierOrder = (t) =>
+      t === TIER.DROP ? 0 :
+      t === TIER.WATCH ? 1 :
+      t === TIER.KEEP ? 2 : 3;
+    verdicts.sort((a, b) => {
+      const dt = tierOrder(a.verdict) - tierOrder(b.verdict);
+      if (dt !== 0) return dt;
+      // Within a tier: higher pNeg first for DROP/WATCH (more confident
+      // it's bad), lower pNeg first for KEEP (still mostly trusted).
+      if (a.verdict === TIER.KEEP) return a.pNeg - b.pNeg;
+      return b.pNeg - a.pNeg;
+    });
 
     // PREVIEW the verdict — retrain a final GBM on the pool with the
     // UNION of (existing persistent mask ∪ this run's DROP verdicts)
