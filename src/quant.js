@@ -170,11 +170,6 @@ export function engineerFeatures(q, allQuotes) {
 }
 
 // ─── Multi-source news aggregation ──────────────────────────────────────────
-const PROXIES = [
-  u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
-  u => `https://corsproxy.io/?${encodeURIComponent(u)}`,
-];
-
 const NEWS_FEEDS = [
   { source: "Al Jazeera",  url: "https://www.aljazeera.com/xml/rss/all.xml" },
   { source: "Reuters",     url: "https://feeds.reuters.com/reuters/businessNews" },
@@ -188,23 +183,24 @@ const NEWS_FEEDS = [
 ];
 
 async function fetchFeed(source, url, cutoff) {
-  for (const proxy of PROXIES) {
-    try {
-      const res = await fetch(proxy(url), {signal: AbortSignal.timeout(10000)});
-      if (!res.ok) continue;
-      const text = await res.text();
-      const doc = new DOMParser().parseFromString(text, "text/xml");
-      const items = [...doc.querySelectorAll("item")];
-      return items.map(el => ({
-        source,
-        title: el.querySelector("title")?.textContent?.trim()||"",
-        date: new Date(el.querySelector("pubDate")?.textContent||0),
-        link: el.querySelector("link")?.textContent?.trim()||"",
-        desc: (el.querySelector("description")?.textContent||"").replace(/<[^>]*>/g,"").slice(0,220),
-      })).filter(n => n.date.getTime() > cutoff && n.title);
-    } catch { continue; }
+  try {
+    const res = await fetch(`/api/proxy?url=${encodeURIComponent(url)}`, {
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) return [];
+    const text = await res.text();
+    const doc = new DOMParser().parseFromString(text, "text/xml");
+    const items = [...doc.querySelectorAll("item")];
+    return items.map(el => ({
+      source,
+      title: el.querySelector("title")?.textContent?.trim()||"",
+      date: new Date(el.querySelector("pubDate")?.textContent||0),
+      link: el.querySelector("link")?.textContent?.trim()||"",
+      desc: (el.querySelector("description")?.textContent||"").replace(/<[^>]*>/g,"").slice(0,220),
+    })).filter(n => n.date.getTime() > cutoff && n.title);
+  } catch {
+    return [];
   }
-  return [];
 }
 
 // Fetch all news sources in parallel and merge, sorted by date desc

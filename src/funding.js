@@ -19,13 +19,22 @@
 // learn to ignore it for those symbols.
 
 // Binance public fapi — perpetual futures historical funding.
-// CORS: Binance public endpoints historically allow cross-origin GET.
-// Falls back to corsproxy if direct fetch fails.
+// Routed through the backend /api/proxy because direct browser fetch is
+// blocked by CORS on most networks. Hetzner egress is geo-blocked by
+// Binance (HTTP 451) so a Coinalyze fallback is wired in below; the
+// fallback only triggers BTC-USD because Coinalyze's free tier coverage
+// for the long-tail of alt perps is uneven and we'd rather report 0 than
+// stitch heterogeneous histories per-symbol.
 const FUNDING_BASE = "https://fapi.binance.com/fapi/v1/fundingRate";
-const CORS_PROXIES = [
-  u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
-  u => `https://corsproxy.io/?${encodeURIComponent(u)}`,
-];
+const COINALYZE_BASE = "https://api.coinalyze.net/v1";
+
+// Coinalyze symbol map for the perp aggregates we actually fall back on.
+// `.A` suffix = aggregated across exchanges' BTCUSDT-margined perps, which
+// is close enough to Binance's series for z-score purposes. Only BTC is
+// covered intentionally (see comment above).
+const COINALYZE_PERP_MAP = {
+  "BTC-USD": "BTCUSDT_PERP.A",
+};
 
 // Symbol map — Yahoo/Polygon ticker → Binance perp. Binance uses USDT
 // quote for perps, so XRP-USD → XRPUSDT etc. Symbols without active
@@ -82,9 +91,54 @@ export function toBinancePerp(symbol) {
 const fundingCache = new Map();  // binanceSym → { records: [{time, rate}], fetchedAt }
 const FUNDING_CACHE_TTL_MS = 60 * 60 * 1000;  // 60 min, matches bars cache
 
+// Coinalyze fallback — daily aggregated funding history for the BTC perp.
+// Returns the same { time, rate } shape so callers don't branch.
+// Resolves to null if no key is set, the symbol isn't covered, or the
+// upstream fails. Logs at most one warn per session per failure mode.
+const coinalyzeWarned = new Set();
+async function fetchFundingFromCoinalyze(symbol, daysAgo = 365) {
+  const caSym = COINALYZE_PERP_MAP[symbol];
+  if (!caSym) return null;
+  const key = import.meta.env?.VITE_COINALYZE_KEY;
+  if (!key) {
+    if (!coinalyzeWarned.has("nokey")) {
+      console.warn("[funding] VITE_COINALYZE_KEY not set — Binance-blocked symbols will report funding=0");
+      coinalyzeWarned.add("nokey");
+    }
+    return null;
+  }
+  const to = Math.floor(Date.now() / 1000);
+  const from = to - daysAgo * 86400;
+  const url = `${COINALYZE_BASE}/funding-rate-history?symbols=${caSym}&interval=daily&from=${from}&to=${to}&api_key=${encodeURIComponent(key)}`;
+  try {
+    const res = await fetch(`/api/proxy?url=${encodeURIComponent(url)}`, {
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) {
+      console.warn(`[funding] coinalyze fallback for ${symbol} returned ${res.status}`);
+      return null;
+    }
+    const data = await res.json();
+    const block = Array.isArray(data) ? data[0] : null;
+    const history = block?.history;
+    if (!Array.isArray(history) || history.length < 10) return null;
+    const records = history
+      .map(h => ({
+        time: Math.floor(h.t || 0),
+        rate: parseFloat(h.c ?? h.close ?? 0),
+      }))
+      .filter(r => r.time > 0 && Number.isFinite(r.rate))
+      .sort((a, b) => a.time - b.time);
+    return records.length >= 10 ? records : null;
+  } catch {
+    console.warn(`[funding] coinalyze fallback for ${symbol} errored`);
+    return null;
+  }
+}
+
 // Fetch up to 1000 most recent funding records (≈333 days at 3/day).
 // Returns array of { time: seconds, rate: number } sorted ascending.
-// null if both direct and proxy fetches fail.
+// null if both Binance and Coinalyze fail.
 export async function fetchFundingHistory(symbol, opts = {}) {
   const { limit = 1000 } = opts;
   const perp = toBinancePerp(symbol);
@@ -95,30 +149,36 @@ export async function fetchFundingHistory(symbol, opts = {}) {
     return cached.records;
   }
 
+  // Primary: Binance via /api/proxy. May 451 from Hetzner egress.
   const url = `${FUNDING_BASE}?symbol=${perp}&limit=${limit}`;
-  // Try direct first, then CORS proxies. Binance public endpoints usually
-  // allow cross-origin but some networks/browsers block them.
-  const attempts = [url, ...CORS_PROXIES.map(p => p(url))];
-  for (const u of attempts) {
-    try {
-      const res = await fetch(u, { signal: AbortSignal.timeout(8000) });
-      if (!res.ok) continue;
+  let records = null;
+  try {
+    const res = await fetch(`/api/proxy?url=${encodeURIComponent(url)}`, {
+      signal: AbortSignal.timeout(15000),
+    });
+    if (res.ok) {
       const data = await res.json();
-      if (!Array.isArray(data)) continue;
-      const records = data
-        .map(r => ({
-          time: Math.floor((r.fundingTime || 0) / 1000),
-          rate: parseFloat(r.fundingRate || 0),
-        }))
-        .filter(r => r.time > 0 && Number.isFinite(r.rate))
-        .sort((a, b) => a.time - b.time);
-      if (records.length < 10) continue;
-      fundingCache.set(perp, { records, fetchedAt: Date.now() });
-      return records;
-    } catch { /* try next */ }
+      if (Array.isArray(data)) {
+        records = data
+          .map(r => ({
+            time: Math.floor((r.fundingTime || 0) / 1000),
+            rate: parseFloat(r.fundingRate || 0),
+          }))
+          .filter(r => r.time > 0 && Number.isFinite(r.rate))
+          .sort((a, b) => a.time - b.time);
+        if (records.length < 10) records = null;
+      }
+    }
+  } catch { /* fall through to Coinalyze */ }
+
+  // Fallback: Coinalyze (BTC only — see COINALYZE_PERP_MAP).
+  if (!records) {
+    records = await fetchFundingFromCoinalyze(symbol);
   }
-  console.warn(`[funding] fetch_failed for ${symbol} (${perp}) — all endpoints errored`);
-  return null;
+
+  if (!records) return null;
+  fundingCache.set(perp, { records, fetchedAt: Date.now() });
+  return records;
 }
 
 // Bulk-fetch for a list of symbols with concurrency limit. Binance has

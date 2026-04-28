@@ -25,10 +25,55 @@
 // features fine (one split separates the dead window from the live).
 
 const BINANCE_OI_BASE = "https://fapi.binance.com/futures/data/openInterestHist";
+const COINALYZE_BASE  = "https://api.coinalyze.net/v1";
+// Coinalyze's aggregated BTC perp symbol — same one used in funding.js.
+const COINALYZE_BTC_PERP = "BTCUSDT_PERP.A";
 
 // 10-min session cache — OI history doesn't revise.
 const oiCache = { records: null, fetchedAt: 0 };
 const OI_TTL_MS = 60 * 60 * 1000;  // 60 min — matches bars cache
+
+// Hetzner→Binance fapi is geo-blocked (HTTP 451); when that fires we fall
+// back to Coinalyze which mirrors the same series. One-warning-per-mode
+// to avoid log spam in normal-operation sessions.
+const oiWarned = new Set();
+async function fetchBtcOICoinalyze(daysAgo = 30) {
+  const key = import.meta.env?.VITE_COINALYZE_KEY;
+  if (!key) {
+    if (!oiWarned.has("nokey")) {
+      console.warn("[OI] VITE_COINALYZE_KEY not set — BTC OI feature will be 0");
+      oiWarned.add("nokey");
+    }
+    return null;
+  }
+  const to = Math.floor(Date.now() / 1000);
+  const from = to - daysAgo * 86400;
+  const url = `${COINALYZE_BASE}/open-interest-history?symbols=${COINALYZE_BTC_PERP}&interval=daily&from=${from}&to=${to}&convert_to_usd=true&api_key=${encodeURIComponent(key)}`;
+  try {
+    const res = await fetch(`/api/proxy?url=${encodeURIComponent(url)}`, {
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) {
+      console.warn(`[OI] coinalyze fallback returned ${res.status}`);
+      return null;
+    }
+    const data = await res.json();
+    const block = Array.isArray(data) ? data[0] : null;
+    const history = block?.history;
+    if (!Array.isArray(history) || history.length < 5) return null;
+    const records = history
+      .map(h => {
+        const close = parseFloat(h.c ?? h.close ?? 0);
+        return { time: Math.floor(h.t || 0), oi: close, oiUsd: close };
+      })
+      .filter(r => r.time > 0 && Number.isFinite(r.oi) && r.oi > 0)
+      .sort((a, b) => a.time - b.time);
+    return records.length >= 5 ? records : null;
+  } catch {
+    console.warn("[OI] coinalyze fallback errored");
+    return null;
+  }
+}
 
 // Fetch daily OI history for BTCUSDT. 30 records is the max daily depth
 // Binance provides on this endpoint (documented soft-30d cap). Returns
@@ -38,30 +83,36 @@ export async function fetchBtcOIHistory(period = "1d", limit = 30) {
   if (oiCache.records && now - oiCache.fetchedAt < OI_TTL_MS) {
     return oiCache.records;
   }
+  // Primary: Binance fapi via /api/proxy.
+  let records = null;
   try {
     const url = `${BINANCE_OI_BASE}?symbol=BTCUSDT&period=${period}&limit=${limit}`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
-    if (!res.ok) return null;
-    const raw = await res.json();
-    if (!Array.isArray(raw) || raw.length < 5) return null;
-    // Response gotcha: values returned as strings, timestamps in ms.
-    // Sort ascending — Binance returns oldest-first most of the time
-    // but docs don't guarantee it.
-    const records = raw
-      .map(d => ({
-        time: Math.floor(d.timestamp / 1000),
-        oi:    parseFloat(d.sumOpenInterest),
-        oiUsd: parseFloat(d.sumOpenInterestValue),
-      }))
-      .filter(r => r.time > 0 && Number.isFinite(r.oi) && r.oi > 0)
-      .sort((a, b) => a.time - b.time);
-    if (records.length < 5) return null;
-    oiCache.records = records;
-    oiCache.fetchedAt = now;
-    return records;
-  } catch {
-    return null;
-  }
+    const res = await fetch(`/api/proxy?url=${encodeURIComponent(url)}`, {
+      signal: AbortSignal.timeout(15000),
+    });
+    if (res.ok) {
+      const raw = await res.json();
+      if (Array.isArray(raw) && raw.length >= 5) {
+        // Binance values are stringified, timestamps in ms.
+        records = raw
+          .map(d => ({
+            time: Math.floor(d.timestamp / 1000),
+            oi:    parseFloat(d.sumOpenInterest),
+            oiUsd: parseFloat(d.sumOpenInterestValue),
+          }))
+          .filter(r => r.time > 0 && Number.isFinite(r.oi) && r.oi > 0)
+          .sort((a, b) => a.time - b.time);
+        if (records.length < 5) records = null;
+      }
+    }
+  } catch { /* fall through */ }
+
+  // Fallback: Coinalyze (matches server-side lookups.js behavior).
+  if (!records) records = await fetchBtcOICoinalyze(limit);
+  if (!records) return null;
+  oiCache.records = records;
+  oiCache.fetchedAt = now;
+  return records;
 }
 
 // Binary search: latest OI record strictly BEFORE `timestampSec`. Strict
@@ -152,33 +203,83 @@ const BINANCE_LS_BASE = "https://fapi.binance.com/futures/data/topLongShortPosit
 const lsCache = { records: null, fetchedAt: 0 };
 const LS_TTL_MS = 60 * 60 * 1000;  // 60 min — matches bars cache (top L/S)
 
+// Coinalyze's `long-short-ratio-history` is the closest analog when Binance
+// is geo-blocked. It's the AGGREGATE retail/all-traders ratio rather than
+// the top-trader subset; the contrarian framing in topLSZAt still holds at
+// extremes (any extreme positioning crowd is contrarian) just with a noisier
+// signal. Better than 0 when the key is set, equivalent to 0 when it isn't.
+const lsWarned = new Set();
+async function fetchBtcLSCoinalyze(daysAgo = 30) {
+  const key = import.meta.env?.VITE_COINALYZE_KEY;
+  if (!key) {
+    if (!lsWarned.has("nokey")) {
+      console.warn("[topLS] VITE_COINALYZE_KEY not set — top long/short feature will be 0");
+      lsWarned.add("nokey");
+    }
+    return null;
+  }
+  const to = Math.floor(Date.now() / 1000);
+  const from = to - daysAgo * 86400;
+  const url = `${COINALYZE_BASE}/long-short-ratio-history?symbols=${COINALYZE_BTC_PERP}&interval=daily&from=${from}&to=${to}&api_key=${encodeURIComponent(key)}`;
+  try {
+    const res = await fetch(`/api/proxy?url=${encodeURIComponent(url)}`, {
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) {
+      console.warn(`[topLS] coinalyze fallback returned ${res.status}`);
+      return null;
+    }
+    const data = await res.json();
+    const block = Array.isArray(data) ? data[0] : null;
+    const history = block?.history;
+    if (!Array.isArray(history) || history.length < 5) return null;
+    const records = history
+      .map(h => ({
+        time:  Math.floor(h.t || 0),
+        ratio: parseFloat(h.r ?? h.c ?? h.close ?? 0),
+      }))
+      .filter(r => r.time > 0 && Number.isFinite(r.ratio) && r.ratio > 0)
+      .sort((a, b) => a.time - b.time);
+    return records.length >= 5 ? records : null;
+  } catch {
+    console.warn("[topLS] coinalyze fallback errored");
+    return null;
+  }
+}
+
 export async function fetchBtcTopLSHistory(period = "1d", limit = 30) {
   const now = Date.now();
   if (lsCache.records && now - lsCache.fetchedAt < LS_TTL_MS) {
     return lsCache.records;
   }
+  // Primary: Binance.
+  let records = null;
   try {
     const url = `${BINANCE_LS_BASE}?symbol=BTCUSDT&period=${period}&limit=${limit}`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
-    if (!res.ok) return null;
-    const raw = await res.json();
-    if (!Array.isArray(raw) || raw.length < 5) return null;
-    // Response shape: [{ symbol, longAccount, shortAccount, longShortRatio, timestamp }]
-    // We want longShortRatio (already derived) — it's a string.
-    const records = raw
-      .map(d => ({
-        time: Math.floor(d.timestamp / 1000),
-        ratio: parseFloat(d.longShortRatio),
-      }))
-      .filter(r => r.time > 0 && Number.isFinite(r.ratio) && r.ratio > 0)
-      .sort((a, b) => a.time - b.time);
-    if (records.length < 5) return null;
-    lsCache.records = records;
-    lsCache.fetchedAt = now;
-    return records;
-  } catch {
-    return null;
-  }
+    const res = await fetch(`/api/proxy?url=${encodeURIComponent(url)}`, {
+      signal: AbortSignal.timeout(15000),
+    });
+    if (res.ok) {
+      const raw = await res.json();
+      if (Array.isArray(raw) && raw.length >= 5) {
+        // Shape: [{ symbol, longAccount, shortAccount, longShortRatio, timestamp }]
+        records = raw
+          .map(d => ({
+            time: Math.floor(d.timestamp / 1000),
+            ratio: parseFloat(d.longShortRatio),
+          }))
+          .filter(r => r.time > 0 && Number.isFinite(r.ratio) && r.ratio > 0)
+          .sort((a, b) => a.time - b.time);
+        if (records.length < 5) records = null;
+      }
+    }
+  } catch { /* fall through */ }
+
+  if (!records) records = await fetchBtcLSCoinalyze(limit);
+  if (!records) return null;
+  lsCache.records = records;
+  lsCache.fetchedAt = now;
+  return records;
 }
 
 // Point-in-time z-score of log(ratio) against rolling baseline.

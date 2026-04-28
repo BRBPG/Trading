@@ -22,11 +22,6 @@
 //   HYG      high-yield credit ETF (risk proxy)
 //   LQD      investment-grade credit ETF
 
-const YAHOO_PROXIES = [
-  u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
-  u => `https://corsproxy.io/?${encodeURIComponent(u)}`,
-];
-
 export const MACRO_SYMBOLS = {
   vix:    "^VIX",
   vix9d:  "^VIX9D",
@@ -44,31 +39,32 @@ const MACRO_CACHE_MS = 2 * 60 * 1000;
 
 async function fetchYahooSymbol(sym, range = "5d", interval = "15m") {
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=${interval}&range=${range}`;
-  for (const proxy of YAHOO_PROXIES) {
-    try {
-      const res = await fetch(proxy(url), { signal: AbortSignal.timeout(6000) });
-      if (!res.ok) continue;
-      const data = await res.json();
-      const r = data?.chart?.result?.[0];
-      if (!r) continue;
-      const m = r.meta || {};
-      const q = r.indicators?.quote?.[0] || {};
-      const ts = r.timestamp || [];
-      const closes = [], timestamps = [];
-      for (let i = 0; i < ts.length; i++) {
-        if (q.close?.[i] == null) continue;
-        closes.push(q.close[i]);
-        timestamps.push(ts[i]);
-      }
-      return {
-        price: m.regularMarketPrice,
-        prevClose: m.chartPreviousClose ?? m.previousClose,
-        closes,
-        timestamps,
-      };
-    } catch { /* try next proxy */ }
+  try {
+    const res = await fetch(`/api/proxy?url=${encodeURIComponent(url)}`, {
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const r = data?.chart?.result?.[0];
+    if (!r) return null;
+    const m = r.meta || {};
+    const q = r.indicators?.quote?.[0] || {};
+    const ts = r.timestamp || [];
+    const closes = [], timestamps = [];
+    for (let i = 0; i < ts.length; i++) {
+      if (q.close?.[i] == null) continue;
+      closes.push(q.close[i]);
+      timestamps.push(ts[i]);
+    }
+    return {
+      price: m.regularMarketPrice,
+      prevClose: m.chartPreviousClose ?? m.previousClose,
+      closes,
+      timestamps,
+    };
+  } catch {
+    return null;
   }
-  return null;
 }
 
 // ─── Live snapshot for the dashboard refresh loop ──────────────────────────

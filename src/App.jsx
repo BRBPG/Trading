@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
-import { generateMockQuote, generateLiveIndicators, computeIndicators } from "./mockData";
+import { computeIndicators } from "./indicators";
 import { scoreSetup, logDecision, reviewDecision, getPerformanceStats, getLog, adaptWeights, resetWeights, saveWeights, getCurrentWeights, trainNNFromLog, trainNNFromSim, resetNN, getNNInfo, trainGBMFromSim, trainGBMFromLog, resetGBM, getGBMInfo, trainRegimeFromSim, resetRegime, FEATURE_NAMES_BTC } from "./model";
 import { loadGBM, predictGBM, getActiveMask, setActiveMask, clearActiveMask, getActiveMaskInfo } from "./gbm";
 import { computeSimMetrics, summariseEdge } from "./simMetrics";
@@ -317,52 +317,24 @@ No prose padding. No "let me analyse..." preamble. No closing summary. ~10 lines
 
 
 // ─── Yahoo Finance fallback ─────────────────────────────────────────────────
-// Finnhub's free tier only covers US stocks. For UK / non-US tickers we hit
-// Yahoo's public chart endpoint via a CORS proxy (same pattern we use for the
-// RSS news feed). Returns the same shape fetchQuote needs: price, prevClose,
-// optionally a bar series and day high/low. Works for any Yahoo-supported
-// symbol — .L (LSE), .DE (Xetra), .PA (Paris), .HK (HKEX), etc.
-const YAHOO_PROXIES = [
-  u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
-  u => `https://corsproxy.io/?${encodeURIComponent(u)}`,
-];
-
+// Live quotes go through the in-house backend at /api/quote/:symbol.
+// The backend proxies Yahoo (and Polygon for crypto) server-side, which
+// removes the public-CORS-proxy dependency that historically broke us.
+// On any failure we return null — there is NO synthetic fallback on the
+// live path because Coinbase real-money integration is coming next and
+// fabricated prices on the live path are unacceptable.
 async function fetchYahoo(symbol) {
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1m&range=1d`;
-  for (const proxy of YAHOO_PROXIES) {
-    try {
-      const res = await fetch(proxy(url), { signal: AbortSignal.timeout(10000) });
-      if (!res.ok) continue;
-      const data = await res.json();
-      const r = data?.chart?.result?.[0];
-      if (!r) continue;
-      const m = r.meta || {};
-      const q = r.indicators?.quote?.[0] || {};
-      const price = m.regularMarketPrice;
-      const prevClose = m.chartPreviousClose ?? m.previousClose;
-      if (!price || !prevClose) continue;
-
-      // Filter out nulls that Yahoo leaves for halted/pre-open minutes.
-      const rawCloses  = (q.close  || []).filter(v => v != null);
-      const rawHighs   = (q.high   || []).filter(v => v != null);
-      const rawLows    = (q.low    || []).filter(v => v != null);
-      const rawVolumes = (q.volume || []).map(v => v == null ? 0 : v);
-
-      return {
-        price, prevClose,
-        dayHigh: m.regularMarketDayHigh,
-        dayLow:  m.regularMarketDayLow,
-        high52:  m.fiftyTwoWeekHigh,
-        low52:   m.fiftyTwoWeekLow,
-        volume:  m.regularMarketVolume,
-        currency: m.currency,
-        bars: rawCloses.length >= 30
-          ? { closes: rawCloses, highs: rawHighs, lows: rawLows, volumes: rawVolumes }
-          : null,
-      };
-    } catch { /* try next proxy */ }
+  try {
+    const res = await fetch(`/api/quote/${encodeURIComponent(symbol)}`, {
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (!data || data.status === "unavailable" || !data.price || !data.prevClose) return null;
+    return data;
+  } catch {
+    return null;
   }
-  return null;
 }
 
 function shouldUseYahoo(symbol) {
@@ -393,68 +365,35 @@ async function fetchIntradayBars(symbol) {
   const cached = barsCache.get(symbol);
   if (cached && now - cached.fetchedAt < BARS_CACHE_MS) return cached.bars;
 
-  // 5-min bars over 1 day = ~78 bars; enough for all indicators
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=5m&range=1d`;
-  for (const proxy of YAHOO_PROXIES) {
-    try {
-      const res = await fetch(proxy(url), { signal: AbortSignal.timeout(8000) });
-      if (!res.ok) continue;
-      const data = await res.json();
-      const r = data?.chart?.result?.[0];
-      if (!r) continue;
-      const q = r.indicators?.quote?.[0] || {};
-      const closes = [], highs = [], lows = [], volumes = [];
-      const len = r.timestamp?.length || 0;
-      for (let i = 0; i < len; i++) {
-        // Skip nulls (halted minutes, pre-open, post-close gaps)
-        if (q.close?.[i] == null || q.high?.[i] == null || q.low?.[i] == null) continue;
-        closes.push(q.close[i]);
-        highs.push(q.high[i]);
-        lows.push(q.low[i]);
-        volumes.push(q.volume?.[i] ?? 0);
-      }
-      if (closes.length < 30) continue; // need enough for EMA50, RSI14, BB20
-
-      const bars = { closes, highs, lows, volumes };
-      barsCache.set(symbol, { bars, fetchedAt: now });
-      return bars;
-    } catch { /* try next proxy */ }
+  // Backend proxies Yahoo/Polygon server-side and applies a 60s cache.
+  try {
+    const res = await fetch(
+      `/api/bars/${encodeURIComponent(symbol)}?interval=5m&days=1`,
+      { signal: AbortSignal.timeout(8000) },
+    );
+    if (!res.ok) return cached?.bars || null;
+    const data = await res.json();
+    if (!data || data.status === "unavailable") return cached?.bars || null;
+    const { closes, highs, lows, volumes } = data;
+    if (!Array.isArray(closes) || closes.length < 30) return cached?.bars || null;
+    const bars = { closes, highs, lows, volumes };
+    barsCache.set(symbol, { bars, fetchedAt: now });
+    return bars;
+  } catch {
+    // Stale cache beats nothing — but never fall back to synthetic.
+    return cached?.bars || null;
   }
-  // If the fetch failed BUT we still have a cached copy (even if expired),
-  // return the stale copy — better than falling back to synthetic data.
-  return cached?.bars || null;
 }
 
 // Run the raw candle series through the cleaning pipeline, then recompute
 // indicators on the CLEANED bars so RSI/MACD/ATR/EMA reflect validated data.
-function cleanAndRecompute(live, session, anchors, { skipCleaning = false } = {}) {
-  // When skipCleaning=true (synthetic fallback bars), we bypass Hampel +
-  // winsorisation. The synthetic walker generates a Gaussian random walk
-  // with tiny per-bar moves — there are no real outliers to find, and
-  // winsorising the anchor-induced jump was the original cause of the GLD
-  // "suspect on every refresh" bug. Still applies anchors + clampOHLC.
-  let closes, highs, lows, volumes, cleaning;
-  if (skipCleaning) {
-    closes = [...live.closes];
-    highs = [...live.highs];
-    lows = [...live.lows];
-    volumes = [...live.volumes];
-    if (anchors.last != null && closes.length > 0) closes[closes.length - 1] = anchors.last;
-    if (anchors.first != null && closes.length > 0) closes[0] = anchors.first;
-    // Clamp OHLC for consistency
-    for (let i = 0; i < closes.length; i++) {
-      if (closes[i] > highs[i]) highs[i] = closes[i];
-      if (closes[i] < lows[i])  lows[i]  = closes[i];
-    }
-    cleaning = { hampelFlagged: 0, winsorised: 0, zeroVolFilled: 0, haltBars: 0, frozenBars: 0, ffillAborted: 0, totalTouched: 0, skipped: true };
-  } else {
-    const cleanedBars = cleanBars(
-      { closes: live.closes, highs: live.highs, lows: live.lows, volumes: live.volumes },
-      session,
-      anchors,
-    );
-    ({ closes, highs, lows, volumes, cleaning } = cleanedBars);
-  }
+function cleanAndRecompute(live, session, anchors) {
+  const cleanedBars = cleanBars(
+    { closes: live.closes, highs: live.highs, lows: live.lows, volumes: live.volumes },
+    session,
+    anchors,
+  );
+  const { closes, highs, lows, volumes, cleaning } = cleanedBars;
   const indicators = computeIndicators(closes, highs, lows, volumes);
   return {
     closes, highs, lows, volumes, ...indicators,
@@ -465,26 +404,36 @@ function cleanAndRecompute(live, session, anchors, { skipCleaning = false } = {}
   };
 }
 
+// Build a structured "unavailable" sentinel. Live-path callers must surface
+// this state in the UI — explicit unavailable state required because Coinbase
+// real-money integration is coming, and silently fabricating a price would
+// route real trade decisions through Math.random().
+function unavailableQuote(symbol, reason) {
+  return {
+    symbol,
+    status: "unavailable",
+    reason,
+    session: getMarketSession(symbol),
+    lastFetched: Date.now(),
+    isMock: false,
+  };
+}
+
 async function fetchQuote(symbol, finnhubKey) {
   const session = getMarketSession(symbol);
 
-  // Non-US tickers (e.g. TW.L) go to Yahoo regardless of Finnhub key — free
-  // Finnhub doesn't cover those exchanges.
+  // Non-US tickers (e.g. TW.L) and crypto go through the backend's Yahoo
+  // proxy — free Finnhub doesn't cover those exchanges.
   if (shouldUseYahoo(symbol)) {
     const y = await fetchYahoo(symbol);
-    if (!y) {
-      const mk = generateMockQuote(symbol);
-      return { ...mk, session, quality: "suspect" };
+    if (!y) return unavailableQuote(symbol, "Backend quote endpoint returned no data");
+    if (!y.bars || !Array.isArray(y.bars.closes) || y.bars.closes.length < 30) {
+      return unavailableQuote(symbol, "Backend returned a quote but no usable intraday bars");
     }
     const change = y.price - y.prevClose;
     const changePct = (change / y.prevClose) * 100;
 
-    // Build a candle series: prefer Yahoo's real bars if we got enough,
-    // otherwise fall back to the synthetic candle generator anchored to the
-    // real Yahoo price/prevClose so indicators still compute.
-    const rawLive = y.bars
-      ? { closes: y.bars.closes, highs: y.bars.highs, lows: y.bars.lows, volumes: y.bars.volumes }
-      : generateLiveIndicators(symbol, y.price, y.prevClose);
+    const rawLive = { closes: y.bars.closes, highs: y.bars.highs, lows: y.bars.lows, volumes: y.bars.volumes };
     const live = cleanAndRecompute(rawLive, session, { last: y.price });
     const { closes, highs, lows, volumes, cleaning } = live;
 
@@ -517,61 +466,42 @@ async function fetchQuote(symbol, finnhubKey) {
       ...live, quant,
       session, extendedMove,
       quality, cleaning,
+      barsSource: "yahoo-5m",
       marketState: "LIVE", lastFetched: Date.now(), isMock: false,
       source: "YAHOO",
+      status: "ok",
     };
   }
 
   if (!finnhubKey) {
-    const m = generateMockQuote(symbol);
-    const cleaned = cleanAndRecompute(m, session, { last: m.price });
-    const quality = assessQuality({
-      flagged: cleaned.cleaning.hampelFlagged,
-      capped: cleaned.cleaning.winsorised,
-      zeroVolFilled: cleaned.cleaning.zeroVolFilled,
-      lastFetched: Date.now(),
-      session,
-    });
-    return { ...m, ...cleaned, session, quality };
+    return unavailableQuote(symbol, "Finnhub key not configured");
   }
   try {
     const [quoteRes, metricRes] = await Promise.all([
       fetch(FH_QUOTE(symbol, finnhubKey), { signal: AbortSignal.timeout(8000) }),
       fetch(FH_METRIC(symbol, finnhubKey), { signal: AbortSignal.timeout(8000) }),
     ]);
-    if (!quoteRes.ok) {
-      const m = generateMockQuote(symbol);
-      return { ...m, session, quality: "suspect" };
-    }
+    if (!quoteRes.ok) return unavailableQuote(symbol, `Finnhub quote HTTP ${quoteRes.status}`);
     const quote = await quoteRes.json();
     const metric = metricRes.ok ? await metricRes.json() : null;
     const price = quote.c;
     const prevClose = quote.pc;
-    if (!price || !prevClose) {
-      const m = generateMockQuote(symbol);
-      return { ...m, session, quality: "suspect" };
-    }
+    if (!price || !prevClose) return unavailableQuote(symbol, "Finnhub returned an empty quote");
 
     const change = price - prevClose;
     const changePct = (change / prevClose) * 100;
     const high52 = metric?.metric?.["52WeekHigh"] ?? quote.h;
     const low52  = metric?.metric?.["52WeekLow"]  ?? quote.l;
 
-    // Fetch REAL intraday 5m bars from Yahoo (cached 3min per symbol). If that
-    // succeeds, indicators are computed on actual market bars. If it fails
-    // for any reason (CORS proxy down, rate-limited, etc.), fall back to the
-    // synthetic walker and mark the resulting quote quality as "suspect" so
-    // the user knows they're back on simulated bar data.
+    // Real intraday 5m bars from the backend. Without real bars we cannot
+    // honestly compute RSI/MACD/ATR/etc, so the quote is flagged unavailable
+    // — explicit unavailable state required because Coinbase integration is
+    // coming and never fall back to fabricated bars.
     const realBars = await fetchIntradayBars(symbol);
-    const usedRealBars = realBars != null;
-    const rawLive = usedRealBars
-      ? realBars
-      : generateLiveIndicators(symbol, price, prevClose);
-    // Anchor last close to Finnhub's real-time price regardless of source —
-    // Yahoo's final 5m bar can lag by up to 60 seconds. Skip cleaning on
-    // synthetic fallback — running Hampel/winsorise on a random walk is
-    // pure waste and causes false-positive "suspect" flags.
-    const live = cleanAndRecompute(rawLive, session, { last: price }, { skipCleaning: !usedRealBars });
+    if (!realBars) return unavailableQuote(symbol, "Real intraday bars unavailable");
+    // Anchor last close to Finnhub's real-time price — Yahoo's final 5m
+    // bar can lag by up to 60 seconds.
+    const live = cleanAndRecompute(realBars, session, { last: price });
     const { closes, highs, lows, volumes, cleaning } = live;
 
     const quant = {
@@ -591,17 +521,13 @@ async function fetchQuote(symbol, finnhubKey) {
     // so we still have something meaningful when the bell isn't ringing.
     const extendedMove = session !== "OPEN" ? { price, changePct, change } : null;
 
-    const baseQuality = assessQuality({
+    const quality = assessQuality({
       flagged: cleaning.hampelFlagged,
       capped: cleaning.winsorised,
       zeroVolFilled: cleaning.zeroVolFilled,
       lastFetched: Date.now(),
       session,
     });
-    // Force "suspect" when we fell back to synthetic bars — the price is
-    // real but the indicators are computed on Math.random() bars, and the
-    // user deserves to see that flagged.
-    const quality = usedRealBars ? baseQuality : "suspect";
 
     return {
       symbol, price, change, changePct, prevClose,
@@ -612,13 +538,13 @@ async function fetchQuote(symbol, finnhubKey) {
       ...live, quant,
       session, extendedMove,
       quality, cleaning,
-      barsSource: usedRealBars ? "yahoo-5m" : "synthetic",
+      barsSource: "yahoo-5m",
       marketState: "LIVE", lastFetched: Date.now(), isMock: false,
       source: "FINNHUB",
+      status: "ok",
     };
-  } catch {
-    const m = generateMockQuote(symbol);
-    return { ...m, session, quality: "suspect" };
+  } catch (err) {
+    return unavailableQuote(symbol, `Quote fetch threw: ${err?.message || err}`);
   }
 }
 
@@ -780,7 +706,7 @@ function buildContext(quotes, selected, news = [], context = {}) {
   const snapshot = Object.values(quotes).map(d=>
     `${d.symbol.padEnd(5)} $${d.price?.toFixed(2).padStart(8)} ${(d.changePct>=0?"+":"")+d.changePct?.toFixed(2)}%  RSI:${d.rsi?.toFixed(0)||"?"}  Vol:${d.volRatio?.toFixed(1)||"?"}x  [${sessionLabel(d.session||getMarketSession(d.symbol))}${d.quality && d.quality !== "clean" ? " " + d.quality.toUpperCase() : ""}]`
   ).join("\n");
-  return `=== LIVE DATA ${q.isMock?"(SIMULATED)":""} — ${new Date().toLocaleTimeString()} ===
+  return `=== LIVE DATA — ${new Date().toLocaleTimeString()} ===
 ${sessLine}
 ${qualityLine}
 SYMBOL: ${selected}  Price: $${q.price?.toFixed(2)}  Change: ${q.changePct>=0?"+":""}${q.changePct?.toFixed(2)}%
@@ -1100,9 +1026,13 @@ export default function App() {
         if (!r) return;
         const sym = activeWatchlist[i];
         const existing = map[sym];
-        if (r.isMock && existing && !existing.isMock) {
-          // Preserve prior live quote, downgrade quality tag
-          map[sym] = { ...existing, quality: "stale" };
+        if (r.status === "unavailable") {
+          // Preserve any prior live data but flip the unavailable flag so
+          // the UI can render a hard-fail banner. Never silently swap in
+          // synthetic data — Coinbase real-money integration is coming.
+          map[sym] = existing && existing.status === "ok"
+            ? { ...existing, status: "unavailable", reason: r.reason, lastFetched: r.lastFetched }
+            : r;
         } else {
           map[sym] = r;
         }
@@ -1185,11 +1115,18 @@ export default function App() {
   }, [messages, thinking]);
 
   async function sendToAI(userText, mode = "deep") {
+    const selectedQuote = quotes[selected];
+    if (!selectedQuote || selectedQuote.status === "unavailable") {
+      // Refuse to call the AI on missing data — explicit unavailable state
+      // required because Coinbase real-money integration is coming and we
+      // never want decisions computed on missing or fabricated prices.
+      setMessages(m => [...m, { role: "assistant", content: `LIVE PRICE UNAVAILABLE for ${selected} — ${selectedQuote?.reason || "no quote"}. Refusing analysis. Wait for data to come back.` }]);
+      return;
+    }
     setThinking(true);
     // For crypto, augment macro with this symbol's time-series momentum —
     // computed from its own bars with no external API. Feeds the TS_mom_z
     // feature slot (which equity mode uses for VIX_term).
-    const selectedQuote = quotes[selected];
     const isCryptoUni = isCryptoUniverse(universe);
     // Phase 4.5: btc universe uses top-150 snapshot for XS rank + breadth
     // + (raw) dominance live. Crypto universe keeps the in-watchlist
@@ -2106,7 +2043,9 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         const isAblationCycle = (cycle + 1) % ABLATE_EVERY === 0 && targets.length > 0;
 
         let aucNow = null, logLossNow = null, gapNow = null;
+        let aucCINow = null, aucSENow = null, aucNNow = null;
         let ablationDeltas = null;
+        let cycleError = null;
         if (isAblationCycle) {
           const ablation = await runAblationStudy(res.trades, {
             folds: 5, epochs: 60,
@@ -2122,7 +2061,12 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
             aucNow = ablation.baselineAUC;
             logLossNow = ablation.baselineLogLoss;
             gapNow = ablation.baselineGap;
+            aucCINow = ablation.baselineAUCCI || null;
+            aucSENow = ablation.baselineAUCSE || null;
+            aucNNow = ablation.baselineAUCN || null;
             ablationDeltas = ablation.results;
+          } else {
+            cycleError = `ablation: ${ablation.error}`;
           }
         } else {
           const wf = await runWalkForward(res.trades, {
@@ -2130,10 +2074,16 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
             modelKind: isCryptoUniverse(universe) ? "gbm" : "nn",
             maskSlots: activeMask,
           });
+          if (wf.error) {
+            cycleError = `wf: ${wf.error}`;
+          }
           aucNow = wf.overall?.oosAUC ?? null;
           logLossNow = wf.overall?.oosLogLoss ?? null;
           gapNow = (wf.overall?.avgTestLoss != null && wf.overall?.avgTrainLoss != null)
             ? wf.overall.avgTestLoss - wf.overall.avgTrainLoss : null;
+          aucCINow = wf.overall?.oosAUCCI ?? null;
+          aucSENow = wf.overall?.oosAUCSE ?? null;
+          aucNNow = wf.overall?.oosAUCN ?? null;
         }
         if (continuousAbortRef.current) break;
 
@@ -2186,7 +2136,14 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         // prior best. Result: MODEL STATE frozen on the best-AUC cycle's
         // state. With pool training each new cycle is trained on strictly
         // MORE data than the previous — overwriting is the right behavior.
-        if (aucNow != null && aucNow > bestAUC) bestAUC = aucNow;
+        //
+        // Skip cycle 1 from the bestAUC accumulator: cycle 1's GBM has
+        // zero trees so every yHat ≈ 0.5 and AUC is essentially a random
+        // draw on a small sample. Promoting a "randomly good" fresh
+        // model would auto-save garbage. Cycle 2 is also warmup (no
+        // Thompson exploration) but already has trees from cycle 1, so
+        // its AUC is meaningful and remains eligible.
+        if (aucNow != null && cycle >= 1 && aucNow > bestAUC) bestAUC = aucNow;
 
         // Posterior mean mu_f for each feature — used for display and rescue logic.
         const posteriorSnapshot = Object.fromEntries(
@@ -2200,6 +2157,10 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         results.push({
           cycle: cycle + 1,
           auc: aucNow,
+          aucCI: aucCINow,           // [low, high] Hanley-McNeil 95% CI, or null
+          aucSE: aucSENow,           // standard error from H-M closed form
+          aucN: aucNNow,             // { pos, neg } class counts for the AUC
+          warmup: cycle < 2,         // cycles 1-2 are warmup (no Thompson exploration)
           logLoss: logLossNow,
           gap: gapNow,
           trades: res.trades.length,  // count only, not the array
@@ -2209,6 +2170,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
           ablationCycle: isAblationCycle,
           bestSoFar: bestAUC,
           timestamp: Date.now(),
+          error: cycleError,
         });
         // Cap stored history at 50 cycles for display. For longer runs
         // the older results fall off — keeps React's VDOM bounded.
@@ -2349,10 +2311,15 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
     const nSyms = Math.max(1, symsForRun.length);
     // Match the continuous loop's holdout formula exactly.
     const holdoutLengthDays = Math.max(30, Math.floor(simDaysAgo * 0.15));
-    const baseSamples = simInterval === "1d"
-      ? Math.min(30, Math.max(5, Math.floor(holdoutLengthDays / 3)))
-      : (holdoutLengthDays <= 7 ? 10 : holdoutLengthDays <= 30 ? 20 : 40);
-    const samples = Math.max(baseSamples, Math.ceil(60 / nSyms));
+    // Push n to the natural ceiling. pickEntriesRange caps at 80% of viable
+    // bars regardless of the requested count, so requesting a large number
+    // gives us the densest legal OOS sample without weakening any leakage
+    // protection. At 110d daily this lands ~70-80 unique entries (~60+
+    // valid after labelBullish filter) — AUC CI tightens from ~±0.16 at
+    // n=50 to ~±0.10 at n=80, large enough to read meaningful edge.
+    const samples = simInterval === "1d"
+      ? Math.max(200, holdoutLengthDays * 2)
+      : Math.max(500, holdoutLengthDays * 10);
 
     try {
       await new Promise(r => setTimeout(r, 30));
@@ -2483,9 +2450,10 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
   }
 
   const selQ = quotes[selected];
+  const selUnavailable = selQ && selQ.status === "unavailable";
   const marketUp = selQ ? selQ.changePct>=0 : true;
   const loadedCount = Object.keys(quotes).length;
-  const mockCount = Object.values(quotes).filter(q=>q.isMock).length;
+  const unavailableCount = Object.values(quotes).filter(q=>q && q.status === "unavailable").length;
 
   if (!apiKey||!finnhubKey) return <ApiKeyModal onSave={(ak,fk,pk)=>{setApiKey(ak);setFinnhubKey(fk);setPolygonKey(pk||"");}}/>;
 
@@ -2530,7 +2498,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
               see an older string in the browser, the bundle is cached
               and you need to hard-refresh. */}
           <span style={{fontSize:8,color:"#444",letterSpacing:1}}>btc-v2</span>
-          {mockCount>0&&<span style={{fontSize:9,color:"#C9A84C",letterSpacing:1}}>SIM {mockCount}/{loadedCount}</span>}
+          {unavailableCount>0&&<span style={{fontSize:9,color:"#E74C3C",letterSpacing:1,fontWeight:900}}>UNAVAILABLE {unavailableCount}/{loadedCount}</span>}
           <div style={{width:6,height:6,borderRadius:"50%",
             background:refreshing?"#C9A84C":loadedCount>0?"#2ECC71":"#555",animation:"pulse 2s infinite"}}/>
           <span style={{fontSize:9,color:"#555",letterSpacing:1}}>
@@ -2591,7 +2559,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                 </div>}
                 {q&&<Sparkline data={q.sparkline} up={up} width={180} height={18}/>}
                 {!q&&<div style={{fontSize:9,color:"#333",marginTop:4}}>loading...</div>}
-                {q?.isMock&&<div style={{fontSize:8,color:"#555",letterSpacing:1}}>SIMULATED</div>}
+                {q?.status==="unavailable"&&<div style={{fontSize:8,color:"#E74C3C",letterSpacing:1,fontWeight:900}}>UNAVAILABLE</div>}
               </div>
             );
           })}
@@ -2599,7 +2567,21 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
 
         {/* Main panel */}
         <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
-          {selQ&&(
+          {selUnavailable && (
+            <div style={{background:"#2A0A0A",borderBottom:"2px solid #E74C3C",padding:"12px 16px",
+              flexShrink:0,fontFamily:"'Courier New',monospace"}}>
+              <div style={{fontSize:14,fontWeight:900,color:"#E74C3C",letterSpacing:3}}>
+                ⚠ LIVE PRICE UNAVAILABLE — DO NOT TRADE
+              </div>
+              <div style={{fontSize:11,color:"#FFB0B0",marginTop:4,letterSpacing:1}}>
+                Symbol: {selected} · Reason: {selQ.reason || "unknown"}
+              </div>
+              <div style={{fontSize:10,color:"#E74C3C",marginTop:2,letterSpacing:1}}>
+                Auto-retrying every 30s. Last attempt: {selQ.lastFetched ? new Date(selQ.lastFetched).toLocaleTimeString() : "—"}
+              </div>
+            </div>
+          )}
+          {selQ&&!selUnavailable&&(
             <div style={{background:"#0F0F0F",borderBottom:"1px solid #1A1A1A",padding:"10px 14px",
               display:"flex",alignItems:"center",gap:16,flexShrink:0,flexWrap:"wrap"}}>
               <div>
@@ -2618,23 +2600,16 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                   return <span title={title} style={{fontSize:9,color:qColor,marginLeft:6,letterSpacing:1,
                     padding:"2px 6px",border:`1px solid ${qColor}44`,cursor:"help"}}>◆ {qc.toUpperCase()}</span>;
                 })()}
-                {(()=>{ const bs = selQ.barsSource;
-                  if (!bs) return null;
-                  const isReal = bs === "yahoo-5m" || bs === "yahoo-1m";
-                  const color = isReal ? "#7FD8A6" : "#E74C3C";
-                  const label = isReal ? "REAL BARS" : "SYNTHETIC BARS";
-                  const tip = isReal
-                    ? "Indicators computed on real 5-min bars from Yahoo (cached 3min, last close anchored to Finnhub real-time price)."
-                    : "Bar fetch failed — indicators are being computed on a random-walk synthetic series. Trade decisions on this symbol are NOT backed by real intraday history.";
-                  return <span title={tip} style={{fontSize:9,color,marginLeft:6,letterSpacing:1,
-                    padding:"2px 6px",border:`1px solid ${color}44`,cursor:"help"}}>◈ {label}</span>;
-                })()}
+                {selQ.barsSource && (
+                  <span title="Indicators computed on real 5-min bars from the backend (Yahoo/Polygon, server-side cached, last close anchored to Finnhub real-time price)."
+                    style={{fontSize:9,color:"#7FD8A6",marginLeft:6,letterSpacing:1,
+                      padding:"2px 6px",border:"1px solid #7FD8A644",cursor:"help"}}>◈ REAL BARS</span>
+                )}
                 {selQ.extendedMove && (selQ.session==="PREMARKET"||selQ.session==="AFTERHOURS") && (
                   <span style={{fontSize:10,color:"#888",marginLeft:8,letterSpacing:1}}>
                     {selQ.session==="PREMARKET"?"PRE":"POST"} {selQ.changePct>=0?"+":""}{selQ.changePct?.toFixed(2)}% vs prev close
                   </span>
                 )}
-                {selQ.isMock&&<span style={{fontSize:9,color:"#C9A84C",marginLeft:8,letterSpacing:1}}>SIMULATED</span>}
               </div>
               <div style={{display:"flex",gap:14,marginLeft:10,flexWrap:"wrap"}}>
                 {[
@@ -3799,27 +3774,72 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                                     was its own grid and body rows stacked
                                     as vertical blocks — fixed here. */}
                                 <div style={{maxHeight:220,overflowY:"auto",padding:"4px 8px",background:"#080808",border:"1px solid #1A1A1A",fontSize:9}}>
-                                  <div style={{display:"grid",gridTemplateColumns:"0.5fr 1fr 1fr 1fr 1.5fr 1fr",gap:6,rowGap:3}}>
+                                  <div style={{display:"grid",gridTemplateColumns:"0.5fr 2.2fr 0.7fr 0.9fr 1.3fr 1fr",gap:6,rowGap:3}}>
                                     <div style={{fontSize:8,color:"#555",position:"sticky",top:0,background:"#080808"}}>#</div>
-                                    <div style={{fontSize:8,color:"#555",position:"sticky",top:0,background:"#080808"}}>AUC</div>
+                                    <div style={{fontSize:8,color:"#555",position:"sticky",top:0,background:"#080808"}}>AUC ± 95% CI</div>
                                     <div style={{fontSize:8,color:"#555",position:"sticky",top:0,background:"#080808"}}>GAP</div>
                                     <div style={{fontSize:8,color:"#555",position:"sticky",top:0,background:"#080808"}}>LOG-LOSS</div>
                                     <div style={{fontSize:8,color:"#555",position:"sticky",top:0,background:"#080808"}}>MASK</div>
                                     <div style={{fontSize:8,color:"#555",position:"sticky",top:0,background:"#080808"}}>TYPE</div>
                                     {continuousResults.slice().reverse().map(r => {
-                                      const aucCol = r.auc == null ? "#666" : r.auc >= 0.55 ? "#2ECC71" : r.auc >= 0.52 ? "#C9A84C" : "#E74C3C";
+                                      // CI-aware coloring: if 95% CI overlaps 0.5 the
+                                      // point estimate is statistically indistinguishable
+                                      // from a coin flip — render in muted yellow with a
+                                      // "(no edge)" tag rather than red, which the user
+                                      // was reading as "below random / inverted model"
+                                      // when it was just sampling noise on n≈100.
+                                      const ci = r.aucCI;
+                                      const ciOverlapsHalf = ci && ci[0] <= 0.5 && ci[1] >= 0.5;
+                                      const ciWidth = ci ? (ci[1] - ci[0]) : null;
+                                      const nTotal = r.aucN ? (r.aucN.pos + r.aucN.neg) : null;
+                                      const lowConfidence = (nTotal != null && nTotal < 30) || (ciWidth != null && ciWidth > 0.3);
+                                      // Warmup cycles (1-2) get muted styling so the eye
+                                      // doesn't weight them when reading the trend.
+                                      // Cycle 1's GBM has zero trees so its AUC is a
+                                      // pure random draw.
+                                      const isWarmup = !!r.warmup;
+                                      const aucCol = r.auc == null ? "#666"
+                                        : isWarmup ? "#888"
+                                        : ciOverlapsHalf ? "#C9A84C"
+                                        : r.auc >= 0.55 ? "#2ECC71"
+                                        : r.auc >= 0.52 ? "#C9A84C"
+                                        : "#E74C3C";
                                       const type = r.error ? `err` : r.probeCycle ? "probe" : r.ablationCycle ? "ablation" : "standard";
+                                      const typeText = r.error ? r.error : type;
                                       const isLatest = r.cycle === continuousResults.length;
+                                      const aucText = r.auc != null
+                                        ? (r.aucSE != null
+                                            ? `${r.auc.toFixed(2)} ± ${(1.96 * r.aucSE).toFixed(2)}`
+                                            : r.auc.toFixed(3))
+                                        : "—";
                                       return (
                                         <React.Fragment key={r.cycle}>
-                                          <div style={{color:isLatest?"#CCC":"#888"}}>{r.cycle}</div>
-                                          <div style={{color:aucCol,fontWeight:isLatest?700:400}}>{r.auc != null ? r.auc.toFixed(3) : "—"}</div>
+                                          <div style={{color:isLatest?"#CCC":"#888"}}>
+                                            {r.cycle}
+                                            {isWarmup && (
+                                              <span style={{marginLeft:4,padding:"0 3px",background:"#1A2A3A",color:"#6A9FDF",fontSize:7,letterSpacing:1}}>warmup</span>
+                                            )}
+                                          </div>
+                                          <div style={{color:aucCol,fontWeight:isLatest && !isWarmup?700:400,opacity:isWarmup?0.65:1}}>
+                                            {aucText}
+                                            {ci && (
+                                              <span style={{color:"#555",fontSize:7,marginLeft:4}}>
+                                                [{ci[0].toFixed(2)}, {ci[1].toFixed(2)}]
+                                              </span>
+                                            )}
+                                            {r.auc != null && ciOverlapsHalf && !isWarmup && (
+                                              <span style={{marginLeft:4,padding:"0 3px",background:"#2A2A0A",color:"#C9A84C",fontSize:7,letterSpacing:1}}>no edge</span>
+                                            )}
+                                            {r.auc != null && lowConfidence && !isWarmup && (
+                                              <span style={{marginLeft:4,padding:"0 3px",background:"#1A1A1A",color:"#888",fontSize:7,letterSpacing:1}}>low confidence</span>
+                                            )}
+                                          </div>
                                           <div style={{color: r.gap != null && r.gap > 0.10 ? "#C9A84C" : "#888"}}>{r.gap != null ? r.gap.toFixed(3) : "—"}</div>
                                           <div style={{color:"#888"}}>{r.logLoss != null ? r.logLoss.toFixed(3) : "—"}</div>
                                           <div style={{color:r.mask?.length ? "#C97A7A" : "#666",fontSize:8}}>
                                             {r.mask?.length ? r.mask.map(s=>`[${s}]`).join(" ") : "all active"}
                                           </div>
-                                          <div style={{color: r.error ? "#E74C3C" : r.probeCycle ? "#7FD8A6" : r.ablationCycle ? "#6A9FDF" : "#666",fontSize:8}}>{type}</div>
+                                          <div style={{color: r.error ? "#E74C3C" : r.probeCycle ? "#7FD8A6" : r.ablationCycle ? "#6A9FDF" : "#666",fontSize:8,whiteSpace:"normal",wordBreak:"break-word"}} title={r.error || ""}>{typeText}{r.trades != null && !r.error ? ` · ${r.trades} trades` : ""}</div>
                                         </React.Fragment>
                                       );
                                     })}

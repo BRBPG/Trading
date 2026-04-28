@@ -44,7 +44,9 @@ export async function fetchDvolHistory(days = 365) {
     const end = now;
     const start = end - days * 86400 * 1000;
     const url = `${DVOL_BASE}/get_volatility_index_data?currency=BTC&start_timestamp=${start}&end_timestamp=${end}&resolution=1D`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    const res = await fetch(`/api/proxy?url=${encodeURIComponent(url)}`, {
+      signal: AbortSignal.timeout(15000),
+    });
     if (!res.ok) return null;
     const data = await res.json();
     const rows = data?.result?.data;

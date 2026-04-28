@@ -1,4 +1,5 @@
 // Server-side historical bar fetcher — no CORS proxy needed (Node 18 native fetch).
+import { randomFillSync } from "node:crypto";
 import { fetchPolygonBars, hasPolygonKey } from "../../src/polygon.js";
 
 // Direct Yahoo fetch without proxy
@@ -59,11 +60,28 @@ export async function fetchHistoricalBars(symbol, daysAgo, polygonKey, interval 
 
 export function clearSimCache() { barsCache.clear(); }
 
-// Minimal 16-dim feature vector matching FEATURE_NAMES order in model.js.
-// Price-only — macro/funding/OI dims zeroed (those require live API calls
-// not suitable for a batch training job; models still train on the 9 active
-// price dims which carry the primary signal).
-export function buildFeatureVector(bars) {
+// OS-grade entropy coin flip — mirrors src/backtest.js secureCoinFlip via
+// node:crypto.randomFillSync. Buffered 256 bytes at a time.
+let entropyBuf = null;
+let entropyIdx = 0;
+function secureCoinFlip() {
+  if (!entropyBuf || entropyIdx >= entropyBuf.length) {
+    entropyBuf = Buffer.alloc(256);
+    randomFillSync(entropyBuf);
+    entropyIdx = 0;
+  }
+  return (entropyBuf[entropyIdx++] & 1) === 1;
+}
+
+// 16-dim feature vector matching FEATURE_NAMES_BTC order in src/model.js.
+//   [0..6]   technicals from the bars themselves
+//   [7..15]  crypto-context features supplied via lookups (each is a function
+//            timestampSec -> number, returns 0 when underlying data missing).
+//
+// `timestampSec` is the entry-bar's timestamp in seconds (matches bars.timestamps[i]).
+// `lookups` is the object returned by lookups.js buildBtcLookups; pass a default
+// shape with no-op fns when lookups aren't available so the function still works.
+export function buildFeatureVector(bars, timestampSec = 0, lookups = {}) {
   const { closes, highs, lows } = bars;
   const n = closes.length;
   if (n < 26) return null;
@@ -102,16 +120,69 @@ export function buildFeatureVector(bars) {
   const macd  = ema12 - ema26;
   const macd_s = macd / (Math.abs(ema26) || 1);
 
-  // [0] rsi_c  [1] macd_s  [2] mom_n  [3] bb_c  [4] ema_s  [5] ema_m  [6] vol_n
-  // [7..14] macro/funding/OI — zeroed  [15] PEAD/surprise prior — zeroed
-  return [rsi_c, macd_s, mom_n, bb_c, ema_s, ema_m, 0,
-          0, 0, 0, 0, 0, 0, 0, 0, 0];
+  // Vol normalised — placeholder zero for slot 6 (the frontend's vol_n is also
+  // computed off the raw quote object, not from bars; keeping at 0 matches
+  // pre-existing behaviour).
+  const vol_n = 0;
+
+  // Slots 7-15 from the lookup object — each is (t) -> number-or-zero.
+  // Order matches FEATURE_NAMES_BTC in src/model.js:
+  //   [7] BTC_dom_z, [8] TS_mom_z, [9] XS_rank_150, [10] Fund_z,
+  //   [11] DVOL-RV_z, [12] OI_z, [13] RV_ratio, [14] Park_ratio, [15] Breakout_20d
+  const safe = (fn) => {
+    try {
+      const v = typeof fn === "function" ? fn(timestampSec) : 0;
+      return Number.isFinite(v) ? v : 0;
+    } catch { return 0; }
+  };
+
+  return [
+    rsi_c, macd_s, mom_n, bb_c, ema_s, ema_m, vol_n,
+    safe(lookups.dominanceZAt),
+    safe(lookups.tsMomZAt),
+    safe(lookups.xsRankAt),
+    safe(lookups.fundingZAt),
+    safe(lookups.dvolRvZAt),
+    safe(lookups.oiZAt),
+    safe(lookups.rvRatioAt),
+    safe(lookups.parkinsonAt),
+    safe(lookups.breakoutFlagAt),
+  ];
+}
+
+// Bidirectional outcome simulator. Mirrors src/backtest.js simulateOutcome but
+// trimmed for the server pipeline (no ATR-driven stops; uses fixed ±TARGET/STOP
+// against entry close, same as the legacy server sim). For BUY: target above,
+// stop below; for SELL: target below, stop above.
+function simulateOutcomeBidi(bars, i, verdict, holdBars, target, stop) {
+  const { closes, highs, lows } = bars;
+  const entry = closes[i];
+  const endIdx = Math.min(i + holdBars, closes.length - 1);
+  let outcome = null;
+  for (let j = i + 1; j <= endIdx; j++) {
+    const hi = highs[j], lo = lows[j];
+    if (verdict === "BUY") {
+      if (hi >= entry * (1 + target)) { outcome = "WIN";  break; }
+      if (lo <= entry * (1 - stop))   { outcome = "LOSS"; break; }
+    } else {
+      if (lo <= entry * (1 - target)) { outcome = "WIN";  break; }
+      if (hi >= entry * (1 + stop))   { outcome = "LOSS"; break; }
+    }
+  }
+  if (!outcome) {
+    const exitClose = closes[endIdx];
+    if (verdict === "BUY")  outcome = exitClose >= entry ? "WIN" : "LOSS";
+    else                    outcome = exitClose <= entry ? "WIN" : "LOSS";
+  }
+  return { entry, outcome };
 }
 
 // Generate labeled sim trades from historical bars.
 // Samples up to maxSamples entry points per symbol, simulates a 3-hour hold.
-export function generateSimTrades(symbol, bars, maxSamples = 60) {
-  const { closes, highs, lows, timestamps } = bars;
+// `lookups` is the object from lookups.js buildBtcLookups; pass `{}` to fall
+// back to all-zero slots 7-15 (matches the pre-fix behaviour).
+export function generateSimTrades(symbol, bars, lookups = {}, maxSamples = 60) {
+  const { closes, timestamps } = bars;
   const HOLD_BARS = 36; // 36 × 5m = 3 hours
   const TARGET = 0.015;
   const STOP   = 0.010;
@@ -125,35 +196,31 @@ export function generateSimTrades(symbol, bars, maxSamples = 60) {
   for (let i = 50; i < closes.length - HOLD_BARS - 1; i += step) {
     const slice = {
       closes: closes.slice(0, i + 1),
-      highs:  highs.slice(0, i + 1),
-      lows:   lows.slice(0, i + 1),
+      highs:  bars.highs.slice(0, i + 1),
+      lows:   bars.lows.slice(0, i + 1),
     };
-    const features = buildFeatureVector(slice);
+    const ts = timestamps?.[i] ?? 0;
+    const features = buildFeatureVector(slice, ts, lookups);
     if (!features) continue;
 
-    const entry = closes[i];
-    let outcome = null;
-    for (let j = i + 1; j <= i + HOLD_BARS && j < closes.length; j++) {
-      if (highs[j] >= entry * (1 + TARGET)) { outcome = "WIN";  break; }
-      if (lows[j]  <= entry * (1 - STOP))   { outcome = "LOSS"; break; }
-    }
-    if (!outcome) {
-      const exitClose = closes[Math.min(i + HOLD_BARS, closes.length - 1)];
-      outcome = exitClose >= entry ? "WIN" : "LOSS";
-    }
+    const verdict = secureCoinFlip() ? "BUY" : "SELL";
+    const { outcome } = simulateOutcomeBidi(bars, i, verdict, HOLD_BARS, TARGET, STOP);
 
-    const ageDays = timestamps?.[i]
-      ? (Date.now() / 1000 - timestamps[i]) / 86400
-      : 0;
+    // labelBullish = "did the market go UP from entry to exit", which is what
+    // compositeProb predicts. Mirrors src/backtest.js:660-661 exactly.
+    const labelBullish = (verdict === "BUY"  && outcome === "WIN")  ||
+                         (verdict === "SELL" && outcome === "LOSS") ? 1 : 0;
+
+    const ageDays = ts ? (Date.now() / 1000 - ts) / 86400 : 0;
 
     simTrades.push({
       symbol,
       features,
       outcome,
-      verdict: "BUY",
-      labelBullish: outcome === "WIN" ? 1 : 0,
+      verdict,
+      labelBullish,
       ageDays,
-      timestamp: timestamps?.[i] ?? 0,
+      timestamp: ts,
     });
   }
   return simTrades;

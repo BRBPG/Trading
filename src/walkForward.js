@@ -89,6 +89,53 @@ function auc(preds) {
   return wins / (pos.length * neg.length);
 }
 
+// AUC with confidence interval via Hanley-McNeil 1982 closed-form SE.
+// Mann-Whitney U-equivalent variance, no bootstrapping needed — at small
+// n (the regime where users are most likely to mis-read 0.4 as "below
+// random") a single number is misleading. Returns the band so the UI can
+// render it.
+//
+// Formula (Hanley & McNeil, Radiology 1982):
+//   Q1 = AUC / (2 - AUC)          # P(both positives ranked higher than a negative)
+//   Q2 = 2*AUC^2 / (1 + AUC)      # P(a positive ranked higher than two negatives)
+//   var(AUC) = ( AUC*(1-AUC)
+//              + (n_pos - 1) * (Q1 - AUC^2)
+//              + (n_neg - 1) * (Q2 - AUC^2) ) / (n_pos * n_neg)
+//   SE = sqrt(var)
+//   95% CI = AUC ± 1.96 * SE   (clipped to [0,1])
+//
+// Returns null fields when either class is empty (matches auc()).
+export function aucWithCI(preds, alpha = 0.05) {
+  const pos = preds.filter(p => p.y === 1).map(p => p.yHat);
+  const neg = preds.filter(p => p.y === 0).map(p => p.yHat);
+  const n_pos = pos.length;
+  const n_neg = neg.length;
+  if (!n_pos || !n_neg) {
+    return { auc: null, n_pos, n_neg, se: null, ciLow: null, ciHigh: null };
+  }
+  let wins = 0;
+  for (const a of pos) for (const b of neg) {
+    if (a > b) wins += 1;
+    else if (a === b) wins += 0.5;
+  }
+  const aucVal = wins / (n_pos * n_neg);
+  const Q1 = aucVal / (2 - aucVal);
+  const Q2 = (2 * aucVal * aucVal) / (1 + aucVal);
+  const variance = (
+    aucVal * (1 - aucVal)
+    + (n_pos - 1) * (Q1 - aucVal * aucVal)
+    + (n_neg - 1) * (Q2 - aucVal * aucVal)
+  ) / (n_pos * n_neg);
+  const se = Math.sqrt(Math.max(0, variance));
+  // Two-sided z for 1-alpha. Hard-coded 1.96 for the common alpha=0.05;
+  // for other alphas fall back to a small lookup. Avoid an erf import
+  // for two values.
+  const z = alpha === 0.05 ? 1.96 : alpha === 0.10 ? 1.645 : alpha === 0.01 ? 2.576 : 1.96;
+  const ciLow = Math.max(0, aucVal - z * se);
+  const ciHigh = Math.min(1, aucVal + z * se);
+  return { auc: aucVal, n_pos, n_neg, se, ciLow, ciHigh };
+}
+
 // Mask the specified feature indices in a sample's x vector by setting
 // them to zero. Used by runAblationStudy to measure per-feature AUC delta.
 function maskFeatures(sample, slotsToZero) {
@@ -379,6 +426,16 @@ export async function runWalkForward(simTrades, opts = {}) {
     };
   }
 
+  // Pre-compute the headline AUC with Hanley-McNeil CI so callers (the
+  // continuous-train cycle UI) can render uncertainty alongside the bare
+  // number. n=100 sample with AUC=0.4 has ~±0.13 95% CI under H-M — bare
+  // number alone reads as "below random" when it's statistically
+  // indistinguishable from a coin flip.
+  const oosCI = aucWithCI(allPreds);
+  const top50CI = aucWithCI(top50);
+  const top30CI = aucWithCI(top30);
+  const top10CI = aucWithCI(top10);
+
   // Aggregate OOS metrics over all folds' predictions pooled together.
   return {
     samples: all.length,
@@ -389,19 +446,26 @@ export async function runWalkForward(simTrades, opts = {}) {
       oosSamples: allPreds.length,
       oosLogLoss: logLoss(allPreds),
       oosAccuracy: accuracy(allPreds),
-      oosAUC: auc(allPreds),
+      oosAUC: oosCI.auc,
+      oosAUCSE: oosCI.se,
+      oosAUCCI: oosCI.auc != null ? [oosCI.ciLow, oosCI.ciHigh] : null,
+      oosAUCN: { pos: oosCI.n_pos, neg: oosCI.n_neg },
       oosBrier: brierScore(allPreds),
       // Average in-sample (train) loss across folds — if train loss is much
       // lower than test loss, the model is OVERFITTING.
       avgTrainLoss: foldResults.reduce((a, f) => a + (f.trainLoss || 0), 0) / foldResults.length,
       avgTestLoss:  foldResults.reduce((a, f) => a + (f.testLoss  || 0), 0) / foldResults.length,
       // Conviction-stratified — where the signal actually lives.
-      // Each entry: { n, auc, logLoss, accuracy, threshold }
+      // Each entry: { n, auc, logLoss, accuracy, threshold, ci, se }
       byConviction: {
-        all:   { n: allPreds.length, auc: auc(allPreds), logLoss: logLoss(allPreds), accuracy: accuracy(allPreds), threshold: 0 },
-        top50: { n: top50.length, auc: auc(top50), logLoss: logLoss(top50), accuracy: accuracy(top50), threshold: convictionThreshold(top50) },
-        top30: { n: top30.length, auc: auc(top30), logLoss: logLoss(top30), accuracy: accuracy(top30), threshold: convictionThreshold(top30) },
-        top10: { n: top10.length, auc: auc(top10), logLoss: logLoss(top10), accuracy: accuracy(top10), threshold: convictionThreshold(top10) },
+        all:   { n: allPreds.length, auc: oosCI.auc, logLoss: logLoss(allPreds), accuracy: accuracy(allPreds), threshold: 0,
+                 ci: oosCI.auc != null ? [oosCI.ciLow, oosCI.ciHigh] : null, se: oosCI.se },
+        top50: { n: top50.length, auc: top50CI.auc, logLoss: logLoss(top50), accuracy: accuracy(top50), threshold: convictionThreshold(top50),
+                 ci: top50CI.auc != null ? [top50CI.ciLow, top50CI.ciHigh] : null, se: top50CI.se },
+        top30: { n: top30.length, auc: top30CI.auc, logLoss: logLoss(top30), accuracy: accuracy(top30), threshold: convictionThreshold(top30),
+                 ci: top30CI.auc != null ? [top30CI.ciLow, top30CI.ciHigh] : null, se: top30CI.se },
+        top10: { n: top10.length, auc: top10CI.auc, logLoss: logLoss(top10), accuracy: accuracy(top10), threshold: convictionThreshold(top10),
+                 ci: top10CI.auc != null ? [top10CI.ciLow, top10CI.ciHigh] : null, se: top10CI.se },
       },
       meta: metaMetrics,
     },
@@ -478,6 +542,9 @@ export async function runAblationStudy(simTrades, baseOpts = {}, targets = [], o
 
   return {
     baselineAUC: baseAUC,
+    baselineAUCCI: baseline.overall?.oosAUCCI ?? null,
+    baselineAUCSE: baseline.overall?.oosAUCSE ?? null,
+    baselineAUCN: baseline.overall?.oosAUCN ?? null,
     baselineLogLoss: baseline.overall?.oosLogLoss,
     baselineSamples: baseline.overall?.oosSamples,
     baselineGap: (baseline.overall?.avgTestLoss != null && baseline.overall?.avgTrainLoss != null)

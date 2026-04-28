@@ -18,7 +18,7 @@
 //               outcome: "WIN" | "LOSS", ageDays }]
 
 import { scoreSetup } from "./model";
-import { computeIndicators } from "./mockData";
+import { computeIndicators } from "./indicators";
 import { fetchPolygonBars, hasPolygonKey } from "./polygon";
 import { fetchMacroHistorical } from "./macro";
 import { calendarFeaturesAt } from "./calendar";
@@ -35,11 +35,6 @@ import {
   breadthAt,
   makeDominanceZLookup,
 } from "./broadMarket";
-
-const YAHOO_PROXIES = [
-  u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
-  u => `https://corsproxy.io/?${encodeURIComponent(u)}`,
-];
 
 // ─── Session bars cache ─────────────────────────────────────────────────────
 // The old multi-sim fetched historical bars for every symbol on every run
@@ -154,30 +149,30 @@ async function fetchYahooHistorical(symbol, daysAgo = 7, interval = "5m") {
      : "10y")
     : `${clamped}d`;
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=${yInterval}&range=${range}`;
-  for (const proxy of YAHOO_PROXIES) {
-    try {
-      const res = await fetch(proxy(url), { signal: AbortSignal.timeout(12000) });
-      if (!res.ok) continue;
-      const data = await res.json();
-      const r = data?.chart?.result?.[0];
-      if (!r) continue;
-      const ts = r.timestamp || [];
-      const q = r.indicators?.quote?.[0] || {};
-      const closes = [], highs = [], lows = [], volumes = [], timestamps = [];
-      for (let i = 0; i < ts.length; i++) {
-        // Yahoo leaves nulls for halted/pre-open minutes — skip them
-        if (q.close?.[i] == null || q.high?.[i] == null || q.low?.[i] == null) continue;
-        closes.push(q.close[i]);
-        highs.push(q.high[i]);
-        lows.push(q.low[i]);
-        volumes.push(q.volume?.[i] ?? 0);
-        timestamps.push(ts[i]);
-      }
-      if (closes.length < 80) continue; // need enough bars for indicators + forward window
-      return { closes, highs, lows, volumes, timestamps };
-    } catch { /* try next */ }
+  try {
+    const res = await fetch(`/api/proxy?url=${encodeURIComponent(url)}`, {
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const r = data?.chart?.result?.[0];
+    if (!r) return null;
+    const ts = r.timestamp || [];
+    const q = r.indicators?.quote?.[0] || {};
+    const closes = [], highs = [], lows = [], volumes = [], timestamps = [];
+    for (let i = 0; i < ts.length; i++) {
+      if (q.close?.[i] == null || q.high?.[i] == null || q.low?.[i] == null) continue;
+      closes.push(q.close[i]);
+      highs.push(q.high[i]);
+      lows.push(q.low[i]);
+      volumes.push(q.volume?.[i] ?? 0);
+      timestamps.push(ts[i]);
+    }
+    if (closes.length < 80) return null;
+    return { closes, highs, lows, volumes, timestamps };
+  } catch {
+    return null;
   }
-  return null;
 }
 
 // Build a fake quote object at time-step i using only bars [0..i]

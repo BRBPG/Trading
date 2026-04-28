@@ -55,7 +55,9 @@ export async function fetchTopCryptoSnapshot(n = 150) {
   }
   try {
     const url = `${COINGECKO_BASE}/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=${n}&page=1&price_change_percentage=14d`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+    const res = await fetch(`/api/proxy?url=${encodeURIComponent(url)}`, {
+      signal: AbortSignal.timeout(15000),
+    });
     if (!res.ok) return null;
     const data = await res.json();
     if (!Array.isArray(data) || data.length < 20) return null;

@@ -42,8 +42,8 @@ export async function fetchBTCDominance() {
     return BTC_DOM_CACHE.data;
   }
   try {
-    const res = await fetch("https://api.coingecko.com/api/v3/global", {
-      signal: AbortSignal.timeout(6000),
+    const res = await fetch(`/api/proxy?url=${encodeURIComponent("https://api.coingecko.com/api/v3/global")}`, {
+      signal: AbortSignal.timeout(15000),
     });
     if (!res.ok) return null;
     const data = await res.json();
