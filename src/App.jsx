@@ -2218,7 +2218,7 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
         ? { mean: post.mean, variance: post.variance, n: post.n }
         : { mean: 0, variance: PRIOR_SIGMA * PRIOR_SIGMA, n: 0 };
       const pNegValue = pNeg(postSnapshot);
-      const tier = mapTier(postSnapshot.n, pNegValue);
+      const tier = mapTier(postSnapshot.n, pNegValue, postSnapshot.mean);
 
       verdicts.push({
         slot: t.slot,
@@ -3860,43 +3860,78 @@ Persona weighting: WILLIAMS / SIMONS are DOMINANT (intraday-native). LIVERMORE /
                               <div style={{fontSize:9,color:"#7FD8A6",letterSpacing:2,marginBottom:6}}>
                                 📊 FINAL FEATURE VERDICTS — preview of what APPLY would drop ({continuousVerdicts.totalCycles} cycles, pool {continuousVerdicts.finalPoolSize} trades)
                               </div>
-                              <div style={{display:"grid",gridTemplateColumns:"0.5fr 2fr 0.7fr 0.7fr 0.8fr 0.8fr 0.5fr",gap:6,fontSize:9,rowGap:3}}>
+                              <div style={{display:"grid",gridTemplateColumns:"0.5fr 2fr 0.7fr 0.5fr 0.8fr 0.8fr 0.8fr",gap:6,fontSize:9,rowGap:3}}>
                                 <div style={{fontSize:8,color:"#555"}}>SLOT</div>
                                 <div style={{fontSize:8,color:"#555"}}>FEATURE</div>
                                 <div style={{fontSize:8,color:"#555"}}>VERDICT</div>
                                 <div style={{fontSize:8,color:"#555"}}>N</div>
                                 <div style={{fontSize:8,color:"#555"}}>MEDIAN Δ</div>
                                 <div style={{fontSize:8,color:"#555"}}>POST MEAN</div>
-                                <div style={{fontSize:8,color:"#555"}}>N OBS</div>
-                                {continuousVerdicts.verdicts.map(v => {
-                                  const col =
-                                    v.verdict === TIER.KEEP ? "#2ECC71"
-                                    : v.verdict === TIER.WATCH ? "#C9A84C"
-                                    : v.verdict === TIER.DROP ? "#E74C3C"
-                                    : "#888";  // INSUFFICIENT
-                                  const confPct = v.verdict === TIER.INSUFFICIENT
-                                    ? null
-                                    : Math.round((v.pNeg ?? 0) * 100);
-                                  return (
-                                    <React.Fragment key={v.slot}>
-                                      <div style={{color:"#888"}}>[{v.slot}]</div>
-                                      <div style={{color:"#CCC"}}>{v.name}</div>
-                                      <div style={{color:col,fontWeight:700}}>
-                                        <span style={{color:col,fontWeight:700}}>
-                                          {v.verdict}{confPct != null ? ` — ${confPct}%` : ""}
-                                        </span>
-                                      </div>
-                                      <div style={{fontSize:8}}>
-                                        {v.n != null && (
-                                          <span style={{color:"#555",fontSize:8,marginLeft:6}}>n={v.n}</span>
-                                        )}
-                                      </div>
-                                      <div style={{color:"#888"}}>{v.median != null ? (v.median >= 0 ? "+" : "") + v.median.toFixed(4) : "—"}</div>
-                                      <div style={{color:"#888"}}>{v.postMean != null ? v.postMean.toFixed(3) : "—"}</div>
-                                      <div style={{color:"#888"}}>{v.n}</div>
-                                    </React.Fragment>
-                                  );
-                                })}
+                                <div style={{fontSize:8,color:"#555"}}>ACTION</div>
+                                {(() => {
+                                  // Read mask once per render; rows close over _maskInfo.
+                                  // maskVersion is in the dep chain elsewhere — reading
+                                  // here picks up the latest after any setMaskVersion bump.
+                                  const _maskInfo = getActiveMaskInfo(universe);
+                                  return continuousVerdicts.verdicts.map(v => {
+                                    const col =
+                                      v.verdict === TIER.KEEP ? "#2ECC71"
+                                      : v.verdict === TIER.WATCH ? "#C9A84C"
+                                      : v.verdict === TIER.DROP ? "#E74C3C"
+                                      : "#888";  // INSUFFICIENT
+                                    const confPct = v.verdict === TIER.INSUFFICIENT
+                                      ? null
+                                      : Math.round((v.pNeg ?? 0) * 100);
+                                    const inMask = _maskInfo.slots.includes(v.slot);
+                                    return (
+                                      <React.Fragment key={v.slot}>
+                                        <div style={{color:"#888"}}>[{v.slot}]</div>
+                                        <div style={{color:"#CCC"}}>{v.name}</div>
+                                        <div style={{color:col,fontWeight:700}}>
+                                          <span style={{color:col,fontWeight:700}}>
+                                            {v.verdict}{confPct != null ? ` — ${confPct}%` : ""}
+                                          </span>
+                                        </div>
+                                        <div style={{fontSize:8}}>
+                                          {v.n != null && (
+                                            <span style={{color:"#555",fontSize:8,marginLeft:6}}>n={v.n}</span>
+                                          )}
+                                        </div>
+                                        <div style={{color:"#888"}}>{v.median != null ? (v.median >= 0 ? "+" : "") + v.median.toFixed(4) : "—"}</div>
+                                        <div style={{color:"#888"}}>{v.postMean != null ? v.postMean.toFixed(3) : "—"}</div>
+                                        <div>
+                                          <button
+                                            onClick={() => {
+                                              if (inMask) {
+                                                const next = _maskInfo.slots.filter(s => s !== v.slot);
+                                                if (next.length === 0) clearActiveMask(universe);
+                                                else setActiveMask(universe, next, { source: "manual_restore" });
+                                              } else {
+                                                const next = Array.from(new Set([..._maskInfo.slots, v.slot]));
+                                                setActiveMask(universe, next, { source: "manual_drop" });
+                                              }
+                                              setMaskVersion(prev => prev + 1);
+                                            }}
+                                            style={{
+                                              background: inMask ? "#1A1A0A" : "#2A1515",
+                                              border: `1px solid ${inMask ? "#5A4A1A" : "#8A4A4A"}`,
+                                              color: inMask ? "#C9A84C" : "#D88080",
+                                              fontSize: 8,
+                                              padding: "1px 6px",
+                                              cursor: "pointer",
+                                              fontFamily: "inherit",
+                                              letterSpacing: 1,
+                                              fontWeight: 700,
+                                            }}
+                                            title={inMask ? "Currently dropped — click to restore this feature" : "Manually drop this feature regardless of verdict"}
+                                          >
+                                            {inMask ? "↶ RESTORE" : "DROP"}
+                                          </button>
+                                        </div>
+                                      </React.Fragment>
+                                    );
+                                  });
+                                })()}
                               </div>
                               <div style={{fontSize:8,color:"#555",marginTop:6,lineHeight:1.5}}>
                                 Three-tier verdict from the posterior tail:

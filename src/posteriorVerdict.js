@@ -22,6 +22,13 @@ const WATCH_PNEG_MIN = 0.55;
 const MIN_N_FOR_VERDICT = 4;
 const SIGMA_OBS_FALLBACK = 0.02;
 const MIN_OBS_FOR_EMPIRICAL_SIGMA = 10;
+// Hybrid drop override — fires when the posterior mean is clearly bad
+// even though the pNeg tail probability hasn't crossed 0.85 yet. Catches
+// the "median Δ ≈ -0.05 to -0.1 with wide cycle-to-cycle variance" case
+// where the Bayesian rule stays cautious but the central tendency is
+// economically clearly anti-predictive.
+const HYBRID_DROP_MEAN_MAX = -0.03;
+const HYBRID_DROP_MIN_N = 3;
 
 // Closed-form normal-normal conjugate update. Returns { mean, variance, n }.
 // `priorSigma` is the prior std-dev on mu_f (centred at 0). `obsSigma` is
@@ -50,8 +57,17 @@ export function pNeg(post) {
 
 // Three-tier verdict. INSUFFICIENT when n is too small to render a
 // confident verdict at all; otherwise DROP / WATCH / KEEP from the
-// posterior tail probability.
-export function mapTier(n, pNegValue) {
+// posterior tail probability, with a hybrid postMean override.
+//
+// The hybrid override fires before the n-floor check so a clearly-bad
+// average effect (postMean < HYBRID_DROP_MEAN_MAX) with at least
+// HYBRID_DROP_MIN_N observations gets dropped even at n=3. This is the
+// economic-judgement layer on top of the principled Bayesian rule —
+// pNeg can stay below 0.85 indefinitely when cycle-to-cycle variance is
+// wide, but a -0.05 mean across 3+ cycles is "clearly bad on average"
+// and shouldn't sit in WATCH/INSUFFICIENT.
+export function mapTier(n, pNegValue, postMean = 0) {
+  if (n >= HYBRID_DROP_MIN_N && postMean < HYBRID_DROP_MEAN_MAX) return TIER.DROP;
   if (n < MIN_N_FOR_VERDICT) return TIER.INSUFFICIENT;
   if (pNegValue > DROP_PNEG_MIN) return TIER.DROP;
   if (pNegValue > WATCH_PNEG_MIN) return TIER.WATCH;
